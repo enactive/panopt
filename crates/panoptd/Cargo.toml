@@ -1,0 +1,23 @@
+[package]
+name = "panoptd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+panopt-core = { path = "../panopt-core" }
+rmcp = { version = "=1.7.0", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+http = "1"
+percent-encoding = "2"
+dirs = "5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }

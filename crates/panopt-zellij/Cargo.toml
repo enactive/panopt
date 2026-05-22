@@ -1,0 +1,15 @@
+[package]
+name = "panopt-zellij"
+version = "0.1.0"
+edition = "2021"
+
+# The PANopt coordination sidebar, a Zellij plugin. A normal binary crate that
+# compiles to a WASM module (wasm32-wasip1) which Zellij loads - the
+# `register_plugin!` macro supplies `main`. Excluded from the cargo workspace;
+# it only builds for the wasm target.
+[dependencies]
+zellij-tile = "0.44"
+
+[profile.release]
+opt-level = "z"
+lto = true

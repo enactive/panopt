@@ -1,0 +1,5 @@
+# Scoped to this crate directory: `cargo build` here targets WASM. This file is
+# only discovered when cargo runs with its cwd inside this crate, so it does not
+# affect `cargo build` for the rest of the workspace.
+[build]
+target = "wasm32-wasip1"

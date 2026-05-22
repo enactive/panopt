@@ -1,0 +1,13 @@
+# Rust build output
+/target
+/crates/panopt-zellij/target
+
+# PANopt's generated state projection
+.panopt/
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Tooling / OS
+.sidecar/
+.DS_Store

@@ -1,0 +1,496 @@
+# PANopt - Design Document
+
+Status: Draft
+Date: 2026-05-21
+Location: `~/p/panopt`
+
+## 1. Overview
+
+PANopt is a personal, cross-platform tool that replicates the multi-agent
+coordination workflow of Solo (soloterm) without being a terminal emulator or a
+code editor itself.
+
+In one line: **PANopt is a coordination daemon.** Agents run as terminal
+sessions in Zellij; PANopt is the shared brain they talk to - a single MCP
+server holding todos, scratchpads, locks, and an agent registry, surfaced live
+as a Zellij sidebar plugin and as ordinary projected files.
+
+The name fits the design. A panopticon is a structure with a single vantage
+point from which every cell is observed at once. PANopt's daemon is exactly
+that vantage point: one process from which every agent, todo, and note is
+observed and coordinated. The architecture is not incidental to the name - the
+single central observer *is* the product.
+
+## 2. Background and Motivation
+
+Solo (soloterm) is a macOS-only application, built with Rust and Tauri (a Rust
+core plus a web frontend in a system webview). It does three things:
+
+1. Wraps agent CLIs in a GUI - launch and manage multiple terminal-based
+   agents from one window.
+2. Runs an MCP server for inter-agent coordination.
+3. Provides shared todos and scratchpads across those agents.
+
+The user runs Linux and wants this workflow there. PANopt itself is not
+platform-bound, though: it is portable Rust, verified end-to-end on macOS, with
+Linux as its primary deployment target. PANopt is a personal tool: no licensing,
+telemetry, hosted backend, auto-update, built-in chat, or pipelines. It does not need to be a polished, shippable product - it needs to
+deliver the workflow.
+
+This project was originally conceived as "solow", a pinned fork of the Ghostty
+terminal emulator in Zig. That approach has been superseded. Section 4 records
+why in full, because the reasoning is the most important content in this
+document.
+
+## 3. Goals and Non-Goals
+
+### Goals
+
+- Inter-agent coordination: multiple agent CLIs sharing todos, scratchpads,
+  advisory locks, and a live agent registry.
+- Todos and scratchpads that feel first-class in the cockpit.
+- Minimal maintenance burden. One maintainer, personal tool, indefinite
+  lifespan.
+- Work with the tools that already exist (Zellij, MCP-capable agent CLIs)
+  instead of rebuilding them.
+- Transport-agnostic coordination: the core must not be welded to any one host
+  application.
+
+### Non-Goals
+
+- Not a terminal emulator.
+- Not a code editor.
+- No standalone GUI application and no single bespoke window.
+- Not a pixel-faithful clone of Solo's UI.
+- No licensing, telemetry, hosted backend, auto-update, built-in chat, or
+  pipelines.
+
+## 4. Architecture Decision: a daemon, not a fork
+
+This section records every option considered and why it was accepted or
+rejected. It is deliberately the longest section.
+
+### 4.1 Understanding the original Solo
+
+To replicate Solo's behavior, PANopt needs Solo's MCP surface, its on-disk
+formats for todos and scratchpads, and its process model.
+
+Static binary analysis (for example, angr) was considered for this and
+rejected. angr is a symbolic-execution framework built for vulnerability
+discovery in small, self-contained binaries. Solo is a large Rust/Tauri GUI
+application: symbolic execution state-explodes immediately, and angr models
+neither the Rust runtime nor the Tauri/webview layer. It is the wrong tool.
+
+The correct approach is dynamic, black-box observation, which is cheap because
+Tauri apps expose almost everything:
+
+- The frontend (HTML/CSS/JS) is bundled into the app and is readable as-is.
+  Every `invoke()` call in that JS names a Rust IPC command, so the frontend
+  enumerates the core API for free.
+- `strings` on the Rust core is productive: panic messages embed source paths,
+  `serde` keeps field names as literals, and `#[derive(Debug)]` leaves struct
+  and field names in the binary.
+- `fs_usage` and `lsof` while Solo runs reveal the on-disk formats directly.
+- MCP is an open JSON-RPC protocol; pointing an MCP client at Solo's server
+  exposes the coordination surface with no reverse engineering at all.
+
+PANopt's specification is therefore derived from observing Solo, not from
+decompiling it.
+
+### 4.2 Option A - fork a terminal emulator (Ghostty)
+
+The original plan: fork Ghostty and add Solo's functions on top.
+
+Rejected. Forking a terminal emulator means owning a divergent copy of a large
+codebase - font rendering, GPU, input handling, all of it commodity - and
+rebasing it onto upstream forever. That is a heavy, permanent maintenance cost
+for a personal tool whose top goal is minimal maintenance.
+
+The multi-agent terminal UI the fork was meant to deliver is not worth forking
+for: a finished terminal multiplexer already provides multi-agent pane and tab
+management as an off-the-shelf, unmodified dependency. Composing such a tool
+reaches the same destination - a multi-agent terminal cockpit - with no fork.
+Section 4.6 chooses that multiplexer.
+
+### 4.3 Option B - fork an editor (Zed)
+
+Tempting, because forking Zed appears to deliver code browsing, diffs, and
+syntax highlighting for free.
+
+Rejected, for three reasons:
+
+1. Zed is one of the largest and fastest-moving Rust codebases in existence. A
+   pinned fork that is continuously rebased onto upstream is a substantial
+   ongoing maintenance job by itself - far heavier than a Ghostty fork.
+2. PANopt's features would live in the exact subsystem Zed is actively
+   iterating on (the agent panel, ACP, terminal threads). Every upstream
+   improvement to that subsystem becomes a merge conflict in the fork. The
+   fork would be racing the Zed team on their own home turf.
+3. It changes the product from "agent coordinator" into "editor with agents,"
+   which is a far larger surface to build and maintain.
+
+### 4.4 Decomposing Solo - what is actually worth owning
+
+Solo breaks cleanly into three parts (Section 2):
+
+1. **Wrap agent CLIs in a GUI.** A commodity - a terminal multiplexer manages
+   multiple agent CLI sessions as panes and tabs natively.
+2. **MCP server for inter-agent coordination.** No existing tool provides this.
+3. **Shared todos and scratchpads.** No existing tool provides this.
+
+Parts 2 and 3 are the real, differentiated value. Part 1 is not worth building.
+
+### 4.5 Decision
+
+PANopt is a **standalone coordination daemon. It forks nothing.**
+
+`panoptd` holds all coordination state and speaks MCP. The host - the program
+that hosts the agent terminals and PANopt's own UI - is **Zellij**, an
+unmodified terminal multiplexer. Because there is no fork, every upstream
+improvement to Zellij is a free upgrade rather than a merge conflict.
+
+An earlier draft of this document made Zed the host. That is superseded;
+Section 4.6 records why the host is a multiplexer, not an editor.
+
+### 4.6 The host: a terminal multiplexer, not an editor
+
+The first version of this design used Zed as the host - agents as Zed terminal
+sessions, todos and scratchpads as files in Zed. Building it surfaced three
+problems, none fixable without forking Zed:
+
+1. **The agent surface is not first-class.** Zed runs external agents in its
+   agent panel, which is dock-locked: Zed reserves the center for the code
+   editor. The agents are a sidebar, not the main event.
+2. **Zed cannot be driven from outside.** There is no CLI and no extension API
+   to focus a specific pane or tab. A coordination UI that lists agents could
+   never *switch to* one.
+3. **The extension API is too thin.** A Zed extension cannot render a navigable
+   panel; the projected files work but are passive.
+
+The decisive realization: "do not fork" and "the host is an editor" were two
+separate decisions, welded together by accident. Keep the first, drop the
+second - the host should be the program built for hosting terminals.
+
+**Zellij** is that program:
+
+- A real terminal multiplexer - clean PTY hosting for any number of agent panes
+  and tabs, which a non-multiplexer only approximates.
+- Scriptable from outside (`zellij action`), so PANopt can drive it.
+- An open plugin API (Rust compiled to WASM) - the sanctioned way to add a
+  native, navigable panel with no fork.
+
+This is composition, not a fork: Zellij is installed and configured, never
+modified. It is categorically different from the Ghostty fork of Section 4.2,
+which would have meant owning a terminal emulator's source.
+
+The cost the earlier draft accepted - "no single bespoke window" - is largely
+recovered. Agents and PANopt's coordination sidebar are panes in one Zellij
+window: a coherent cockpit. It is a terminal-grid UI rather than a GPU-rendered
+bespoke application, which for a coordination sidebar is entirely adequate. An
+editor (Zed, helix, or any other) is opened on demand to read the projected
+files and browse code - a tool reached for, not the frame.
+
+## 5. System Architecture
+
+### 5.1 Components
+
+- **`panoptd`** - the daemon. Rust, long-lived. Holds all state. Exposes an MCP
+  server.
+- **Projected files** - `.panopt/` markdown files mirroring daemon state into
+  the workspace, readable by any editor.
+- **PANopt Zellij plugin** - a Rust-to-WASM Zellij plugin that renders the
+  coordination sidebar: a grouped, navigable list of agents and todos, pinned
+  as a pane in the Zellij layout. It focuses a pane when the user selects it.
+- **Agents** - external CLIs (Claude Code and similar), run as Zellij panes or
+  tabs, each configured with the daemon as an MCP server.
+- **`panopt`** - the launcher CLI. Starts `panoptd` on demand and opens agent
+  panes in Zellij, each with a stable per-agent identity (Section 9). A
+  standalone TUI client of the daemon may be added later as a subcommand; the
+  Zellij plugin remains the primary in-cockpit dashboard.
+
+### 5.2 Diagram
+
+```
+        Zellij  (terminal multiplexer - the cockpit, one window)
+  +-------------------------------------------------------+
+  |  agent panes / tabs       PANopt plugin pane          |
+  |  [agent A] [agent B]      (coordination sidebar)      |
+  +------|---------|-------------------|------------------+
+         |  MCP    |  MCP              | reads .panopt/*.md
+         | (HTTP)  | (HTTP)           | + focuses panes
+         v         v                   |
+  +------------------------------------------------------+
+  |                   panoptd  (daemon)                  |
+  |                                                      |
+  |   MCP server  ->  state: todos, scratchpads,         |
+  |                   locks, agent registry              |
+  |                        |                             |
+  |                        +-> filesystem projector ---> .panopt/*.md
+  |                        +-> SQLite (persistence)      |
+  +------------------------------------------------------+
+
+  Any editor (Zed, helix, ...) also opens .panopt/*.md on
+  demand, live-reloading. The projection is host-agnostic.
+```
+
+There are two planes. The **coordination plane** is agents talking to the
+daemon over MCP. The **presentation plane** is the daemon projecting state into
+`.panopt/*.md`, surfaced by the Zellij plugin and by any editor.
+
+### 5.3 Transport
+
+The daemon listens on **HTTP/SSE (Streamable HTTP) on localhost**, not stdio.
+
+Rationale: stdio MCP is one-client-per-process. If agents used stdio, each
+would spawn its own private copy of the daemon with no shared state, which
+defeats the entire purpose. A shared coordination hub requires one daemon
+serving many connections, which means a network transport. A unix-domain
+socket is a reasonable hardening option later, but localhost HTTP is chosen
+first because agent CLIs configure HTTP MCP servers by URL with no friction.
+
+There is one daemon instance, and it serves every project at once. A project
+is selected per connection by a `ws` query parameter on the MCP URL:
+`http://127.0.0.1:PORT/mcp?ws=<absolute project path>`. An agent's `claude mcp
+add`, run inside the project, captures that path from `$PWD`, so registration
+is the moment the project is named - the daemon never has to guess. The daemon
+canonicalizes the path, so symlinks and trailing slashes collapse onto one
+project, and distinct git worktrees are distinct projects unless deliberately
+pointed at the same path. The URL may also carry an `agent` parameter - a
+stable per-agent id used as the registry key (Sections 6.3 and 9). Every
+project's state lives in one SQLite database the daemon owns (Section 6.4).
+
+### 5.4 Coordination plane (agents to daemon)
+
+This plane does not involve the host at all.
+
+Each agent CLI is configured with PANopt as an MCP server in its own
+configuration (for example, `claude mcp add --transport http panopt
+http://127.0.0.1:PORT/mcp?ws=$PWD`, run inside the project). Zellij is merely
+the process that launched the terminal; it is not in the loop.
+
+An agent is registered with the daemon automatically: the first tool call on a
+connection adds it to the agent registry (Section 6.3), keyed by its connection
+key. The `identify` tool then enriches that entry with a human name and
+status, and `whoami` / `agent_list` read it back. An agent gains the
+coordination tools - `todo_*`, `scratchpad_*`, the registry tools, and `lock_*`
+- simply by connecting. Because this plane is pure MCP, it works
+identically with any MCP-capable agent and any host - Zellij today, a bare
+shell, or anything else later. The coordination core is never welded to the
+host.
+
+### 5.5 Presentation plane (daemon to the cockpit)
+
+Two mechanisms surface the daemon's state - one host-agnostic, one
+Zellij-native:
+
+1. **Filesystem projection (the backbone).** On every state mutation the daemon
+   atomically rewrites markdown files under `.panopt/` (`todos.md`,
+   `scratchpad/<id>.md`) - write to a temp file, then rename, so a reader never
+   sees a half-written file. Any editor with live file-reload renders them as
+   ordinary buffers: file-tree entries, syntax highlighting, search, splits,
+   pinned tabs. This needs zero host integration and is the reliable backbone
+   of the design - it works under Zellij, a bare editor, or anything else.
+
+2. **The Zellij plugin (the cockpit sidebar).** A Rust-to-WASM Zellij plugin,
+   pinned as a sidebar pane in the layout, renders a grouped, navigable list of
+   the agents and the todos. It reads the projected `.panopt/` files and
+   Zellij's own live pane state, and - the part a passive file view cannot do -
+   focuses the corresponding pane when the user selects an entry, and opens a
+   new agent pane on `a` or a `panopt:spawn-agent` pipe message - it is the
+   cockpit's spawner. That makes it a real switcher: the coherent grouped
+   window list the editor-host design could not provide. A WASM plugin is Zellij's sanctioned extension point and
+   requires no fork; it requests Zellij permissions (`ReadApplicationState`,
+   `ChangeApplicationState`, `RunCommands`) once, then is cached.
+
+The earlier draft named "no pixel-native panel" as the one real limitation of
+the no-fork decision. The Zellij plugin removes most of it: the sidebar is a
+native pane in the cockpit. What remains is only that it is a terminal-grid UI
+rather than a GPU-rendered surface - immaterial for a coordination sidebar.
+
+## 6. Data Model
+
+### 6.1 Todos
+
+Fields: id, title, status (open / in-progress / done), assignee, blockers,
+tags, comments. This mirrors a trimmed subset of Solo's todo surface.
+
+Projection: rendered as a markdown checklist in `.panopt/todos.md`. The file is
+a live *view* with lightweight write-back - toggling a checkbox in an editor is
+a simple change the daemon parses back into a status update. Richer mutations
+(reassign, add a blocker, comment) go through the sidebar plugin or MCP tools.
+The file is a view first and an input second.
+
+### 6.2 Scratchpads
+
+Append-oriented shared notes, organized into sections and tags.
+
+Projection: `.panopt/scratchpad/<id>.md`. Because scratchpads are
+append-mostly, bidirectional sync is clean: a user editing in any editor and an
+agent appending via MCP both land, and the daemon reconciles by section.
+Appends are conflict-free by construction.
+
+### 6.3 Agent registry and locks
+
+The registry tracks which agents are currently connected, scoped per project.
+Each agent is keyed by a connection key and carries a name and a free-form
+status, both set through the `identify` tool; `whoami` returns the caller's own
+entry and `agent_list` returns every agent on the project. The first tool call
+on any connection registers the agent, so even one that never calls `identify`
+still appears.
+
+The connection key is the `agent` query parameter on the MCP URL when one is
+set - a stable per-agent id - and the MCP session id otherwise. The session-id
+fallback is imperfect: a Streamable HTTP session is scoped to a connection
+episode, so it rotates whenever a client reconnects, and without an `agent` id
+one agent then splits across several keys until the idle ones are pruned (see
+Section 9).
+
+The registry is in-memory only, never persisted: it describes *currently
+connected* agents, so a daemon restart correctly forgets it and lets it refill
+as agents reconnect. An agent that has made no tool call for five minutes is
+pruned as gone; a background sweep in the daemon runs that prune every 30
+seconds, so a closed agent leaves the roster even when no other agent is active
+to trigger one. The roster is projected to `.panopt/agents.md` like every other
+piece of state.
+
+Locks are advisory: a lock is a named claim one agent holds so others
+coordinate exclusive work voluntarily - the daemon records the holder but
+enforces nothing. `lock_acquire` takes a lock and is non-blocking (it reports
+the current holder rather than waiting), `lock_release` frees it, and
+`lock_status` lists every lock held in the project. Like the registry, locks
+are in-memory and ephemeral, and a lock is released automatically when its
+holder is pruned. The table is projected to `.panopt/locks.md`.
+
+### 6.4 Persistence
+
+A single SQLite database holds every project. One database file is simpler to
+operate than a file per project, and SQLite gives durability and queryability
+with no server.
+
+Three tables: `projects`, `todos`, and `scratchpads`. The `todos` and
+`scratchpads` rows are keyed by `(project_id, id)`, so ids restart at 1 in each
+project and read naturally in the projected files. Per-project id counters live
+on the `projects` row and are bumped in the same transaction as the insert, so
+an id is never handed out twice and never reused after a deletion. Each mutation
+commits its transaction and then re-projects the affected `.panopt/` file; the
+first time a project is touched in a daemon run, every file is re-projected from
+the database, which both initializes a new project and self-heals a restarted
+one. The database file lives in the per-user data directory (`panopt/panopt.db`);
+the daemon owns it, and no project ever sees it.
+
+### 6.5 Conflict model
+
+The daemon is the single source of truth. Projected files are derived state.
+
+- Scratchpads: section-based merge; appends never conflict.
+- Todos: the projected file is read-mostly. Checkbox toggles are parsed back;
+  structural edits go through commands. Where a direct file edit and a daemon
+  update collide, the daemon's value wins (last-writer-wins under daemon
+  authority).
+
+## 7. Proof of Concept
+
+Two proofs of concept were built and verified, each retiring the load-bearing
+risk of its layer.
+
+### 7.1 POC 1 - the coordination daemon
+
+Goal: prove that multiple agents coordinate through one shared daemon and that
+their shared state appears live as files.
+
+Built: `panopt-core` (state and filesystem projection, no protocol
+dependencies) and `panoptd` (an MCP server over Streamable HTTP, built on
+`rmcp`, `tokio`, and `axum`). In-memory state behind a `Mutex`, one-way
+projection - no SQLite yet. Seven tools: `scratchpad_create`, `scratchpad_list`,
+`scratchpad_append`, `scratchpad_read`, `todo_create`, `todo_list`,
+`todo_complete` (`scratchpad_create` and `scratchpad_list` were added to the
+original five: scratchpads are id-keyed, so a create tool mints ids and a list
+tool discovers them).
+
+Verified: two agents coordinating through a single daemon over MCP; every
+mutation projected atomically to `.panopt/*.md`; and the load-bearing check -
+an editor live-reloading a projected file the instant the daemon rewrites it,
+confirmed on macOS with Zed, no prompt and no flicker.
+
+### 7.2 POC 2 - the Zellij sidebar plugin
+
+Goal: prove that a Zellij plugin can be PANopt's coordination cockpit sidebar.
+
+Built: `panopt-zellij`, a Rust-to-WASM Zellij plugin, and `panopt.kdl`, a
+Zellij layout that places it as a sidebar pane.
+
+Verified, all five claims: it renders as a sidebar pane; receives Zellij's live
+pane state; reads the `.panopt/` projection; navigates - pressing Enter focuses
+the selected pane; and updates live as todos change.
+
+Findings worth recording: a Zellij plugin is an ordinary binary crate compiled
+to `wasm32-wasip1`, not a `cdylib` (the `register_plugin!` macro supplies
+`main`). The plugin needs `ReadApplicationState` and `ChangeApplicationState`
+permissions, granted once and then cached by Zellij.
+
+### 7.3 Deliberately out of POC scope
+
+The POC left these out: persistence, the agent registry, advisory locks,
+bidirectional editing, multi-project support, and the rest of Solo's tool
+surface. None carried architectural risk - they are more of the same once the
+proven loops exist. Persistence, multi-project support, the agent
+registry, and advisory locks have since been built (Sections 5.3, 6.4, and
+6.3); bidirectional editing and the rest of the tool surface remain.
+
+## 8. Technology Choices
+
+- **Language: Rust.** The MCP SDK (`rmcp`) is Rust; it matches Solo's own
+  stack; it produces a single static binary well suited to a long-lived
+  daemon.
+- **MCP: `rmcp`**, the official Rust SDK, using the Streamable HTTP transport.
+- **Async runtime: `tokio`.**
+- **HTTP: `axum`** (the basis of `rmcp`'s HTTP transport).
+- **Persistence: SQLite** (`rusqlite` or `sqlx`).
+- **TUI: `ratatui`.**
+- **Zellij plugin: Rust compiled to WASM**, per Zellij's plugin model.
+
+## 9. Risks and Open Questions
+
+- Editor live-reload of the projected files - the load-bearing assumption of
+  the presentation plane. Verified in POC 1 on macOS with Zed.
+- Zellij plugin-API maturity and version coupling. A plugin is compiled against
+  a specific `zellij-tile` version; a Zellij upgrade can require recompiling it.
+- Ergonomics of bidirectional todo editing. If write-back proves fiddly, todos
+  may degrade gracefully to a read-only projected view plus command-driven
+  editing.
+- Daemon lifecycle: decided - on-demand launch. The first agent (or the Zellij
+  layout) starts `panoptd` if nothing is already listening on its port; one
+  global daemon then serves every project. There is no systemd unit or other
+  system integration, so the daemon behaves identically on macOS and Linux. The
+  `panopt` launcher performs that start-if-absent check, starting `panoptd`
+  detached in its own session so it outlives the launching terminal and every
+  Zellij session.
+- Agent identification: solved. Project selection is explicit (the `ws` URL
+  parameter, Section 5.3). The MCP session id alone is unreliable as an agent
+  key - a Streamable HTTP session is connection-episode-scoped and rotates when
+  the client reconnects - so the daemon keys an agent on a stable `agent` query
+  parameter when the URL carries one, falling back to the session id otherwise.
+  The `panopt` launcher gives each agent pane a unique `agent` id, via a
+  per-pane `PANOPT_AGENT` environment variable that the agent's MCP config
+  expands into the URL, so an agent keeps one identity across session churn.
+
+## 10. Out of Scope and Future Work
+
+- The remainder of Solo's large tool surface (timers, prompt templates, process
+  spawn and management, services). Added incrementally after the POC.
+- Process spawning and supervision. Solo spawns and manages processes itself;
+  PANopt initially relies on Zellij to host agent and command panes, and may
+  add direct process management later.
+
+## Appendix: Rejected Approaches
+
+- **angr / static binary analysis of Solo** - wrong tool; symbolic execution
+  does not scale to a large Rust/Tauri GUI. Use dynamic observation instead.
+- **Fork Ghostty** - owning a terminal emulator's source is a permanent
+  maintenance cost; an unmodified multiplexer (Zellij) delivers multi-agent
+  terminal management by composition instead.
+- **Fork Zed** - unmaintainable; forks the exact subsystem Zed is actively
+  developing, turning every upstream improvement into a merge conflict.
+- **Zed as the host, unforked** - the agent surface is dock-locked, Zed cannot
+  be driven from outside, and its extension API cannot render a navigable
+  panel. Superseded by Zellij; see Section 4.6.

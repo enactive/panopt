@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/panopt-core", "crates/panoptd", "crates/panopt"]
+# panopt-zellij is a WASM-only plugin crate; excluded so `cargo build --workspace`
+# (which targets the host) does not try to build it.
+exclude = ["crates/panopt-zellij"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"

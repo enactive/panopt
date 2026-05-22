@@ -1,0 +1,18 @@
+// PANopt cockpit layout for Zellij.
+//
+// Left: the PANopt coordination sidebar plugin (25% width).
+// Right: agent / terminal panes.
+//
+// Start Zellij from inside the workspace folder so the plugin's `/host` mount
+// resolves to it:  cd <workspace> && zellij --layout /Users/user/p/panopt/panopt.kdl
+layout {
+    pane split_direction="vertical" {
+        pane size="25%" {
+            plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm"
+        }
+        pane split_direction="horizontal" {
+            pane focus=true
+            pane
+        }
+    }
+}

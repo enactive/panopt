@@ -1,0 +1,13 @@
+[package]
+name = "panopt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+dirs = "5"
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = { workspace = true }
