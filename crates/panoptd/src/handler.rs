@@ -1,4 +1,4 @@
-//! The MCP server handler: the 13 coordination tools and the `ServerHandler`
+//! The MCP server handler: the coordination tools and the `ServerHandler`
 //! impl that advertises them.
 //!
 //! Every tool resolves its project from the `ws` query parameter on the
@@ -10,7 +10,9 @@
 use std::sync::{Arc, Mutex};
 
 use http::request::Parts;
-use panopt_core::{Agent, CoreError, Lock, ProjectId, Store, TodoStatus};
+use panopt_core::{
+    Agent, CoreError, Lock, Priority, ProjectId, Store, Todo, TodoPatch, TodoStatus,
+};
 use rmcp::{
     handler::server::{common::Extension, router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -21,7 +23,8 @@ use serde::Serialize;
 
 use crate::params::{
     IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
-    ScratchpadReadArgs, TodoCompleteArgs, TodoCreateArgs,
+    ScratchpadReadArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCompleteArgs, TodoCreateArgs,
+    TodoDeleteArgs, TodoGetArgs, TodoUpdateArgs,
 };
 
 /// Per-session MCP handler.
@@ -47,12 +50,87 @@ struct ScratchpadDto {
     title: String,
 }
 
-/// Wire shape for a todo in `todo_list` output.
+/// Wire shape for a todo in `todo_list` output: every field but the body and
+/// the full comment thread, which `todo_get` returns.
 #[derive(Serialize)]
-struct TodoDto {
+struct TodoSummaryDto {
     id: u64,
     title: String,
     status: &'static str,
+    priority: &'static str,
+    assignee: String,
+    tags: Vec<String>,
+    blockers: Vec<u64>,
+    comment_count: usize,
+}
+
+impl TodoSummaryDto {
+    fn from_todo(todo: &Todo) -> Self {
+        TodoSummaryDto {
+            id: todo.id,
+            title: todo.title.clone(),
+            status: todo.status.as_str(),
+            priority: todo.priority.as_str(),
+            assignee: todo.assignee.clone(),
+            tags: todo.tags.clone(),
+            blockers: todo.blockers.clone(),
+            comment_count: todo.comments.len(),
+        }
+    }
+}
+
+/// Wire shape for one comment in `todo_get` output.
+#[derive(Serialize)]
+struct TodoCommentDto {
+    id: u64,
+    author: String,
+    body: String,
+    created_at: String,
+}
+
+/// Wire shape for the full todo returned by `todo_get`.
+#[derive(Serialize)]
+struct TodoDetailDto {
+    id: u64,
+    title: String,
+    body: String,
+    status: &'static str,
+    priority: &'static str,
+    assignee: String,
+    tags: Vec<String>,
+    blockers: Vec<u64>,
+    comments: Vec<TodoCommentDto>,
+    created_at: String,
+    updated_at: String,
+    completed_at: Option<String>,
+}
+
+impl TodoDetailDto {
+    fn from_todo(todo: Todo) -> Self {
+        TodoDetailDto {
+            id: todo.id,
+            title: todo.title,
+            body: todo.body,
+            status: todo.status.as_str(),
+            priority: todo.priority.as_str(),
+            assignee: todo.assignee,
+            tags: todo.tags,
+            blockers: todo.blockers,
+            comments: todo
+                .comments
+                .into_iter()
+                .map(|c| TodoCommentDto {
+                    id: c.id,
+                    author: c.author,
+                    body: c.body,
+                    created_at: c.created_at,
+                })
+                .collect(),
+            created_at: todo.created_at,
+            updated_at: todo.updated_at,
+            completed_at: todo.completed_at,
+        }
+    }
 }
 
 /// Wire shape for an agent in `agent_list` and `whoami` output.
@@ -112,9 +190,11 @@ impl LockDto {
 /// Map a core error onto an MCP error result at the protocol boundary.
 fn map_core_err(e: CoreError) -> McpError {
     match e {
-        // Caller-fixable: a bad id, or a workspace path the daemon cannot reach.
+        // Caller-fixable: a bad id, a rejected argument, or a workspace path
+        // the daemon cannot reach.
         CoreError::ScratchpadNotFound(_)
         | CoreError::TodoNotFound(_)
+        | CoreError::BadRequest(_)
         | CoreError::Workspace(_) => McpError::invalid_params(e.to_string(), None),
         // Internal: a stale project handle, a database fault, or a failed write.
         CoreError::ProjectNotFound(_) | CoreError::Db(_) | CoreError::Projection(_) => {
@@ -182,8 +262,15 @@ fn agent_key(parts: &Parts) -> Option<String> {
 /// Every tool runs this first, so any connected agent appears in the registry
 /// even if it never calls `identify`. Returns the project and the agent key
 /// (the latter `None` only when the request carries no MCP session id).
+///
+/// A request carrying `?observer=1` is a tool, not an agent - the `panopt`
+/// CLI, say - so it resolves the project but is never added to the registry,
+/// and its key is reported as `None`.
 fn enter(store: &mut Store, parts: &Parts) -> Result<(ProjectId, Option<String>), McpError> {
     let project = resolve_project(store, parts)?;
+    if query_param(parts.uri.query(), "observer").as_deref() == Some("1") {
+        return Ok((project, None));
+    }
     let key = agent_key(parts);
     if let Some(key) = &key {
         let first_seen = store.agent_whoami(project, key).is_none();
@@ -221,6 +308,26 @@ fn require_lock_name(name: String) -> Result<String, McpError> {
         return Err(McpError::invalid_params("lock name must not be empty", None));
     }
     Ok(name)
+}
+
+/// Parse a status token from a tool argument, with a caller-facing error.
+fn parse_status(s: &str) -> Result<TodoStatus, McpError> {
+    TodoStatus::parse(s).ok_or_else(|| {
+        McpError::invalid_params(
+            format!("invalid status '{s}': expected open, in_progress, backlog, or completed"),
+            None,
+        )
+    })
+}
+
+/// Parse a priority token from a tool argument, with a caller-facing error.
+fn parse_priority(s: &str) -> Result<Priority, McpError> {
+    Priority::parse(s).ok_or_else(|| {
+        McpError::invalid_params(
+            format!("invalid priority '{s}': expected high, medium, or low"),
+            None,
+        )
+    })
 }
 
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
@@ -427,28 +534,71 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    #[tool(description = "List all todos as a JSON array of {id, title, status}.")]
+    #[tool(description = "List all todos as a JSON array of {id, title, status, priority, \
+                          assignee, tags, blockers, comment_count}. Use todo_get for a todo's \
+                          body and comment thread.")]
     async fn todo_list(
         &self,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let dtos: Vec<TodoDto> = {
+        let dtos: Vec<TodoSummaryDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
             st.todo_list(project)
                 .map_err(map_core_err)?
-                .into_iter()
-                .map(|t| TodoDto {
-                    id: t.id,
-                    title: t.title,
-                    status: match t.status {
-                        TodoStatus::Open => "open",
-                        TodoStatus::Done => "done",
-                    },
-                })
+                .iter()
+                .map(TodoSummaryDto::from_todo)
                 .collect()
         };
         json_result(&dtos)
+    }
+
+    #[tool(description = "Fetch one todo in full - body, comment thread, blockers and all - \
+                          addressed by numeric id.")]
+    async fn todo_get(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            TodoDetailDto::from_todo(st.todo_get(project, args.todo_id).map_err(map_core_err)?)
+        };
+        json_result(&dto)
+    }
+
+    #[tool(description = "Edit a todo's fields. Every argument but todo_id is optional; an \
+                          omitted field is left unchanged. status is one of open/in_progress/\
+                          backlog/completed, priority one of high/medium/low; tags replaces \
+                          the whole tag list.")]
+    async fn todo_update(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoUpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let status = match &args.status {
+            Some(s) => Some(parse_status(s)?),
+            None => None,
+        };
+        let priority = match &args.priority {
+            Some(p) => Some(parse_priority(p)?),
+            None => None,
+        };
+        let patch = TodoPatch {
+            title: args.title,
+            body: args.body,
+            status,
+            priority,
+            assignee: args.assignee,
+            tags: args.tags,
+        };
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_update(project, args.todo_id, patch).map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
     #[tool(description = "Mark a todo complete, addressed by numeric id.")]
@@ -463,6 +613,82 @@ impl Handler {
             st.todo_complete(project, args.todo_id).map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Delete a todo, addressed by numeric id. Its comments and blocker \
+                          links are removed with it.")]
+    async fn todo_delete(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_delete(project, args.todo_id).map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Record that one todo is blocked by another: todo_id is blocked by \
+                          blocker_id. Both must exist and must differ.")]
+    async fn todo_add_blocker(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoBlockerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_add_blocker(project, args.todo_id, args.blocker_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Remove a blocker link, so todo_id is no longer blocked by \
+                          blocker_id.")]
+    async fn todo_remove_blocker(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoBlockerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_remove_blocker(project, args.todo_id, args.blocker_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Add a comment to a todo. The author is the supplied `author`, or - \
+                          omitted - the calling agent's registered name. Returns the new \
+                          comment's numeric id.")]
+    async fn todo_comment_add(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoCommentAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, key) = enter(&mut st, &parts)?;
+            // An explicit author wins; otherwise the agent's registered name;
+            // otherwise its raw key; "unknown" only for an anonymous observer.
+            let author = args
+                .author
+                .filter(|a| !a.trim().is_empty())
+                .or_else(|| {
+                    key.as_deref()
+                        .and_then(|k| st.agent_whoami(project, k))
+                        .map(|a| a.name)
+                })
+                .or(key)
+                .unwrap_or_else(|| "unknown".to_string());
+            st.todo_comment_add(project, args.todo_id, author, args.body)
+                .map_err(map_core_err)?
+        };
+        Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 }
 
@@ -487,7 +713,10 @@ impl ServerHandler for Handler {
                  - Locks: lock_acquire (name, optional note) takes a named advisory lock \
                  and is non-blocking; lock_release frees it; lock_status lists every held \
                  lock. Locks are advisory - agents cooperate, the daemon does not enforce.\n\
-                 - Todos: todo_create (returns an id), todo_list, todo_complete.\n\
+                 - Todos: todo_create (returns an id), todo_list (summaries), \
+                 todo_get (one todo in full), todo_update (edit any field), \
+                 todo_complete, todo_delete, todo_add_blocker / todo_remove_blocker, \
+                 and todo_comment_add. Each todo also projects to .panopt/todos/<id>.md.\n\
                  - Scratchpads: scratchpad_create (returns an id), scratchpad_list, \
                  scratchpad_append, scratchpad_read. Reference scratchpads by numeric id.\n\
                  State is persisted, shared live across every agent on the same project, \

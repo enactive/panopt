@@ -39,15 +39,52 @@ panopt up
 ```
 
 Re-running `panopt up` in a project whose cockpit already exists just attaches.
-Inside the cockpit, add more agents by pressing `a` in the sidebar, or:
+The sidebar lists the agents and the todos with one cursor (Up/Down) over both:
 
-```sh
-panopt agent [name]
-```
+- `a` - spawn a new agent pane.
+- `c` - create a todo: opens the form on a blank one.
+- `Enter` - on an agent, focuses its pane; on a todo, opens the **todo form**.
+
+The todo form (`panopt todo edit`) opens in a *floating* pane over the cockpit -
+a real, roomy editing surface, not the cramped sidebar - and closes when you
+quit it. Agents can also be added with `panopt agent [name]`.
+
+The layout is fixed: the sidebar stays pinned full-height on the left, and agent
+panes fill the right. New agents stack on the right by default (the focused one
+full-size, the rest collapsed to title bars); `Alt-]` / `Alt-[` toggle between
+the stacked arrangement and an even tiled grid.
 
 Each agent is a Claude pane wired to PANopt with a stable per-agent identity.
 The two sections below are what `panopt up` automates - run them by hand to
 understand the pieces, or to use PANopt without the launcher.
+
+## Editing todos from the CLI
+
+`panopt todo` is a small client of the daemon for a project's shared todos from
+a shell - it is also what the cockpit's todo form shells out to.
+
+```sh
+panopt todo list                    # every todo, one per line
+panopt todo get 3                   # one todo in full
+panopt todo create "wire the form"  # prints the new id
+panopt todo set 3 --status in_progress --priority high --assignee alice
+panopt todo set 3 --tags "ui, mcp"  # replaces the whole tag list
+panopt todo done 3                  # mark complete
+panopt todo rm 3                    # delete
+panopt todo block 4 --by 3          # todo 4 is blocked by todo 3
+panopt todo comment 3 "started" --as greg
+panopt todo edit 3                  # open the interactive form on todo 3
+panopt todo edit --new              # the form on a fresh todo
+```
+
+The project is the current directory, or `--ws <path>`. Each invocation
+auto-starts the daemon if needed and connects as an observer, so it never lands
+in the agent roster.
+
+`panopt todo edit` is the form the cockpit launches - a TUI with labeled
+fields: Tab moves between them, Left/Right cycle `status` and `priority`, typing
+edits `title`/`assignee`/`tags`/`body`, Ctrl-S saves, Esc quits. It runs the
+same from a plain shell as it does in the cockpit's floating pane.
 
 ## Run the daemon
 
@@ -95,8 +132,14 @@ works. State is shared live across every agent connected with the same `ws`.
 | `scratchpad_append` | `scratchpad_id`, `content` | `ok` |
 | `scratchpad_read` | `scratchpad_id` | scratchpad body |
 | `todo_create` | `title` | new numeric id |
-| `todo_list` | - | JSON array of `{id, title, status}` |
+| `todo_list` | - | JSON array of todo summaries |
+| `todo_get` | `todo_id` | one todo in full - body, comments, blockers |
+| `todo_update` | `todo_id`, optional `title`/`body`/`status`/`priority`/`assignee`/`tags` | `ok` |
 | `todo_complete` | `todo_id` | `ok` |
+| `todo_delete` | `todo_id` | `ok` |
+| `todo_add_blocker` | `todo_id`, `blocker_id` | `ok` |
+| `todo_remove_blocker` | `todo_id`, `blocker_id` | `ok` |
+| `todo_comment_add` | `todo_id`, `body` | new comment id |
 
 Connecting already registers an agent; `identify` just adds a name and status.
 The registry key is the `agent=` URL parameter (the `panopt` launcher gives each
@@ -106,7 +149,11 @@ pane a unique one), or the MCP session id as a fallback when it is absent.
 
 Every state mutation atomically rewrites the affected file:
 
-- `.panopt/todos.md` - all todos as a markdown checklist.
+- `.panopt/todos.md` - an index of every todo as a markdown checklist, each
+  entry linking to that todo's own file.
+- `.panopt/todos/<id>.md` - one file per todo: a `---` frontmatter block of
+  structured fields (status, priority, assignee, tags, blockers, timestamps),
+  the title and body, then the comment thread.
 - `.panopt/scratchpad/<id>.md` - one file per scratchpad, id in the filename.
 - `.panopt/agents.md` - the roster of currently connected agents.
 - `.panopt/locks.md` - the advisory locks currently held.
@@ -116,4 +163,7 @@ so a reader never observes a half-written file.
 
 ## Not yet implemented
 
-The TUI and bidirectional editing. See `DESIGN.md` sections 9 and 10.
+Bidirectional editing - parsing a hand-edit of a projected `.panopt/` file back
+into the daemon (toggling a checkbox in `.panopt/todos.md`, say). Today the
+projection is write-only; edits go through the form, the MCP tools, or
+`panopt todo`. See `DESIGN.md` sections 6.5 and 9.

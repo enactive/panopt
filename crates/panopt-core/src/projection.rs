@@ -1,9 +1,14 @@
 //! Filesystem projection: rendering state to markdown under `.panopt/`.
 //!
 //! Every write goes through [`atomic_write`] - write to a temp file in the same
-//! directory, then `rename` over the target - so a reader (Zed) never observes a
-//! half-written file.
+//! directory, then `rename` over the target - so a reader (an editor, the
+//! Zellij plugin) never observes a half-written file.
+//!
+//! Todos project as one file per todo under `.panopt/todos/<id>.md`, each a
+//! self-contained record with a `---` frontmatter block of structured fields
+//! and a markdown body, plus a `.panopt/todos.md` index linking them all.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,8 +24,18 @@ fn panopt_dir(ws: &Path) -> PathBuf {
     ws.join(".panopt")
 }
 
-fn todos_path(ws: &Path) -> PathBuf {
+/// The todo index file: a checklist linking every per-todo file.
+fn todos_index_path(ws: &Path) -> PathBuf {
     panopt_dir(ws).join("todos.md")
+}
+
+/// The directory holding one `<id>.md` file per todo.
+fn todos_dir(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("todos")
+}
+
+fn todo_path(ws: &Path, id: u64) -> PathBuf {
+    todos_dir(ws).join(format!("{id}.md"))
 }
 
 fn scratchpad_dir(ws: &Path) -> PathBuf {
@@ -65,19 +80,65 @@ fn atomic_write(target: &Path, contents: &str) -> io::Result<()> {
     }
 }
 
-/// Render the whole todo list as a GitHub-style markdown checklist.
-pub(crate) fn render_todos_md(todos: &[Todo]) -> String {
+/// Render the todo index: a GitHub-style checklist, one line per todo, each
+/// linking to that todo's own file.
+pub(crate) fn render_todos_index_md(todos: &[Todo]) -> String {
     let mut out = String::from("# Todos\n\n");
     if todos.is_empty() {
         out.push_str("_(no todos)_\n");
         return out;
     }
     for todo in todos {
-        let mark = match todo.status {
-            TodoStatus::Open => ' ',
-            TodoStatus::Done => 'x',
-        };
-        out.push_str(&format!("- [{mark}] (#{}) {}\n", todo.id, todo.title));
+        let mark = if todo.status == TodoStatus::Completed { 'x' } else { ' ' };
+        out.push_str(&format!(
+            "- [{mark}] [#{id}](todos/{id}.md) {title} - {status}, {priority}\n",
+            id = todo.id,
+            title = todo.title,
+            status = todo.status.as_str(),
+            priority = todo.priority.as_str(),
+        ));
+    }
+    out
+}
+
+/// Render one todo as a self-contained markdown file: a `---` frontmatter block
+/// of structured fields, the title as an H1, the body, then any comments.
+pub(crate) fn render_todo_md(todo: &Todo) -> String {
+    let blockers = todo
+        .blockers
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = String::from("---\n");
+    out.push_str(&format!("status: {}\n", todo.status.as_str()));
+    out.push_str(&format!("priority: {}\n", todo.priority.as_str()));
+    out.push_str(&format!("assignee: {}\n", todo.assignee));
+    out.push_str(&format!("tags: {}\n", todo.tags.join(", ")));
+    out.push_str(&format!("blockers: {blockers}\n"));
+    out.push_str(&format!("created: {}\n", todo.created_at));
+    out.push_str(&format!("updated: {}\n", todo.updated_at));
+    if let Some(completed) = &todo.completed_at {
+        out.push_str(&format!("completed: {completed}\n"));
+    }
+    out.push_str("---\n\n");
+
+    out.push_str(&format!("# {}\n", todo.title));
+
+    if !todo.body.trim().is_empty() {
+        out.push('\n');
+        out.push_str(todo.body.trim_end());
+        out.push('\n');
+    }
+
+    if !todo.comments.is_empty() {
+        out.push_str("\n## Comments\n");
+        for comment in &todo.comments {
+            out.push_str(&format!("\n**{}** - {}\n\n", comment.author, comment.created_at));
+            out.push_str(comment.body.trim_end());
+            out.push('\n');
+        }
     }
     out
 }
@@ -138,22 +199,47 @@ pub(crate) fn render_locks_md(locks: &[Lock]) -> String {
 /// Create the `.panopt/` projection tree and its initial files.
 ///
 /// Called from [`crate::Store::ensure_project`]. Writes `.panopt/.gitignore`
-/// (`*`) so git ignores the whole projection, plus empty `todos.md`,
+/// (`*`) so git ignores the whole projection, plus an empty `todos.md` index,
 /// `agents.md`, and `locks.md` so the files a user pins in an editor exist
 /// before any tool call.
 pub(crate) fn bootstrap(ws: &Path) -> io::Result<()> {
     fs::create_dir_all(panopt_dir(ws))?;
     fs::create_dir_all(scratchpad_dir(ws))?;
+    fs::create_dir_all(todos_dir(ws))?;
     atomic_write(&panopt_dir(ws).join(".gitignore"), "*\n")?;
-    atomic_write(&todos_path(ws), &render_todos_md(&[]))?;
+    atomic_write(&todos_index_path(ws), &render_todos_index_md(&[]))?;
     atomic_write(&agents_path(ws), &render_agents_md(&[]))?;
     atomic_write(&locks_path(ws), &render_locks_md(&[]))?;
     Ok(())
 }
 
-/// Rewrite `.panopt/todos.md` from the current todo list.
+/// Rewrite the whole todo projection: the `todos.md` index, one
+/// `todos/<id>.md` per todo, and a sweep that deletes the per-todo files of
+/// todos that no longer exist.
 pub(crate) fn project_todos(ws: &Path, todos: &[Todo]) -> io::Result<()> {
-    atomic_write(&todos_path(ws), &render_todos_md(todos))
+    fs::create_dir_all(todos_dir(ws))?;
+    atomic_write(&todos_index_path(ws), &render_todos_index_md(todos))?;
+    for todo in todos {
+        atomic_write(&todo_path(ws, todo.id), &render_todo_md(todo))?;
+    }
+
+    // Remove the per-todo file of any todo that has since been deleted.
+    let live: HashSet<u64> = todos.iter().map(|t| t.id).collect();
+    if let Ok(entries) = fs::read_dir(todos_dir(ws)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let stem = match name.to_string_lossy().strip_suffix(".md") {
+                Some(stem) => stem.to_string(),
+                None => continue,
+            };
+            if let Ok(id) = stem.parse::<u64>() {
+                if !live.contains(&id) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite the one `.panopt/scratchpad/<id>.md` for the given scratchpad.
@@ -174,24 +260,100 @@ pub(crate) fn project_locks(ws: &Path, locks: &[Lock]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Priority, TodoComment};
 
-    #[test]
-    fn empty_todo_list_renders_placeholder() {
-        let md = render_todos_md(&[]);
-        assert_eq!(md, "# Todos\n\n_(no todos)_\n");
+    /// A todo with the given identity and otherwise-default fields.
+    fn todo(id: u64, title: &str, status: TodoStatus) -> Todo {
+        Todo { id, title: title.into(), status, ..Default::default() }
     }
 
     #[test]
-    fn todos_render_with_id_and_checkbox() {
+    fn empty_todo_index_renders_placeholder() {
+        assert_eq!(render_todos_index_md(&[]), "# Todos\n\n_(no todos)_\n");
+    }
+
+    #[test]
+    fn todo_index_links_each_todo() {
         let todos = vec![
-            Todo { id: 1, title: "wire up auth".into(), status: TodoStatus::Open },
-            Todo { id: 2, title: "write readme".into(), status: TodoStatus::Done },
+            todo(1, "wire up auth", TodoStatus::Open),
+            todo(2, "write readme", TodoStatus::Completed),
         ];
-        let md = render_todos_md(&todos);
         assert_eq!(
-            md,
-            "# Todos\n\n- [ ] (#1) wire up auth\n- [x] (#2) write readme\n"
+            render_todos_index_md(&todos),
+            "# Todos\n\n\
+             - [ ] [#1](todos/1.md) wire up auth - open, medium\n\
+             - [x] [#2](todos/2.md) write readme - completed, medium\n"
         );
+    }
+
+    #[test]
+    fn todo_file_has_frontmatter_and_body() {
+        let t = Todo {
+            id: 3,
+            title: "wire spawn_agent".into(),
+            body: "Pipe the request to the cockpit plugin.".into(),
+            status: TodoStatus::InProgress,
+            priority: Priority::High,
+            assignee: "claude-a1f".into(),
+            tags: vec!["launcher".into(), "mcp".into()],
+            blockers: vec![1, 2],
+            comments: vec![TodoComment {
+                id: 1,
+                author: "claude-a1f".into(),
+                body: "looking into this".into(),
+                created_at: "2026-05-21 11:00:00".into(),
+            }],
+            created_at: "2026-05-21 10:00:00".into(),
+            updated_at: "2026-05-21 11:00:00".into(),
+            completed_at: None,
+        };
+        assert_eq!(
+            render_todo_md(&t),
+            "---\n\
+             status: in_progress\n\
+             priority: high\n\
+             assignee: claude-a1f\n\
+             tags: launcher, mcp\n\
+             blockers: 1, 2\n\
+             created: 2026-05-21 10:00:00\n\
+             updated: 2026-05-21 11:00:00\n\
+             ---\n\n\
+             # wire spawn_agent\n\n\
+             Pipe the request to the cockpit plugin.\n\n\
+             ## Comments\n\n\
+             **claude-a1f** - 2026-05-21 11:00:00\n\n\
+             looking into this\n"
+        );
+    }
+
+    #[test]
+    fn completed_todo_file_carries_completed_line() {
+        let mut t = todo(1, "done thing", TodoStatus::Completed);
+        t.completed_at = Some("2026-05-21 12:00:00".into());
+        assert!(render_todo_md(&t).contains("completed: 2026-05-21 12:00:00\n"));
+    }
+
+    #[test]
+    fn project_todos_writes_index_and_per_todo_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let todos = vec![todo(1, "first", TodoStatus::Open), todo(2, "second", TodoStatus::Open)];
+        project_todos(dir.path(), &todos).unwrap();
+
+        assert!(dir.path().join(".panopt/todos.md").is_file());
+        assert!(dir.path().join(".panopt/todos/1.md").is_file());
+        assert!(dir.path().join(".panopt/todos/2.md").is_file());
+    }
+
+    #[test]
+    fn project_todos_sweeps_deleted_per_todo_files() {
+        let dir = tempfile::tempdir().unwrap();
+        project_todos(dir.path(), &[todo(1, "a", TodoStatus::Open), todo(2, "b", TodoStatus::Open)])
+            .unwrap();
+        // Todo 2 is gone on the next projection; its file must be swept.
+        project_todos(dir.path(), &[todo(1, "a", TodoStatus::Open)]).unwrap();
+
+        assert!(dir.path().join(".panopt/todos/1.md").is_file());
+        assert!(!dir.path().join(".panopt/todos/2.md").exists());
     }
 
     #[test]
@@ -266,6 +428,7 @@ mod tests {
         bootstrap(dir.path()).unwrap();
 
         assert!(dir.path().join(".panopt/scratchpad").is_dir());
+        assert!(dir.path().join(".panopt/todos").is_dir());
         assert_eq!(
             fs::read_to_string(dir.path().join(".panopt/.gitignore")).unwrap(),
             "*\n"

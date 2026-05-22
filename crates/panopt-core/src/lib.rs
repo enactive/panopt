@@ -16,5 +16,7 @@ mod registry;
 mod state;
 
 pub use error::CoreError;
-pub use model::{Agent, Lock, ProjectId, Scratchpad, Todo, TodoStatus};
+pub use model::{
+    Agent, Lock, Priority, ProjectId, Scratchpad, Todo, TodoComment, TodoPatch, TodoStatus,
+};
 pub use state::Store;

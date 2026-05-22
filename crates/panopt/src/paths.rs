@@ -36,3 +36,9 @@ pub fn daemon_log() -> Result<PathBuf> {
 pub fn cockpit_layout() -> Result<PathBuf> {
     Ok(config_dir()?.join("cockpit.kdl"))
 }
+
+/// The cockpit Zellij config `panopt up` generates: the user's Zellij config
+/// with PANopt's keybinding tweaks, handed to Zellij via `--config`.
+pub fn cockpit_config() -> Result<PathBuf> {
+    Ok(config_dir()?.join("cockpit-config.kdl"))
+}

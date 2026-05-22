@@ -1,18 +1,48 @@
 // PANopt cockpit layout for Zellij.
 //
-// Left: the PANopt coordination sidebar plugin (25% width).
-// Right: agent / terminal panes.
+// Left: the PANopt coordination sidebar plugin (25% width), pinned full-height.
+// Right: agent / terminal panes - "stacked" by default, "tiled" as a toggle
+// (cycle with Zellij's swap-layout keys, Alt-] / Alt-[).
+//
+// This is a static reference layout. `panopt up` generates its own equivalent;
+// see `crates/panopt/src/up.rs`.
 //
 // Start Zellij from inside the workspace folder so the plugin's `/host` mount
 // resolves to it:  cd <workspace> && zellij --layout /Users/user/p/panopt/panopt.kdl
 layout {
-    pane split_direction="vertical" {
-        pane size="25%" {
-            plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm"
+    // The fixed shell of every tab: sidebar pinned left, agents flow into the
+    // `children` slot on the right.
+    tab_template name="ui" {
+        pane split_direction="vertical" {
+            pane size="25%" {
+                plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm"
+            }
+            pane {
+                children
+            }
         }
-        pane split_direction="horizontal" {
-            pane focus=true
-            pane
+    }
+
+    // Initial state: the sidebar plus one agent pane.
+    ui {
+        pane focus=true
+    }
+
+    // Default arrangement: agents stacked on the right.
+    swap_tiled_layout name="stacked" {
+        ui min_panes=1 {
+            pane stacked=true {
+                children;
+            }
+        }
+    }
+
+    // Toggle arrangement: agents in an even tiled grid on the right.
+    swap_tiled_layout name="tiled" {
+        ui min_panes=1 {
+            pane {
+                children;
+            }
         }
     }
 }

@@ -5,8 +5,11 @@
 
 mod agent;
 mod daemon;
+mod edit;
 mod mcp;
+mod mcpclient;
 mod paths;
+mod todo;
 mod up;
 
 use std::path::PathBuf;
@@ -39,6 +42,14 @@ enum Cmd {
         /// Optional readable name for the agent.
         name: Option<String>,
     },
+    /// Inspect and edit the project's shared todos.
+    Todo {
+        /// Project root the todos belong to (default: the current directory).
+        #[arg(long, global = true)]
+        ws: Option<PathBuf>,
+        #[command(subcommand)]
+        action: todo::TodoCmd,
+    },
     /// Internal: the entrypoint that runs inside an agent pane.
     #[command(name = "_agent", hide = true)]
     AgentExec {
@@ -54,6 +65,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Up { plugin } => up::run(plugin, cli.port),
         Cmd::Agent { name } => agent::spawn(name),
+        Cmd::Todo { ws, action } => todo::run(ws, action, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
     }
 }

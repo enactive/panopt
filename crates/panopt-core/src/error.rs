@@ -13,6 +13,11 @@ pub enum CoreError {
     #[error("todo {0} not found")]
     TodoNotFound(u64),
 
+    /// A caller-supplied argument was rejected - for example, a todo asked to
+    /// block itself. The message is safe to surface to the caller.
+    #[error("{0}")]
+    BadRequest(String),
+
     /// No project row exists with the given internal id. Indicates a stale
     /// [`crate::ProjectId`] used after its row vanished - a bug, not a user
     /// error.

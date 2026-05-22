@@ -204,9 +204,11 @@ files and browse code - a tool reached for, not the frame.
 - **Agents** - external CLIs (Claude Code and similar), run as Zellij panes or
   tabs, each configured with the daemon as an MCP server.
 - **`panopt`** - the launcher CLI. Starts `panoptd` on demand and opens agent
-  panes in Zellij, each with a stable per-agent identity (Section 9). A
-  standalone TUI client of the daemon may be added later as a subcommand; the
-  Zellij plugin remains the primary in-cockpit dashboard.
+  panes in Zellij, each with a stable per-agent identity (Section 9). Its
+  `todo` subcommand is a small MCP client for editing a project's todos from a
+  shell, and is what the cockpit's todo form shells out to. A standalone TUI
+  client of the daemon may be added later; the Zellij plugin remains the
+  primary in-cockpit dashboard.
 
 ### 5.2 Diagram
 
@@ -295,10 +297,14 @@ Zellij-native:
    pinned as a sidebar pane in the layout, renders a grouped, navigable list of
    the agents and the todos. It reads the projected `.panopt/` files and
    Zellij's own live pane state, and - the part a passive file view cannot do -
-   focuses the corresponding pane when the user selects an entry, and opens a
-   new agent pane on `a` or a `panopt:spawn-agent` pipe message - it is the
-   cockpit's spawner. That makes it a real switcher: the coherent grouped
-   window list the editor-host design could not provide. A WASM plugin is Zellij's sanctioned extension point and
+   focuses the corresponding pane when the user selects an entry, opens a new
+   agent pane on `a` or a `panopt:spawn-agent` pipe message, and opens the todo
+   form on `Enter` over a todo (or `c` for a new one). It is the cockpit's
+   launcher, never an editor: the form itself is `panopt todo edit`, a `ratatui`
+   TUI in a *floating* pane, so a real editing surface gets real room while the
+   narrow sidebar stays a list. That makes the plugin a real switcher: the
+   coherent grouped window list the editor-host design could not provide. A
+   WASM plugin is Zellij's sanctioned extension point and
    requires no fork; it requests Zellij permissions (`ReadApplicationState`,
    `ChangeApplicationState`, `RunCommands`) once, then is cached.
 
@@ -311,14 +317,21 @@ rather than a GPU-rendered surface - immaterial for a coordination sidebar.
 
 ### 6.1 Todos
 
-Fields: id, title, status (open / in-progress / done), assignee, blockers,
-tags, comments. This mirrors a trimmed subset of Solo's todo surface.
+Fields: id, title, body, status (open / in_progress / backlog / completed),
+priority (high / medium / low), assignee, tags, blockers, comments, and
+created / updated / completed timestamps. This mirrors a trimmed subset of
+Solo's `todos` table plus its `todo_comments` and `todo_blockers` side tables.
+The one deliberate divergence is `assignee`: Solo uses a foreign key to an
+agent, but PANopt's registry is in-memory and ephemeral (Section 6.3), so the
+assignee is a plain free-text name that cannot dangle.
 
-Projection: rendered as a markdown checklist in `.panopt/todos.md`. The file is
-a live *view* with lightweight write-back - toggling a checkbox in an editor is
-a simple change the daemon parses back into a status update. Richer mutations
-(reassign, add a blocker, comment) go through the sidebar plugin or MCP tools.
-The file is a view first and an input second.
+Projection: one file per todo at `.panopt/todos/<id>.md` - a `---` frontmatter
+block of the structured fields above the title, body, and comment thread -
+plus a `.panopt/todos.md` index that links them all. Each per-todo file is a
+live *view* with lightweight write-back planned: toggling a checkbox or editing
+a frontmatter field becomes a change the daemon parses back into an update.
+Richer mutations go through the sidebar plugin or MCP tools. The files are a
+view first and an input second.
 
 ### 6.2 Scratchpads
 
@@ -433,9 +446,10 @@ permissions, granted once and then cached by Zellij.
 The POC left these out: persistence, the agent registry, advisory locks,
 bidirectional editing, multi-project support, and the rest of Solo's tool
 surface. None carried architectural risk - they are more of the same once the
-proven loops exist. Persistence, multi-project support, the agent
-registry, and advisory locks have since been built (Sections 5.3, 6.4, and
-6.3); bidirectional editing and the rest of the tool surface remain.
+proven loops exist. Persistence, multi-project support, the agent registry,
+advisory locks, and the full todo data model with its editing tools and
+per-file projection have since been built (Sections 5.3, 6.4, 6.3, and 6.1);
+bidirectional editing and the remaining scratchpad and process tools remain.
 
 ## 8. Technology Choices
 

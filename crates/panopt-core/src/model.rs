@@ -25,22 +25,123 @@ pub struct Scratchpad {
     pub body: String,
 }
 
-/// Completion state of a [`Todo`].
+/// Lifecycle state of a [`Todo`].
 ///
-/// A two-variant enum rather than a `bool` so rendering is a `match` and an
-/// `InProgress` variant can be added later without an API break.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The four variants mirror Solo's `todos.status` column (DESIGN.md Section
+/// 6.1): `Backlog` is not yet scheduled, `Open` is ready to pick up,
+/// `InProgress` is being worked, `Completed` is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TodoStatus {
+    #[default]
     Open,
-    Done,
+    InProgress,
+    Backlog,
+    Completed,
+}
+
+impl TodoStatus {
+    /// The token stored in SQLite and used on the wire and in the projection.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TodoStatus::Open => "open",
+            TodoStatus::InProgress => "in_progress",
+            TodoStatus::Backlog => "backlog",
+            TodoStatus::Completed => "completed",
+        }
+    }
+
+    /// Parse a stored or wire token; `None` for an unrecognized string.
+    pub fn parse(s: &str) -> Option<TodoStatus> {
+        match s {
+            "open" => Some(TodoStatus::Open),
+            "in_progress" => Some(TodoStatus::InProgress),
+            "backlog" => Some(TodoStatus::Backlog),
+            "completed" => Some(TodoStatus::Completed),
+            _ => None,
+        }
+    }
+}
+
+/// Importance of a [`Todo`], mirroring Solo's `todos.priority` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority {
+    High,
+    #[default]
+    Medium,
+    Low,
+}
+
+impl Priority {
+    /// The token stored in SQLite and used on the wire and in the projection.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::High => "high",
+            Priority::Medium => "medium",
+            Priority::Low => "low",
+        }
+    }
+
+    /// Parse a stored or wire token; `None` for an unrecognized string.
+    pub fn parse(s: &str) -> Option<Priority> {
+        match s {
+            "high" => Some(Priority::High),
+            "medium" => Some(Priority::Medium),
+            "low" => Some(Priority::Low),
+            _ => None,
+        }
+    }
+}
+
+/// One comment on a [`Todo`], mirroring a row of Solo's `todo_comments` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoComment {
+    /// Id unique within the parent todo, restarting at 1 in each todo.
+    pub id: u64,
+    /// Display name of the agent that posted it.
+    pub author: String,
+    pub body: String,
+    /// SQLite `datetime('now')` text (UTC, `YYYY-MM-DD HH:MM:SS`).
+    pub created_at: String,
 }
 
 /// A todo item identified by a numeric id, unique within its project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The field set mirrors a trimmed subset of Solo's `todos` table plus its
+/// `todo_comments` and `todo_blockers` side tables (DESIGN.md Section 6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Todo {
     pub id: u64,
     pub title: String,
+    /// Free-form description. Empty until set.
+    pub body: String,
     pub status: TodoStatus,
+    pub priority: Priority,
+    /// Free-text owner; empty when unassigned. Unlike Solo's agent foreign key
+    /// this is a plain name: PANopt's agent registry is in-memory and ephemeral
+    /// (DESIGN.md Section 6.3), so a persisted agent id would dangle.
+    pub assignee: String,
+    pub tags: Vec<String>,
+    /// Ids of other todos in the same project that block this one.
+    pub blockers: Vec<u64>,
+    pub comments: Vec<TodoComment>,
+    /// SQLite `datetime('now')` text (UTC).
+    pub created_at: String,
+    pub updated_at: String,
+    /// Set while `status` is `Completed`, `None` otherwise.
+    pub completed_at: Option<String>,
+}
+
+/// A set of optional edits to a [`Todo`], applied by [`crate::Store::todo_update`].
+///
+/// Each `None` field leaves that attribute untouched; each `Some` replaces it.
+#[derive(Debug, Default, Clone)]
+pub struct TodoPatch {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub status: Option<TodoStatus>,
+    pub priority: Option<Priority>,
+    pub assignee: Option<String>,
+    pub tags: Option<Vec<String>>,
 }
 
 /// A connected agent, as tracked by the in-memory registry.

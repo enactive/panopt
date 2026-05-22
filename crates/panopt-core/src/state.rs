@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
-use crate::model::{Agent, Lock, ProjectId, Scratchpad, Todo, TodoStatus};
+use crate::model::{Agent, Lock, Priority, ProjectId, Scratchpad, Todo, TodoComment, TodoPatch, TodoStatus};
 use crate::projection;
 use crate::registry::Registry;
 
@@ -327,7 +327,8 @@ impl Store {
             let tx = self.conn.transaction()?;
             let next = next_id(&tx, pid, "next_todo_id")?;
             tx.execute(
-                "INSERT INTO todos (project_id, id, title, status) VALUES (?1, ?2, ?3, 'open')",
+                "INSERT INTO todos (project_id, id, title, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'open', datetime('now'), datetime('now'))",
                 params![pid, next, title],
             )?;
             tx.execute(
@@ -341,33 +342,269 @@ impl Store {
         Ok(id)
     }
 
-    /// List a project's todos, id-ascending.
+    /// List a project's todos in full - blockers and comments included -
+    /// id-ascending.
     pub fn todo_list(&self, project: ProjectId) -> Result<Vec<Todo>, CoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, title, status FROM todos WHERE project_id = ?1 ORDER BY id")?;
-        let rows = stmt.query_map([project.0], |r| {
-            let status: String = r.get(2)?;
-            Ok(Todo {
-                id: r.get::<_, i64>(0)? as u64,
-                title: r.get(1)?,
-                status: if status == "done" { TodoStatus::Done } else { TodoStatus::Open },
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let ids: Vec<u64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM todos WHERE project_id = ?1 ORDER BY id")?;
+            let rows = stmt.query_map([project.0], |r| Ok(r.get::<_, i64>(0)? as u64))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        ids.into_iter().map(|id| self.fetch_todo(project, id)).collect()
+    }
+
+    /// Fetch one todo in full, or [`CoreError::TodoNotFound`] if it is absent.
+    pub fn todo_get(&self, project: ProjectId, id: u64) -> Result<Todo, CoreError> {
+        self.fetch_todo(project, id)
+    }
+
+    /// Apply a [`TodoPatch`]: every `Some` field is written, every `None` field
+    /// is left as-is. `updated_at` is always bumped, and `completed_at` is
+    /// reconciled with the resulting status.
+    pub fn todo_update(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        patch: TodoPatch,
+    ) -> Result<(), CoreError> {
+        let mut todo = self.fetch_todo(project, id)?;
+        if let Some(v) = patch.title {
+            todo.title = v;
+        }
+        if let Some(v) = patch.body {
+            todo.body = v;
+        }
+        if let Some(v) = patch.status {
+            todo.status = v;
+        }
+        if let Some(v) = patch.priority {
+            todo.priority = v;
+        }
+        if let Some(v) = patch.assignee {
+            todo.assignee = v;
+        }
+        if let Some(v) = patch.tags {
+            todo.tags = v;
+        }
+        let tags_json = serde_json::to_string(&todo.tags).unwrap_or_else(|_| "[]".into());
+        self.conn.execute(
+            "UPDATE todos
+                SET title = ?1, body = ?2, status = ?3, priority = ?4,
+                    assignee = ?5, tags = ?6, updated_at = datetime('now')
+              WHERE project_id = ?7 AND id = ?8",
+            params![
+                todo.title,
+                todo.body,
+                todo.status.as_str(),
+                todo.priority.as_str(),
+                todo.assignee,
+                tags_json,
+                project.0,
+                id as i64,
+            ],
+        )?;
+        self.reconcile_completed_at(project, id, todo.status)?;
+        self.reproject_todos(project)
     }
 
     /// Mark a todo complete. Idempotent: completing an already-done todo
     /// succeeds and re-projects.
     pub fn todo_complete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let changed = self.conn.execute(
-            "UPDATE todos SET status = 'done' WHERE project_id = ?1 AND id = ?2",
+            "UPDATE todos SET status = 'completed', updated_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2",
+            params![project.0, id as i64],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::TodoNotFound(id));
+        }
+        self.reconcile_completed_at(project, id, TodoStatus::Completed)?;
+        self.reproject_todos(project)
+    }
+
+    /// Delete a todo and, by foreign-key cascade, its comments and every
+    /// blocker row in which it appears (as the blocked todo or the blocker).
+    pub fn todo_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        let changed = self.conn.execute(
+            "DELETE FROM todos WHERE project_id = ?1 AND id = ?2",
             params![project.0, id as i64],
         )?;
         if changed == 0 {
             return Err(CoreError::TodoNotFound(id));
         }
         self.reproject_todos(project)
+    }
+
+    /// Record that todo `id` is blocked by `blocker_id`. Both todos must exist
+    /// and be distinct. Idempotent: an already-recorded blocker is left as-is.
+    pub fn todo_add_blocker(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        blocker_id: u64,
+    ) -> Result<(), CoreError> {
+        if id == blocker_id {
+            return Err(CoreError::BadRequest("a todo cannot block itself".into()));
+        }
+        self.fetch_todo(project, id)?;
+        self.fetch_todo(project, blocker_id)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO todo_blockers (project_id, todo_id, blocker_id)
+             VALUES (?1, ?2, ?3)",
+            params![project.0, id as i64, blocker_id as i64],
+        )?;
+        self.touch_todo(project, id)?;
+        self.reproject_todos(project)
+    }
+
+    /// Remove the record that todo `id` is blocked by `blocker_id`. Idempotent:
+    /// a blocker that was not recorded is a no-op. The blocked todo must exist.
+    pub fn todo_remove_blocker(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        blocker_id: u64,
+    ) -> Result<(), CoreError> {
+        self.fetch_todo(project, id)?;
+        self.conn.execute(
+            "DELETE FROM todo_blockers
+              WHERE project_id = ?1 AND todo_id = ?2 AND blocker_id = ?3",
+            params![project.0, id as i64, blocker_id as i64],
+        )?;
+        self.touch_todo(project, id)?;
+        self.reproject_todos(project)
+    }
+
+    /// Append a comment to a todo and return the new comment's id (unique
+    /// within that todo, restarting at 1 in each todo).
+    pub fn todo_comment_add(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        author: String,
+        body: String,
+    ) -> Result<u64, CoreError> {
+        let pid = project.0;
+        let comment_id = {
+            let tx = self.conn.transaction()?;
+            let next: Option<i64> = tx
+                .query_row(
+                    "SELECT next_comment_id FROM todos WHERE project_id = ?1 AND id = ?2",
+                    params![pid, id as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let next = next.ok_or(CoreError::TodoNotFound(id))?;
+            tx.execute(
+                "INSERT INTO todo_comments (project_id, todo_id, id, author, body, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                params![pid, id as i64, next, author, body],
+            )?;
+            tx.execute(
+                "UPDATE todos SET next_comment_id = ?1, updated_at = datetime('now')
+                  WHERE project_id = ?2 AND id = ?3",
+                params![next + 1, pid, id as i64],
+            )?;
+            tx.commit()?;
+            next as u64
+        };
+        self.reproject_todos(project)?;
+        Ok(comment_id)
+    }
+
+    /// Set or clear `completed_at` to match `status`: a `Completed` todo keeps
+    /// any existing timestamp or gets one now; any other status clears it.
+    fn reconcile_completed_at(
+        &self,
+        project: ProjectId,
+        id: u64,
+        status: TodoStatus,
+    ) -> Result<(), CoreError> {
+        let sql = if status == TodoStatus::Completed {
+            "UPDATE todos SET completed_at = COALESCE(completed_at, datetime('now'))
+              WHERE project_id = ?1 AND id = ?2"
+        } else {
+            "UPDATE todos SET completed_at = NULL WHERE project_id = ?1 AND id = ?2"
+        };
+        self.conn.execute(sql, params![project.0, id as i64])?;
+        Ok(())
+    }
+
+    /// Bump a todo's `updated_at` to now. Used by mutations of a todo's side
+    /// tables, which do not otherwise touch the `todos` row.
+    fn touch_todo(&self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        self.conn.execute(
+            "UPDATE todos SET updated_at = datetime('now') WHERE project_id = ?1 AND id = ?2",
+            params![project.0, id as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch one todo with its blockers and comments, or
+    /// [`CoreError::TodoNotFound`] when no such todo exists in `project`.
+    fn fetch_todo(&self, project: ProjectId, id: u64) -> Result<Todo, CoreError> {
+        let mut todo = self
+            .conn
+            .query_row(
+                "SELECT title, body, status, priority, assignee, tags,
+                        created_at, updated_at, completed_at
+                   FROM todos WHERE project_id = ?1 AND id = ?2",
+                params![project.0, id as i64],
+                |r| {
+                    let status: String = r.get(2)?;
+                    let priority: String = r.get(3)?;
+                    let tags: String = r.get(5)?;
+                    Ok(Todo {
+                        id,
+                        title: r.get(0)?,
+                        body: r.get(1)?,
+                        status: TodoStatus::parse(&status).unwrap_or(TodoStatus::Open),
+                        priority: Priority::parse(&priority).unwrap_or(Priority::Medium),
+                        assignee: r.get(4)?,
+                        tags: serde_json::from_str(&tags).unwrap_or_default(),
+                        blockers: Vec::new(),
+                        comments: Vec::new(),
+                        created_at: r.get(6)?,
+                        updated_at: r.get(7)?,
+                        completed_at: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(CoreError::TodoNotFound(id))?;
+        todo.blockers = self.todo_blockers(project, id)?;
+        todo.comments = self.todo_comments(project, id)?;
+        Ok(todo)
+    }
+
+    /// The ids that block todo `id`, ascending.
+    fn todo_blockers(&self, project: ProjectId, id: u64) -> Result<Vec<u64>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blocker_id FROM todo_blockers
+              WHERE project_id = ?1 AND todo_id = ?2 ORDER BY blocker_id",
+        )?;
+        let rows = stmt
+            .query_map(params![project.0, id as i64], |r| Ok(r.get::<_, i64>(0)? as u64))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The comments on todo `id`, in post order.
+    fn todo_comments(&self, project: ProjectId, id: u64) -> Result<Vec<TodoComment>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, author, body, created_at FROM todo_comments
+              WHERE project_id = ?1 AND todo_id = ?2 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![project.0, id as i64], |r| {
+            Ok(TodoComment {
+                id: r.get::<_, i64>(0)? as u64,
+                author: r.get(1)?,
+                body: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     // --- projection ---
@@ -494,9 +731,104 @@ mod tests {
         let id = fx.store.todo_create(p, "task".into()).unwrap();
         assert_eq!(fx.store.todo_list(p).unwrap()[0].status, TodoStatus::Open);
         fx.store.todo_complete(p, id).unwrap();
-        assert_eq!(fx.store.todo_list(p).unwrap()[0].status, TodoStatus::Done);
+        let done = fx.store.todo_get(p, id).unwrap();
+        assert_eq!(done.status, TodoStatus::Completed);
+        assert!(done.completed_at.is_some());
         fx.store.todo_complete(p, id).unwrap(); // idempotent
-        assert_eq!(fx.store.todo_list(p).unwrap()[0].status, TodoStatus::Done);
+        assert_eq!(fx.store.todo_get(p, id).unwrap().status, TodoStatus::Completed);
+    }
+
+    #[test]
+    fn todo_update_writes_only_the_some_fields() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.todo_create(p, "draft".into()).unwrap();
+        fx.store
+            .todo_update(
+                p,
+                id,
+                TodoPatch {
+                    body: Some("the description".into()),
+                    priority: Some(Priority::High),
+                    tags: Some(vec!["a".into(), "b".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let t = fx.store.todo_get(p, id).unwrap();
+        assert_eq!(t.title, "draft"); // None field left untouched
+        assert_eq!(t.body, "the description");
+        assert_eq!(t.priority, Priority::High);
+        assert_eq!(t.tags, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn completed_at_tracks_status_through_updates() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.todo_create(p, "task".into()).unwrap();
+        assert!(fx.store.todo_get(p, id).unwrap().completed_at.is_none());
+
+        let to = |s| TodoPatch { status: Some(s), ..Default::default() };
+        fx.store.todo_update(p, id, to(TodoStatus::Completed)).unwrap();
+        assert!(fx.store.todo_get(p, id).unwrap().completed_at.is_some());
+        fx.store.todo_update(p, id, to(TodoStatus::InProgress)).unwrap();
+        assert!(fx.store.todo_get(p, id).unwrap().completed_at.is_none());
+    }
+
+    #[test]
+    fn blockers_record_list_and_reject_self_reference() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let a = fx.store.todo_create(p, "a".into()).unwrap();
+        let b = fx.store.todo_create(p, "b".into()).unwrap();
+
+        fx.store.todo_add_blocker(p, b, a).unwrap();
+        assert_eq!(fx.store.todo_get(p, b).unwrap().blockers, vec![a]);
+        // Re-adding is idempotent; removing clears it.
+        fx.store.todo_add_blocker(p, b, a).unwrap();
+        assert_eq!(fx.store.todo_get(p, b).unwrap().blockers, vec![a]);
+        fx.store.todo_remove_blocker(p, b, a).unwrap();
+        assert!(fx.store.todo_get(p, b).unwrap().blockers.is_empty());
+
+        assert!(matches!(
+            fx.store.todo_add_blocker(p, a, a),
+            Err(CoreError::BadRequest(_))
+        ));
+        assert!(matches!(
+            fx.store.todo_add_blocker(p, a, 999),
+            Err(CoreError::TodoNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn deleting_a_todo_cascades_its_side_tables() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let a = fx.store.todo_create(p, "a".into()).unwrap();
+        let b = fx.store.todo_create(p, "b".into()).unwrap();
+        fx.store.todo_add_blocker(p, b, a).unwrap();
+        fx.store.todo_comment_add(p, a, "me".into(), "note".into()).unwrap();
+
+        // Deleting a (the blocker) cascades away the (b blocked-by a) row.
+        fx.store.todo_delete(p, a).unwrap();
+        assert!(fx.store.todo_get(p, b).unwrap().blockers.is_empty());
+        assert!(matches!(fx.store.todo_get(p, a), Err(CoreError::TodoNotFound(_))));
+    }
+
+    #[test]
+    fn comment_ids_restart_in_each_todo() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let a = fx.store.todo_create(p, "a".into()).unwrap();
+        let b = fx.store.todo_create(p, "b".into()).unwrap();
+        assert_eq!(fx.store.todo_comment_add(p, a, "x".into(), "1".into()).unwrap(), 1);
+        assert_eq!(fx.store.todo_comment_add(p, a, "x".into(), "2".into()).unwrap(), 2);
+        assert_eq!(fx.store.todo_comment_add(p, b, "y".into(), "1".into()).unwrap(), 1);
+        let comments = fx.store.todo_get(p, a).unwrap().comments;
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].body, "1");
+        assert_eq!(comments[1].id, 2);
     }
 
     #[test]
@@ -552,12 +884,17 @@ mod tests {
         let (p, root) = fx.project("proj");
 
         let tid = fx.store.todo_create(p, "wire up auth".into()).unwrap();
-        let todos_md = std::fs::read_to_string(root.join(".panopt/todos.md")).unwrap();
-        assert!(todos_md.contains("- [ ] (#1) wire up auth"), "{todos_md}");
+        let index = std::fs::read_to_string(root.join(".panopt/todos.md")).unwrap();
+        assert!(index.contains("- [ ] [#1](todos/1.md) wire up auth"), "{index}");
+        let todo_md = std::fs::read_to_string(root.join(".panopt/todos/1.md")).unwrap();
+        assert!(todo_md.contains("status: open"), "{todo_md}");
+        assert!(todo_md.contains("# wire up auth"), "{todo_md}");
 
         fx.store.todo_complete(p, tid).unwrap();
-        let todos_md = std::fs::read_to_string(root.join(".panopt/todos.md")).unwrap();
-        assert!(todos_md.contains("- [x] (#1) wire up auth"), "{todos_md}");
+        let index = std::fs::read_to_string(root.join(".panopt/todos.md")).unwrap();
+        assert!(index.contains("- [x] [#1](todos/1.md) wire up auth"), "{index}");
+        let todo_md = std::fs::read_to_string(root.join(".panopt/todos/1.md")).unwrap();
+        assert!(todo_md.contains("status: completed"), "{todo_md}");
 
         let sid = fx.store.scratchpad_create(p, "notes".into()).unwrap();
         fx.store.scratchpad_append(p, sid, "first").unwrap();
