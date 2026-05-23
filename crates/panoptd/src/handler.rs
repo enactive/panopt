@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use http::request::Parts;
 use panopt_core::{
-    Agent, CoreError, Lock, Priority, ProjectId, Store, Todo, TodoPatch, TodoStatus,
+    Agent, CoreError, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad,
+    ScratchpadPatch, Store, Todo, TodoPatch, TodoStatus,
 };
 use rmcp::{
     handler::server::{common::Extension, router::tool::ToolRouter, wrapper::Parameters},
@@ -22,9 +23,12 @@ use rmcp::{
 use serde::Serialize;
 
 use crate::params::{
-    IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
-    ScratchpadReadArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCompleteArgs, TodoCreateArgs,
-    TodoDeleteArgs, TodoGetArgs, TodoUpdateArgs,
+    IdentifyArgs, LockAcquireArgs, LockReleaseArgs, RosterCreateArgs, RosterDeleteArgs,
+    RosterGetArgs, RosterUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
+    ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs,
+    TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs,
+    TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs,
+    TodoSetBlockersArgs, TodoUnlockArgs, TodoUpdateArgs,
 };
 
 /// Per-session MCP handler.
@@ -48,6 +52,28 @@ pub struct Handler {
 struct ScratchpadDto {
     id: u64,
     title: String,
+}
+
+/// Wire shape for `scratchpad_get`: title, body, and timestamps.
+#[derive(Serialize)]
+struct ScratchpadDetailDto {
+    id: u64,
+    title: String,
+    body: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl ScratchpadDetailDto {
+    fn from_scratchpad(pad: &Scratchpad) -> Self {
+        ScratchpadDetailDto {
+            id: pad.id,
+            title: pad.title.clone(),
+            body: pad.body.clone(),
+            created_at: pad.created_at.clone(),
+            updated_at: pad.updated_at.clone(),
+        }
+    }
 }
 
 /// Wire shape for a todo in `todo_list` output: every field but the body and
@@ -103,10 +129,15 @@ struct TodoDetailDto {
     created_at: String,
     updated_at: String,
     completed_at: Option<String>,
+    /// Display name of the agent currently holding `todo:<id>` as an advisory
+    /// lock; `None` when no agent holds it. Locks are ephemeral and not part of
+    /// the SQLite-stored todo, so the daemon resolves this at read time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locked_by: Option<String>,
 }
 
 impl TodoDetailDto {
-    fn from_todo(todo: Todo) -> Self {
+    fn from_todo(todo: Todo, locked_by: Option<String>) -> Self {
         TodoDetailDto {
             id: todo.id,
             title: todo.title,
@@ -129,8 +160,49 @@ impl TodoDetailDto {
             created_at: todo.created_at,
             updated_at: todo.updated_at,
             completed_at: todo.completed_at,
+            locked_by,
         }
     }
+}
+
+/// Wire shape for a roster entry in `roster_list` and `roster_get` output.
+#[derive(Serialize)]
+struct RosterDto {
+    id: u64,
+    kind: &'static str,
+    name: String,
+    display_name: String,
+    command: String,
+    cwd: String,
+    position: i64,
+    created_at: String,
+}
+
+impl RosterDto {
+    fn from_entry(e: RosterEntry) -> Self {
+        RosterDto {
+            id: e.id,
+            kind: e.kind.as_str(),
+            name: e.name,
+            display_name: e.display_name,
+            command: e.command,
+            cwd: e.cwd,
+            position: e.position,
+            created_at: e.created_at,
+        }
+    }
+}
+
+/// The display name of whoever holds `todo:<id>` in `project`, if anyone does.
+/// Resolves through [`Store::lock_list`] so the holder's registered name lands
+/// instead of the raw session key.
+fn todo_lock_holder(store: &Store, project: ProjectId, todo_id: u64) -> Option<String> {
+    let name = format!("todo:{todo_id}");
+    store
+        .lock_list(project)
+        .into_iter()
+        .find(|l| l.name == name)
+        .map(|l| l.holder_name)
 }
 
 /// Wire shape for an agent in `agent_list` and `whoami` output.
@@ -194,6 +266,8 @@ fn map_core_err(e: CoreError) -> McpError {
         // the daemon cannot reach.
         CoreError::ScratchpadNotFound(_)
         | CoreError::TodoNotFound(_)
+        | CoreError::TodoCommentNotFound { .. }
+        | CoreError::RosterNotFound(_)
         | CoreError::BadRequest(_)
         | CoreError::Workspace(_) => McpError::invalid_params(e.to_string(), None),
         // Internal: a stale project handle, a database fault, or a failed write.
@@ -325,6 +399,16 @@ fn parse_priority(s: &str) -> Result<Priority, McpError> {
     Priority::parse(s).ok_or_else(|| {
         McpError::invalid_params(
             format!("invalid priority '{s}': expected high, medium, or low"),
+            None,
+        )
+    })
+}
+
+/// Parse a roster-kind token from a tool argument, with a caller-facing error.
+fn parse_roster_kind(s: &str) -> Result<RosterKind, McpError> {
+    RosterKind::parse(s).ok_or_else(|| {
+        McpError::invalid_params(
+            format!("invalid kind '{s}': expected agent, command, or terminal"),
             None,
         )
     })
@@ -520,6 +604,64 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
+    #[tool(
+        description = "Fetch one scratchpad in full - id, title, body, and timestamps - \
+                       addressed by numeric id."
+    )]
+    async fn scratchpad_get(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ScratchpadGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            let pad = st
+                .scratchpad_get(project, args.scratchpad_id)
+                .map_err(map_core_err)?;
+            ScratchpadDetailDto::from_scratchpad(&pad)
+        };
+        json_result(&dto)
+    }
+
+    #[tool(
+        description = "Edit a scratchpad's title and/or body. Each omitted field is left \
+                       unchanged; body replaces the existing body in full (use \
+                       scratchpad_append to add instead of replace)."
+    )]
+    async fn scratchpad_update(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ScratchpadUpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            let patch = ScratchpadPatch { title: args.title, body: args.body };
+            st.scratchpad_update(project, args.scratchpad_id, patch)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(
+        description = "Delete a scratchpad. Removes both the database row and the per-pad \
+                       projection file."
+    )]
+    async fn scratchpad_delete(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ScratchpadDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.scratchpad_delete(project, args.scratchpad_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
     #[tool(description = "Create a new todo with a title. Returns its numeric id.")]
     async fn todo_create(
         &self,
@@ -554,7 +696,8 @@ impl Handler {
     }
 
     #[tool(description = "Fetch one todo in full - body, comment thread, blockers and all - \
-                          addressed by numeric id.")]
+                          addressed by numeric id. `locked_by` is set when an agent holds \
+                          the `todo:<id>` advisory lock.")]
     async fn todo_get(
         &self,
         Extension(parts): Extension<Parts>,
@@ -563,7 +706,9 @@ impl Handler {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            TodoDetailDto::from_todo(st.todo_get(project, args.todo_id).map_err(map_core_err)?)
+            let todo = st.todo_get(project, args.todo_id).map_err(map_core_err)?;
+            let locked_by = todo_lock_holder(&st, project, args.todo_id);
+            TodoDetailDto::from_todo(todo, locked_by)
         };
         json_result(&dto)
     }
@@ -690,6 +835,212 @@ impl Handler {
         };
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
+
+    #[tool(description = "Edit an existing comment's body. The author and timestamp are \
+                          preserved - this is not a re-post.")]
+    async fn todo_comment_update(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoCommentUpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_comment_update(project, args.todo_id, args.comment_id, args.body)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Delete a comment from a todo. Comment ids are not reused after \
+                          deletion - the per-todo counter keeps advancing.")]
+    async fn todo_comment_delete(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoCommentDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_comment_delete(project, args.todo_id, args.comment_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Replace a todo's blocker set in one call. Equivalent to a diff of \
+                          todo_add_blocker / todo_remove_blocker, but atomic - used by the \
+                          cockpit form to avoid a half-applied state.")]
+    async fn todo_set_blockers(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoSetBlockersArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_set_blockers(project, args.todo_id, args.blocker_ids)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "List the project's tag vocabulary: the sorted, deduped union of \
+                          every tag attached to any todo. Used for tag autocomplete in the \
+                          cockpit form.")]
+    async fn todo_tags_list(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let tags = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_tags_list(project).map_err(map_core_err)?
+        };
+        json_result(&tags)
+    }
+
+    #[tool(description = "Claim a todo as `todo:<id>` in the advisory lock table. A thin \
+                          wrapper around lock_acquire - non-blocking, returns {acquired: \
+                          bool, held_by?: name}. Advisory only.")]
+    async fn todo_lock(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoLockArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let outcome = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, key) = enter(&mut st, &parts)?;
+            let key = require_key(key)?;
+            // Make sure the todo exists before we register a lock against it -
+            // otherwise an agent could squat `todo:999` forever.
+            st.todo_get(project, args.todo_id).map_err(map_core_err)?;
+            let name = format!("todo:{}", args.todo_id);
+            st.lock_acquire(project, &key, name, args.note)
+                .map_err(map_core_err)?
+        };
+        match outcome {
+            None => json_result(&serde_json::json!({ "acquired": true })),
+            Some(holder) => json_result(&serde_json::json!({ "acquired": false, "held_by": holder })),
+        }
+    }
+
+    #[tool(description = "Release the `todo:<id>` advisory lock you hold. Returns \
+                          {released: bool, held_by?: name}.")]
+    async fn todo_unlock(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoUnlockArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let outcome = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, key) = enter(&mut st, &parts)?;
+            let key = require_key(key)?;
+            let name = format!("todo:{}", args.todo_id);
+            st.lock_release(project, &key, &name).map_err(map_core_err)?
+        };
+        match outcome {
+            None => json_result(&serde_json::json!({ "released": true })),
+            Some(holder) => json_result(&serde_json::json!({ "released": false, "held_by": holder })),
+        }
+    }
+
+    #[tool(description = "Create a roster entry - a persistent agent, command, or terminal for \
+                          this project. kind is one of agent/command/terminal. Returns its \
+                          numeric id.")]
+    async fn roster_create(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterCreateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = parse_roster_kind(&args.kind)?;
+        let id = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_create(
+                project,
+                kind,
+                args.name,
+                args.display_name.unwrap_or_default(),
+                args.command.unwrap_or_default(),
+                args.cwd.unwrap_or_default(),
+            )
+            .map_err(map_core_err)?
+        };
+        Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
+    }
+
+    #[tool(description = "List this project's roster as a JSON array of {id, kind, name, \
+                          display_name, command, cwd, position, created_at}.")]
+    async fn roster_list(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let dtos: Vec<RosterDto> = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_list(project)
+                .map_err(map_core_err)?
+                .into_iter()
+                .map(RosterDto::from_entry)
+                .collect()
+        };
+        json_result(&dtos)
+    }
+
+    #[tool(description = "Fetch one roster entry in full, addressed by numeric id.")]
+    async fn roster_get(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            RosterDto::from_entry(
+                st.roster_get(project, args.roster_id).map_err(map_core_err)?,
+            )
+        };
+        json_result(&dto)
+    }
+
+    #[tool(description = "Edit a roster entry's fields. Every argument but roster_id is \
+                          optional; an omitted field is left unchanged.")]
+    async fn roster_update(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterUpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let patch = RosterPatch {
+            name: args.name,
+            display_name: args.display_name,
+            command: args.command,
+            cwd: args.cwd,
+            position: args.position,
+        };
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_update(project, args.roster_id, patch)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Delete a roster entry, addressed by numeric id.")]
+    async fn roster_delete(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_delete(project, args.roster_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
 }
 
 #[tool_handler]
@@ -715,10 +1066,21 @@ impl ServerHandler for Handler {
                  lock. Locks are advisory - agents cooperate, the daemon does not enforce.\n\
                  - Todos: todo_create (returns an id), todo_list (summaries), \
                  todo_get (one todo in full), todo_update (edit any field), \
-                 todo_complete, todo_delete, todo_add_blocker / todo_remove_blocker, \
-                 and todo_comment_add. Each todo also projects to .panopt/todos/<id>.md.\n\
+                 todo_complete, todo_delete, todo_add_blocker / todo_remove_blocker / \
+                 todo_set_blockers, todo_comment_add / todo_comment_update / \
+                 todo_comment_delete, todo_tags_list (project tag vocabulary), and \
+                 todo_lock / todo_unlock (advisory `todo:<id>` lock, surfaced as \
+                 locked_by on todo_get). Each todo also projects to \
+                 .panopt/todos/<id>.md.\n\
                  - Scratchpads: scratchpad_create (returns an id), scratchpad_list, \
-                 scratchpad_append, scratchpad_read. Reference scratchpads by numeric id.\n\
+                 scratchpad_get (one scratchpad in full), scratchpad_append (add to body), \
+                 scratchpad_read (body only), scratchpad_update (replace title and/or body), \
+                 scratchpad_delete. Each scratchpad also projects to \
+                 .panopt/scratchpad/<id>.md.\n\
+                 - Roster: roster_create (kind agent/command/terminal, returns an id), \
+                 roster_list, roster_get, roster_update, roster_delete. The roster is the \
+                 project's persistent agents, commands, and terminals; the cockpit launches \
+                 and tracks them. Projected to .panopt/roster.md.\n\
                  State is persisted, shared live across every agent on the same project, \
                  and mirrored into .panopt/*.md under the project root."
                     .to_string(),

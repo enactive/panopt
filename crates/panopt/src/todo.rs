@@ -115,7 +115,7 @@ pub(crate) fn observer_url(ws: Option<PathBuf>, port: u16) -> Result<String> {
 }
 
 /// The project root: the given path, or the current directory, canonicalized.
-fn resolve_ws(ws: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn resolve_ws(ws: Option<PathBuf>) -> Result<PathBuf> {
     let ws = match ws {
         Some(ws) => ws,
         None => std::env::current_dir().context("reading the current directory")?,
@@ -193,14 +193,14 @@ fn dispatch(client: &Client, cmd: TodoCmd) -> Result<()> {
 }
 
 /// Insert `key: value` into `args` only when `value` is `Some`.
-fn insert_opt(args: &mut Map<String, Value>, key: &str, value: Option<String>) {
+pub(crate) fn insert_opt(args: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if let Some(v) = value {
         args.insert(key.to_string(), Value::String(v));
     }
 }
 
 /// Render a scalar tool result (a bare number or string) without JSON quotes.
-fn render_scalar(v: &Value) -> String {
+pub(crate) fn render_scalar(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         other => other.to_string(),

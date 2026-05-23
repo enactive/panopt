@@ -29,6 +29,31 @@ pub struct ScratchpadReadArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScratchpadGetArgs {
+    /// Numeric id of the scratchpad to fetch in full.
+    pub scratchpad_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScratchpadUpdateArgs {
+    /// Numeric id of the scratchpad to edit.
+    pub scratchpad_id: u64,
+    /// New title. Omit to leave unchanged.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Replacement body. Replaces the existing body in full. Omit to leave
+    /// unchanged.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScratchpadDeleteArgs {
+    /// Numeric id of the scratchpad to delete.
+    pub scratchpad_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TodoCreateArgs {
     /// Short description of the todo.
     pub title: String,
@@ -96,6 +121,97 @@ pub struct TodoCommentAddArgs {
     /// a non-agent caller (the `panopt` CLI) supplies this explicitly.
     #[serde(default)]
     pub author: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoCommentUpdateArgs {
+    /// Numeric id of the todo the comment lives on.
+    pub todo_id: u64,
+    /// Numeric id of the comment to edit (per-todo, restarts at 1 in each todo).
+    pub comment_id: u64,
+    /// Replacement body. The author and timestamp are preserved.
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoCommentDeleteArgs {
+    /// Numeric id of the todo the comment lives on.
+    pub todo_id: u64,
+    /// Numeric id of the comment to delete.
+    pub comment_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoSetBlockersArgs {
+    /// Numeric id of the todo whose blocker set is being replaced.
+    pub todo_id: u64,
+    /// Replacement set of blocker ids. May be empty to clear all blockers.
+    pub blocker_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoLockArgs {
+    /// Numeric id of the todo to claim. The advisory lock name is `todo:<id>`.
+    pub todo_id: u64,
+    /// Optional reason, shown to other agents in `lock_status`.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoUnlockArgs {
+    /// Numeric id of the todo whose lock to release.
+    pub todo_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterCreateArgs {
+    /// Kind of entry: one of agent, command, terminal.
+    pub kind: String,
+    /// Identifier-style name for the entry.
+    pub name: String,
+    /// Optional human label shown in the cockpit. Omit to use `name`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Shell command the entry launches. Omit for a bare terminal.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Working directory for the launched command. Omit to use the project root.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterGetArgs {
+    /// Numeric id of the roster entry to fetch.
+    pub roster_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterUpdateArgs {
+    /// Numeric id of the roster entry to edit.
+    pub roster_id: u64,
+    /// New name. Omit to leave unchanged.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New display label. Omit to leave unchanged.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// New launch command. Omit to leave unchanged.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// New working directory. Omit to leave unchanged.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// New sort position. Omit to leave unchanged.
+    #[serde(default)]
+    pub position: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterDeleteArgs {
+    /// Numeric id of the roster entry to delete.
+    pub roster_id: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

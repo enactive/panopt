@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -83,6 +83,81 @@ CREATE TABLE todo_blockers (
 );
 ";
 
+/// Version 3: the persistent agent/command/terminal roster (todo #67).
+///
+/// Adds one `roster` table holding all three kinds, distinguished by a `kind`
+/// column, modeled on Solo's `processes` table. Like `todos` and `scratchpads`
+/// it is keyed `(project_id, id)` with a per-project id counter on `projects`.
+/// Columns are deliberately minimal; per-entry settings (auto-start, env, an
+/// agent-tool link) are left for later additions.
+const SCHEMA_V3: &str = "
+ALTER TABLE projects ADD COLUMN next_roster_id INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE roster (
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
+    id           INTEGER NOT NULL,
+    kind         TEXT    NOT NULL,
+    name         TEXT    NOT NULL,
+    display_name TEXT    NOT NULL DEFAULT '',
+    command      TEXT    NOT NULL DEFAULT '',
+    cwd          TEXT    NOT NULL DEFAULT '',
+    position     INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL,
+    PRIMARY KEY (project_id, id)
+);
+";
+
+/// Version 4: timestamps on scratchpads (todo #76).
+///
+/// Adds `created_at` and `updated_at` to `scratchpads` so every mutation -
+/// including append - can bump `updated_at` and the projected index line can
+/// surface it. That makes the cockpit sidebar visibly refresh on every
+/// scratchpad change, the same way every todo mutation already changes the
+/// todo index line through its status/priority fields. The backfill mirrors
+/// the v1->v2 todo backfill: any pre-existing scratchpad lands with both
+/// timestamps set to `datetime('now')`.
+///
+/// The `ALTER`s run through [`add_column_if_missing`] rather than a raw
+/// `execute_batch`, so a database stuck at `user_version = 3` whose
+/// `scratchpads` table already carries the v4 columns - the transitional
+/// state of any machine that ran an in-development v4 binary before the
+/// `user_version` bump landed - upgrades cleanly instead of failing on
+/// "duplicate column name". The backfill is unconditionally safe.
+fn apply_v4(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "scratchpads", "created_at", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "scratchpads", "updated_at", "TEXT NOT NULL DEFAULT ''")?;
+    conn.execute_batch(
+        "UPDATE scratchpads
+            SET created_at = datetime('now'), updated_at = datetime('now')
+          WHERE created_at = '';",
+    )
+}
+
+/// Add `column` to `table` only if it is not already there. Used by migrations
+/// that may collide with a transitional dev-database state where the column
+/// landed before its `user_version` bump did. `decl` is the type+constraint
+/// text after the column name, exactly as it would appear in an `ALTER TABLE`.
+///
+/// `column` and `table` are fixed in-crate identifiers, not caller input, so
+/// interpolating them into the SQL is safe.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let existing: String = row.get(1)?;
+        if existing == column {
+            return Ok(());
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))
+}
+
 /// Bring `conn` up to [`SCHEMA_VERSION`], creating tables on a fresh database.
 ///
 /// Idempotent: a database already at the current version is left untouched.
@@ -95,6 +170,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
     if version < 2 {
         conn.execute_batch(SCHEMA_V2)?;
+    }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3)?;
+    }
+    if version < 4 {
+        apply_v4(conn)?;
     }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -163,5 +244,140 @@ mod tests {
             .query_row("SELECT created_at FROM todos WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert!(!created.is_empty(), "created_at should be backfilled");
+    }
+
+    #[test]
+    fn fresh_database_has_the_v3_roster_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO roster (project_id, id, kind, name, created_at)
+                 VALUES (1, 1, 'agent', 'Claude', '');",
+        )
+        .unwrap();
+        let next: i64 = conn
+            .query_row("SELECT next_roster_id FROM projects WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn fresh_database_has_v4_scratchpad_timestamps() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // The v4 columns exist and accept inserts that set both timestamps.
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+                 VALUES (1, 1, 't', '', datetime('now'), datetime('now'));",
+        )
+        .unwrap();
+        let updated: String = conn
+            .query_row("SELECT updated_at FROM scratchpads WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(!updated.is_empty(), "fresh scratchpad has updated_at set");
+    }
+
+    #[test]
+    fn v3_database_upgrades_to_v4_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Stand up a v3 database by hand: v1+v2+v3, version pinned to 3.
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO scratchpads (project_id, id, title, body)
+                 VALUES (1, 1, 'old', 'note');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The pre-existing scratchpad is backfilled with real timestamps.
+        let (created, updated): (String, String) = conn
+            .query_row(
+                "SELECT created_at, updated_at FROM scratchpads WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(!created.is_empty(), "created_at backfilled");
+        assert!(!updated.is_empty(), "updated_at backfilled");
+    }
+
+    #[test]
+    fn v4_migration_tolerates_a_transitional_database_with_columns_already_present() {
+        // Models the local-dev drift that prompted this guard: an earlier
+        // in-development v4 binary ran the ALTER on `scratchpads` but did not
+        // bump `user_version`, so the database now reports v3 yet already
+        // carries the v4 columns. `migrate` should upgrade it cleanly instead
+        // of failing on a duplicate-column ALTER.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE scratchpads ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
+             ALTER TABLE scratchpads ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+                 VALUES (1, 1, 'pre-bumped', 'note', '', '');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The backfill still runs, so the empty timestamps land at real ones.
+        let updated: String = conn
+            .query_row("SELECT updated_at FROM scratchpads WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(!updated.is_empty(), "updated_at backfilled even in the drift case");
+    }
+
+    #[test]
+    fn v2_database_upgrades_to_v3_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Stand up a v2 database by hand: the v1+v2 schema, version pinned to 2.
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch("INSERT INTO projects (id, root) VALUES (1, '/x');")
+            .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The roster table and the new per-project counter both exist.
+        conn.execute_batch(
+            "INSERT INTO roster (project_id, id, kind, name, created_at)
+                 VALUES (1, 1, 'command', 'Run', '');",
+        )
+        .unwrap();
+        let next: i64 = conn
+            .query_row("SELECT next_roster_id FROM projects WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(next, 1);
     }
 }
