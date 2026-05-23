@@ -148,6 +148,8 @@ struct PanoptSidebar {
     /// Cleared on the next successful navigation. A placeholder until the
     /// floating-pane dialog (task 5) lands.
     last_gate_refusal: Option<String>,
+    /// Whether the initial preview has been shown on startup.
+    initial_preview_done: bool,
 }
 
 /// A parsed `.panopt/roster.md` line.
@@ -279,6 +281,13 @@ impl ZellijPlugin for PanoptSidebar {
             Event::PaneUpdate(manifest) => {
                 self.ingest_panes(manifest);
                 self.rebuild_sections();
+                if !self.initial_preview_done && self.slot_pane.is_some() && self.permitted {
+                    self.preview_focus();
+                    if let Some(plugin) = self.plugin_pane {
+                        focus_pane_with_id(plugin, false, false);
+                    }
+                    self.initial_preview_done = true;
+                }
                 true
             }
             Event::Key(key) => self.handle_key(key),
@@ -380,11 +389,7 @@ impl ZellijPlugin for PanoptSidebar {
             }
             if section.items.len() > limit {
                 let more = section.items.len() - limit;
-                lines.push((
-                    format!("  +{more} more"),
-                    RowKind::More(si),
-                    Style::DIM,
-                ));
+                lines.push((format!("  +{more} more"), RowKind::More(si), Style::DIM));
             }
         }
 
@@ -662,11 +667,17 @@ impl PanoptSidebar {
     fn nav_rows(&self) -> Vec<Focus> {
         let mut rows = Vec::new();
         for (si, section) in self.sections.iter().enumerate() {
-            rows.push(Focus { section: si, item: None });
+            rows.push(Focus {
+                section: si,
+                item: None,
+            });
             if !self.collapsed[si] {
                 let shown = visible_item_count(section);
                 for ii in 0..shown {
-                    rows.push(Focus { section: si, item: Some(ii) });
+                    rows.push(Focus {
+                        section: si,
+                        item: Some(ii),
+                    });
                 }
             }
         }
@@ -691,9 +702,7 @@ impl PanoptSidebar {
     fn row_is_focused(&self, kind: RowKind) -> bool {
         match kind {
             RowKind::Header(si) => self.focus.section == si && self.focus.item.is_none(),
-            RowKind::Item(si, ii) => {
-                self.focus.section == si && self.focus.item == Some(ii)
-            }
+            RowKind::Item(si, ii) => self.focus.section == si && self.focus.item == Some(ii),
             _ => false,
         }
     }
@@ -728,21 +737,26 @@ impl PanoptSidebar {
     /// Preview the focused row in the slot, leaving focus on the sidebar. A
     /// document re-points every viewer; a running pane is routed into the slot
     /// or - when it is already visible in another split - the slot clears
-    /// instead, since a TTY cannot be in two places at once. A row with
-    /// nothing to show (a section header, a roster entry that is not running)
-    /// also clears the slot. Preview never starts a process.
+    /// instead, since a TTY cannot be in two places at once. Focusing the
+    /// Todos or Scratchpads header previews its list (the same document a
+    /// click would open); other headers and a roster entry that is not
+    /// running clear the slot. Preview never starts a process.
     fn preview_focus(&mut self) {
         match self.focused_target() {
             Some(ItemTarget::Todo(id)) => self.open_document("todo", Some(id), false),
-            Some(ItemTarget::Scratchpad(id)) => {
-                self.open_document("scratchpad", Some(id), false)
-            }
+            Some(ItemTarget::Scratchpad(id)) => self.open_document("scratchpad", Some(id), false),
             Some(ItemTarget::Roster(id)) => match self.roster_pane(id) {
                 Some(pane) => self.route_pane_to_slot(pane, false),
                 None => self.clear_slot(),
             },
             Some(ItemTarget::Pane(pane)) => self.route_pane_to_slot(pane, false),
-            None => self.clear_slot(),
+            None => match self.sections.get(self.focus.section).map(|s| s.kind) {
+                Some(SectionKind::Todos) => self.open_document("todo-list", None, false),
+                Some(SectionKind::Scratchpads) => {
+                    self.open_document("scratchpad-list", None, false)
+                }
+                _ => self.clear_slot(),
+            },
         }
     }
 
@@ -789,7 +803,10 @@ impl PanoptSidebar {
                 }
                 let handled = match self.row_map.get(line as usize).copied() {
                     Some(RowKind::Header(si)) => {
-                        self.focus = Focus { section: si, item: None };
+                        self.focus = Focus {
+                            section: si,
+                            item: None,
+                        };
                         if col < 2 {
                             self.toggle_collapsed(si);
                         } else {
@@ -798,7 +815,10 @@ impl PanoptSidebar {
                         true
                     }
                     Some(RowKind::Item(si, ii)) => {
-                        self.focus = Focus { section: si, item: Some(ii) };
+                        self.focus = Focus {
+                            section: si,
+                            item: Some(ii),
+                        };
                         self.activate_item(si, ii, false);
                         true
                     }
@@ -868,9 +888,7 @@ impl PanoptSidebar {
     fn open_section_list(&mut self, si: usize, focus: bool) {
         match self.sections.get(si).map(|s| s.kind) {
             Some(SectionKind::Todos) => self.open_document("todo-list", None, focus),
-            Some(SectionKind::Scratchpads) => {
-                self.open_document("scratchpad-list", None, focus)
-            }
+            Some(SectionKind::Scratchpads) => self.open_document("scratchpad-list", None, focus),
             _ => self.toggle_collapsed(si),
         }
     }
@@ -1044,12 +1062,9 @@ impl PanoptSidebar {
         let new = match self.slot_pane {
             // `open_command_pane_in_place_of_pane_id` suppresses the replaced
             // pane (false = do not close it) and does not change focus.
-            Some(slot) => open_command_pane_in_place_of_pane_id(
-                slot,
-                command,
-                false,
-                BTreeMap::new(),
-            ),
+            Some(slot) => {
+                open_command_pane_in_place_of_pane_id(slot, command, false, BTreeMap::new())
+            }
             None => open_command_pane(command, BTreeMap::new()),
         };
         if let Some(pane) = new {
@@ -1084,7 +1099,11 @@ impl PanoptSidebar {
             "empty".to_string(),
         ];
         open_command_pane(
-            CommandToRun { path: PathBuf::from(&self.panopt_bin), args, cwd: Some(ws) },
+            CommandToRun {
+                path: PathBuf::from(&self.panopt_bin),
+                args,
+                cwd: Some(ws),
+            },
             BTreeMap::new(),
         );
     }
@@ -1431,10 +1450,7 @@ fn is_user_shell(basename: &str) -> bool {
 /// do.
 fn is_transient_pipe_pane(p: &PaneInfo) -> bool {
     p.terminal_command.as_deref().map_or(false, |c| {
-        c.contains("zellij")
-            && c.contains("action")
-            && c.contains("pipe")
-            && c.contains("panopt:")
+        c.contains("zellij") && c.contains("action") && c.contains("pipe") && c.contains("panopt:")
     })
 }
 
@@ -1614,7 +1630,10 @@ mod tests {
             })
             .collect();
         PanoptSidebar {
-            sections: vec![Section { kind: SectionKind::Todos, items }],
+            sections: vec![Section {
+                kind: SectionKind::Todos,
+                items,
+            }],
             ..PanoptSidebar::default()
         }
     }
@@ -1639,10 +1658,9 @@ mod tests {
         // The post-V4 form embeds `- updated <ts>` in the trailing label.
         // The parser treats everything after `") "` as the label, so the
         // timestamp simply flows into the cockpit's row text.
-        let (id, label) = parse_index_line(
-            "- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21",
-        )
-        .unwrap();
+        let (id, label) =
+            parse_index_line("- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21")
+                .unwrap();
         assert_eq!(id, 1);
         assert_eq!(label, "Sample Notes - updated 2026-05-23 18:05:21");
     }
@@ -1690,16 +1708,40 @@ mod tests {
     fn move_focus_walks_the_header_and_each_item() {
         let mut sidebar = sidebar_with_todos(2);
         // The cursor starts on the section header.
-        assert_eq!(sidebar.focus, Focus { section: 0, item: None });
+        assert_eq!(
+            sidebar.focus,
+            Focus {
+                section: 0,
+                item: None
+            }
+        );
         // Down stops on each item in turn.
         assert!(sidebar.move_focus(1));
-        assert_eq!(sidebar.focus, Focus { section: 0, item: Some(0) });
+        assert_eq!(
+            sidebar.focus,
+            Focus {
+                section: 0,
+                item: Some(0)
+            }
+        );
         assert!(sidebar.move_focus(1));
-        assert_eq!(sidebar.focus, Focus { section: 0, item: Some(1) });
+        assert_eq!(
+            sidebar.focus,
+            Focus {
+                section: 0,
+                item: Some(1)
+            }
+        );
         // Up walks back onto the header.
         assert!(sidebar.move_focus(-1));
         assert!(sidebar.move_focus(-1));
-        assert_eq!(sidebar.focus, Focus { section: 0, item: None });
+        assert_eq!(
+            sidebar.focus,
+            Focus {
+                section: 0,
+                item: None
+            }
+        );
     }
 
     #[test]
@@ -1710,7 +1752,13 @@ mod tests {
         // Move to the last row, then confirm Down there does not move.
         assert!(sidebar.move_focus(1));
         assert!(!sidebar.move_focus(1));
-        assert_eq!(sidebar.focus, Focus { section: 0, item: Some(0) });
+        assert_eq!(
+            sidebar.focus,
+            Focus {
+                section: 0,
+                item: Some(0)
+            }
+        );
     }
 
     #[test]
@@ -1718,7 +1766,10 @@ mod tests {
         let mut sidebar = sidebar_with_todos(1);
         assert!(sidebar.focused_target().is_none());
         sidebar.move_focus(1);
-        assert!(matches!(sidebar.focused_target(), Some(ItemTarget::Todo(0))));
+        assert!(matches!(
+            sidebar.focused_target(),
+            Some(ItemTarget::Todo(0))
+        ));
     }
 
     #[test]
@@ -1794,9 +1845,7 @@ mod tests {
                     id: 7,
                     is_selectable: true,
                     is_suppressed: true,
-                    terminal_command: Some(
-                        "/bin/panopt _viewer --slot v1 --port 7600".to_string(),
-                    ),
+                    terminal_command: Some("/bin/panopt _viewer --slot v1 --port 7600".to_string()),
                     ..Default::default()
                 },
                 PaneInfo {
@@ -1821,10 +1870,7 @@ mod tests {
         );
         // The suppressed viewer is the one `ensure_viewer_in_slot` reveals
         // into the slot before falling back to spawning a fresh one.
-        assert_eq!(
-            sidebar.first_suppressed_viewer(),
-            Some(PaneId::Terminal(7))
-        );
+        assert_eq!(sidebar.first_suppressed_viewer(), Some(PaneId::Terminal(7)));
         // The agent pane carries no viewer slot name.
         assert!(sidebar.viewer_slot_of(PaneId::Terminal(9)).is_none());
     }
@@ -1874,9 +1920,9 @@ mod tests {
         let agents = &sidebar.sections[1];
         assert_eq!(agents.items[0].label, "Agent 1"); // pane 4
         assert_eq!(agents.items[1].label, "Agent 2"); // pane 9
-        // A later manifest delivers the panes in the other order and adds one.
-        // Existing labels stay put; the new pane takes the next number; rows
-        // stay ordered by pane id.
+                                                      // A later manifest delivers the panes in the other order and adds one.
+                                                      // Existing labels stay put; the new pane takes the next number; rows
+                                                      // stay ordered by pane id.
         sidebar.ingest_panes(manifest(&[12, 9, 4]));
         sidebar.rebuild_sections();
         let agents = &sidebar.sections[1];
