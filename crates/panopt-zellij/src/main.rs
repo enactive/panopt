@@ -150,6 +150,8 @@ struct PanoptSidebar {
     last_gate_refusal: Option<String>,
     /// Whether the initial preview has been shown on startup.
     initial_preview_done: bool,
+    /// Counter for delaying initial preview until the UI is ready.
+    initial_preview_delay: u32,
 }
 
 /// A parsed `.panopt/roster.md` line.
@@ -281,18 +283,21 @@ impl ZellijPlugin for PanoptSidebar {
             Event::PaneUpdate(manifest) => {
                 self.ingest_panes(manifest);
                 self.rebuild_sections();
-                if !self.initial_preview_done && self.slot_pane.is_some() && self.permitted {
-                    self.preview_focus();
-                    if let Some(plugin) = self.plugin_pane {
-                        focus_pane_with_id(plugin, false, false);
-                    }
-                    self.initial_preview_done = true;
-                }
                 true
             }
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Timer(_) => {
+                if !self.initial_preview_done && self.slot_pane.is_some() && self.permitted {
+                    self.initial_preview_delay += 1;
+                    if self.initial_preview_delay >= 2 {
+                        self.preview_focus();
+                        if let Some(plugin) = self.plugin_pane {
+                            focus_pane_with_id(plugin, false, false);
+                        }
+                        self.initial_preview_done = true;
+                    }
+                }
                 self.reload_data();
                 self.rebuild_sections();
                 set_timeout(1.0);
