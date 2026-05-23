@@ -1,0 +1,248 @@
+//! Soft-wrap helper for the body fields.
+//!
+//! `tui_textarea` 0.7 does not support visual line wrap - it tracks one row
+//! per logical line and scrolls horizontally when a line outgrows the field.
+//! For prose-shaped fields (todo / scratchpad bodies) that reads as "my text
+//! disappeared off the right edge." This module re-renders the textarea's
+//! buffer wrapped at the field width, and maps the textarea's logical cursor
+//! position to a visual position so the host can place the terminal cursor on
+//! the right cell.
+//!
+//! Wrapping is word-aware: a visual row breaks at the last whitespace that
+//! fits, with the whitespace kept at the end of the upper row so every char
+//! in the buffer still appears once in the visual grid (the cursor map relies
+//! on that 1-to-1 correspondence). If a single token is wider than the field,
+//! it falls back to a hard char-level break.
+//!
+//! Selection / highlight regions are not reflected - the body fields don't
+//! surface them visually today.
+
+use unicode_width::UnicodeWidthChar;
+
+/// One logical line wrapped into visual rows that each fit in `width` cells.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Wrapped {
+    /// Visual rows, top to bottom, across every logical line.
+    pub lines: Vec<String>,
+    /// Where the logical cursor lands in the visual grid: `(row, col)`.
+    /// `row` indexes [`Wrapped::lines`]; `col` is in cells from the left.
+    pub cursor: (usize, usize),
+}
+
+/// Wrap `lines` at `width` cells per visual row, and locate the visual
+/// position of the logical cursor `(row, col)`.
+///
+/// `width == 0` is treated as "no wrap": the input lines pass through and the
+/// visual cursor matches the logical one in row, with col clamped.
+pub(crate) fn wrap_for_display(
+    lines: &[String],
+    cursor: (usize, usize),
+    width: usize,
+) -> Wrapped {
+    if width == 0 {
+        return Wrapped {
+            lines: lines.to_vec(),
+            cursor,
+        };
+    }
+    let (clog_row, clog_col) = cursor;
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut cvis: (usize, usize) = (0, 0);
+    let mut found_cursor = false;
+
+    for (lrow, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            // Empty logical line gets one empty visual row.
+            if !found_cursor && lrow == clog_row {
+                cvis = (out_lines.len(), 0);
+                found_cursor = true;
+            }
+            out_lines.push(String::new());
+            continue;
+        }
+
+        // Greedy word-wrap pass over this logical line. `i` is the start of the
+        // segment under construction; `j` walks forward until adding the next
+        // char would overflow `width`. When that happens, `last_break` is the
+        // closest split point at or before `j` that lands just after a run of
+        // whitespace - we break there so the whitespace stays at the end of
+        // the upper row. With no break point available the segment splits at
+        // `j` (char-level fallback for tokens wider than the field).
+        let mut i = 0usize;
+        while i < chars.len() {
+            let mut visual_w = 0usize;
+            let mut j = i;
+            // The most recent char-index strictly after a whitespace inside
+            // chars[i..j], or `None` if no whitespace has been seen yet.
+            let mut last_break: Option<usize> = None;
+            while j < chars.len() {
+                let cw = UnicodeWidthChar::width(chars[j]).unwrap_or(0);
+                if visual_w + cw > width {
+                    break;
+                }
+                visual_w += cw;
+                j += 1;
+                if chars[j - 1].is_whitespace() && j > i {
+                    last_break = Some(j);
+                }
+            }
+
+            let seg_end = if j == chars.len() {
+                // Everything from `i` fits in one segment - last row of the
+                // line.
+                j
+            } else if let Some(b) = last_break {
+                // Break just after the most recent whitespace.
+                b
+            } else {
+                // No whitespace in this segment - split at width.
+                j.max(i + 1)
+            };
+
+            let seg: String = chars[i..seg_end].iter().collect();
+
+            // If the logical cursor falls in this segment, map it. End-of-line
+            // (clog_col == chars.len()) lands on the final segment.
+            if !found_cursor && lrow == clog_row {
+                let in_segment = (i..seg_end).contains(&clog_col)
+                    || (seg_end == chars.len() && clog_col == seg_end);
+                if in_segment {
+                    let col = visual_col_within(&seg, clog_col - i);
+                    cvis = (out_lines.len(), col);
+                    found_cursor = true;
+                }
+            }
+
+            out_lines.push(seg);
+            i = seg_end;
+        }
+    }
+
+    // Cursor past the end of the buffer (no lines or empty buffer): clamp.
+    if !found_cursor {
+        let r = out_lines.len().saturating_sub(1);
+        cvis = (r, 0);
+    }
+
+    Wrapped {
+        lines: out_lines,
+        cursor: cvis,
+    }
+}
+
+/// The visual width, in cells, of the first `char_count` chars of `s`.
+fn visual_col_within(s: &str, char_count: usize) -> usize {
+    s.chars()
+        .take(char_count)
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_wrap_is_an_identity_pass_through() {
+        let lines = vec!["hello".to_string(), "world".to_string()];
+        let w = wrap_for_display(&lines, (1, 3), 0);
+        assert_eq!(w.lines, lines);
+        assert_eq!(w.cursor, (1, 3));
+    }
+
+    #[test]
+    fn long_line_splits_into_visual_rows() {
+        let lines = vec!["abcdefghij".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 4);
+        assert_eq!(w.lines, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn cursor_at_start_of_logical_line_is_at_start_of_first_visual_row() {
+        let lines = vec!["abcdefghij".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 4);
+        assert_eq!(w.cursor, (0, 0));
+    }
+
+    #[test]
+    fn cursor_inside_a_wrapped_segment() {
+        let lines = vec!["abcdefghij".to_string()];
+        // Logical col 6 -> in segment "efgh" (segment 1, segment_start_char = 4)
+        // -> visual col 2.
+        let w = wrap_for_display(&lines, (0, 6), 4);
+        assert_eq!(w.cursor, (1, 2));
+    }
+
+    #[test]
+    fn cursor_at_end_of_line_lands_after_last_visual_row() {
+        let lines = vec!["abcdefghij".to_string()];
+        // 10 chars total, width 4 -> segments "abcd","efgh","ij". End-of-line
+        // cursor at col 10 sits at the end of "ij".
+        let w = wrap_for_display(&lines, (0, 10), 4);
+        assert_eq!(w.cursor, (2, 2));
+    }
+
+    #[test]
+    fn cursor_in_a_later_logical_line() {
+        let lines = vec!["abcdef".to_string(), "xy".to_string()];
+        // Visual rows: "abcd", "ef", "xy". Logical cursor at (1, 1) -> visual (2, 1).
+        let w = wrap_for_display(&lines, (1, 1), 4);
+        assert_eq!(w.lines, vec!["abcd", "ef", "xy"]);
+        assert_eq!(w.cursor, (2, 1));
+    }
+
+    #[test]
+    fn empty_logical_line_emits_an_empty_visual_row() {
+        let lines = vec!["".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 4);
+        assert_eq!(w.lines, vec![""]);
+        assert_eq!(w.cursor, (0, 0));
+    }
+
+    /// Word-wrap breaks at whitespace and keeps the trailing space at the
+    /// end of the upper row so every character still appears in the visual.
+    #[test]
+    fn wraps_on_whitespace_keeping_the_space_on_the_upper_row() {
+        let lines = vec!["hello world foo".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 8);
+        assert_eq!(w.lines, vec!["hello ", "world ", "foo"]);
+    }
+
+    /// A single token longer than the field width falls back to char-level
+    /// wrap so it always renders.
+    #[test]
+    fn long_word_falls_back_to_char_wrap() {
+        let lines = vec!["supercalifragilistic".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 8);
+        assert_eq!(w.lines, vec!["supercal", "ifragili", "stic"]);
+    }
+
+    /// A long token followed by a space breaks the token by chars but the
+    /// trailing space still anchors the wrap of the next token.
+    #[test]
+    fn mixed_long_word_and_short_words() {
+        let lines = vec!["abcdefghijk lmno pqr".to_string()];
+        // chars=20, width=8.
+        // i=0: visual fills with "abcdefgh"(8 chars), no whitespace yet -> char wrap at 8.
+        //      push "abcdefgh", i=8.
+        // i=8: chars[8..]="ijk lmno pqr". Walk: i=8,j=9,10,11(=' '),12,13,14,15,16 visual_w=8 stop at 16? Let me recount.
+        //      chars[8]='i' w=1, chars[9]='j' w=2, chars[10]='k' w=3, chars[11]=' ' w=4 (last_break=12),
+        //      chars[12]='l' w=5, chars[13]='m' w=6, chars[14]='n' w=7, chars[15]='o' w=8, chars[16]=' ' w=9 STOP.
+        //      seg_end = last_break = 12. push "ijk ", i=12.
+        // i=12: chars[12..]="lmno pqr". walk: 'l','m','n','o',' ','p','q','r' visual_w=1..=8 stops at next? 8 chars, all fit. j=20=chars.len(). push "lmno pqr".
+        let w = wrap_for_display(&lines, (0, 0), 8);
+        assert_eq!(w.lines, vec!["abcdefgh", "ijk ", "lmno pqr"]);
+    }
+
+    /// Word-wrap maps the cursor onto the row that actually holds the char
+    /// under the cursor, not the geometric center of the logical line.
+    #[test]
+    fn cursor_lands_on_the_word_wrapped_row() {
+        let lines = vec!["hello world foo".to_string()];
+        // "hello " (0..6), "world " (6..12), "foo" (12..15).
+        // Cursor at logical col 8 -> visual row 1, col 2 (in "world ").
+        let w = wrap_for_display(&lines, (0, 8), 8);
+        assert_eq!(w.cursor, (1, 2));
+    }
+}

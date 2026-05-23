@@ -17,3 +17,7 @@ percent-encoding = "2"
 ratatui = "0.29"
 crossterm = "0.28"
 tui-textarea = "0.7"
+# For measuring grapheme cell width when soft-wrapping the body field. Already
+# in our dependency graph via ratatui; declaring it here lets us use it
+# directly.
+unicode-width = "0.2"

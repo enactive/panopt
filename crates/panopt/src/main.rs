@@ -17,6 +17,7 @@ mod todo_form;
 mod up;
 mod viewer;
 mod viewstate;
+mod wrap;
 
 use std::path::PathBuf;
 

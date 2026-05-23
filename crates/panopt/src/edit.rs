@@ -9,11 +9,15 @@
 //! Ctrl-S to save explicitly and Esc to quit (with a dirty-flag warning),
 //! because there is no host driving debounced autosave for it.
 
+use std::io::stdout;
 use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use crossterm::execute;
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
@@ -42,7 +46,11 @@ pub fn run(ws: Option<PathBuf>, id: Option<u64>, new: bool, port: u16) -> Result
     };
 
     let mut terminal = ratatui::init();
+    // Mirror the in-pane viewer: turn pastes into a single Event::Paste so
+    // they don't shred themselves on tui_textarea's emacs-style shortcuts.
+    let _ = execute!(stdout(), EnableBracketedPaste);
     let outcome = event_loop(&mut terminal, &mut form);
+    let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
 
     // When launched as a floating cockpit pane, close that pane on the way out
@@ -69,34 +77,41 @@ fn load(url: &str, id: u64) -> Result<Value> {
 fn event_loop(terminal: &mut DefaultTerminal, form: &mut TodoForm) -> Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, form))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            // CLI-specific shortcuts: Ctrl-S forces a save; Esc quits with a
-            // dirty-flag warning. Both are intercepted before the form widget
-            // sees them so the standalone behavior matches the legacy form.
-            match key.code {
-                KeyCode::Char('s') if ctrl => {
-                    form.save_explicit();
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                KeyCode::Esc => {
-                    if form.can_quit {
-                        return Ok(());
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // CLI-specific shortcuts: Ctrl-S forces a save; Esc quits with
+                // a dirty-flag warning. Both are intercepted before the form
+                // widget sees them so the standalone behavior matches the
+                // legacy form.
+                match key.code {
+                    KeyCode::Char('s') if ctrl => {
+                        form.save_explicit();
+                        continue;
                     }
-                    form.can_quit = true;
-                    form.message =
-                        "unsaved changes - Esc again to discard, Ctrl-S to save".to_string();
-                    continue;
+                    KeyCode::Esc => {
+                        if form.can_quit {
+                            return Ok(());
+                        }
+                        form.can_quit = true;
+                        form.message =
+                            "unsaved changes - Esc again to discard, Ctrl-S to save".to_string();
+                        continue;
+                    }
+                    _ => {}
                 }
-                _ => {}
+                match form.handle_key(key) {
+                    TodoFormAction::Close => return Ok(()),
+                    TodoFormAction::Dirty | TodoFormAction::Idle => {}
+                }
             }
-            match form.handle_key(key) {
-                TodoFormAction::Close => return Ok(()),
-                TodoFormAction::Dirty | TodoFormAction::Idle => {}
+            Event::Paste(s) => {
+                let _ = form.handle_paste(&s);
             }
+            _ => {}
         }
     }
 }

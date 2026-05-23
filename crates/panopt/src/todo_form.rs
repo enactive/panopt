@@ -142,6 +142,11 @@ pub struct TodoForm {
     pub(crate) can_quit: bool,
     /// Bottom-line feedback shown next to the help string.
     pub(crate) message: String,
+
+    /// First visible visual row of the soft-wrapped Body field. Drives the
+    /// `draw_body` scroll so the cursor stays on screen as the user edits or
+    /// pastes past the bottom of the field.
+    body_scroll: usize,
 }
 
 impl TodoForm {
@@ -171,6 +176,7 @@ impl TodoForm {
             dirty_since: None,
             can_quit: true,
             message: "new todo - type to begin".to_string(),
+            body_scroll: 0,
         }
     }
 
@@ -236,6 +242,7 @@ impl TodoForm {
             dirty_since: None,
             can_quit: true,
             message: format!("editing todo #{id}"),
+            body_scroll: 0,
         })
     }
 
@@ -264,6 +271,48 @@ impl TodoForm {
                 TodoFormAction::Idle
             }
             _ => self.field_key(key),
+        }
+    }
+
+    /// Insert a bracketed-paste payload into whichever field currently has
+    /// focus. Forwards to the focused field's [`paste_into`] /
+    /// [`paste_into_single_line`] / [`text_area`] as appropriate. Enum fields
+    /// (status, priority) silently drop pastes; section fields (comments,
+    /// blockers) route the paste into their input row.
+    pub fn handle_paste(&mut self, s: &str) -> TodoFormAction {
+        if s.is_empty() {
+            return TodoFormAction::Idle;
+        }
+        // Scalar-field pastes count as a dirty edit (autosave should flush
+        // them); section-row pastes only mutate the input draft, which the
+        // user still has to commit with Enter or Ctrl-S.
+        let (changed, scalar) = match FIELDS[self.focus] {
+            Field::Title => (paste_into_single_line(&mut self.title, s), true),
+            Field::Assignee => (paste_into_single_line(&mut self.assignee, s), true),
+            Field::Tags => (paste_into_single_line(&mut self.tags, s), true),
+            Field::Body => (paste_into(&mut self.body, s), true),
+            Field::Status | Field::Priority => (false, false),
+            Field::Comments => {
+                // While an existing comment is being edited, the paste goes
+                // there; otherwise it lands in the new-comment input row.
+                let c = if let Some((_, area)) = self.editing_comment.as_mut() {
+                    paste_into(area, s)
+                } else {
+                    self.comment_cursor = self.comments.len();
+                    paste_into(&mut self.new_comment, s)
+                };
+                (c, false)
+            }
+            Field::Blockers => {
+                self.blocker_cursor = self.blockers.len();
+                (paste_into_single_line(&mut self.new_blocker, s), false)
+            }
+        };
+        if changed && scalar {
+            self.mark_dirty();
+            TodoFormAction::Dirty
+        } else {
+            TodoFormAction::Idle
         }
     }
 
@@ -300,7 +349,7 @@ impl TodoForm {
             ScalarField::Title => single_line_input(&mut self.title, key),
             ScalarField::Assignee => single_line_input(&mut self.assignee, key),
             ScalarField::Tags => single_line_input(&mut self.tags, key),
-            ScalarField::Body => self.body.input(key),
+            ScalarField::Body => text_input(&mut self.body, key),
         };
         if changed {
             self.mark_dirty();
@@ -310,15 +359,26 @@ impl TodoForm {
         }
     }
 
-    /// Keys handled when the comments section has focus. The cursor moves over
-    /// existing comments (j/k); `Enter` either commits typed input as a new
-    /// comment or, if the focus is on an existing comment, starts editing it
-    /// in place; `d` deletes the highlighted comment. Any other printable key
-    /// types into the bottom input row.
+    /// Keys handled when the comments section has focus.
+    ///
+    /// The cursor row decides the bindings: while it's on an existing comment
+    /// (read mode), `j`/`k`/Up/Down navigate, `Enter` starts in-place edit,
+    /// and `d` deletes. While it's on the trailing input row (where the user
+    /// is typing a new comment), every char including `j`/`k`/`d` goes into
+    /// the textarea - the vim-ish navigation bindings only make sense over
+    /// the read rows. `Up` from the input row still navigates out, since the
+    /// input row is single-line; `Down` is a no-op. `Enter` submits the new
+    /// comment.
     fn comments_section_key(&mut self, key: KeyEvent) -> TodoFormAction {
         // Rows in the comment section, top to bottom: each existing comment is
         // a row; the trailing input row is `comments.len()`.
         let total_rows = self.comments.len() + 1;
+        let on_input_row = self.comment_cursor == self.comments.len();
+
+        if on_input_row {
+            return self.comments_input_row_key(key);
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.comment_cursor > 0 {
@@ -333,43 +393,52 @@ impl TodoForm {
                 TodoFormAction::Idle
             }
             KeyCode::Enter => {
-                if self.comment_cursor == self.comments.len() {
-                    // Append: ship the new comment, clear the input.
-                    let body = self.new_comment.lines().join("\n");
-                    if body.trim().is_empty() {
-                        return TodoFormAction::Idle;
-                    }
-                    match self.append_comment(&body) {
-                        Ok(()) => {
-                            self.new_comment = text_area("");
-                            self.message = "comment added".to_string();
-                            self.comment_cursor = self.comments.len();
-                        }
-                        Err(e) => self.message = format!("comment failed: {e:#}"),
-                    }
-                    TodoFormAction::Idle
-                } else {
-                    // Begin in-place edit of the highlighted comment.
-                    let existing = self.comments[self.comment_cursor].body.clone();
-                    self.editing_comment = Some((self.comment_cursor, text_area(&existing)));
-                    TodoFormAction::Idle
-                }
+                // Begin in-place edit of the highlighted comment.
+                let existing = self.comments[self.comment_cursor].body.clone();
+                self.editing_comment = Some((self.comment_cursor, text_area(&existing)));
+                TodoFormAction::Idle
             }
             KeyCode::Char('d') => {
-                if self.comment_cursor < self.comments.len() {
-                    let cid = self.comments[self.comment_cursor].id;
-                    match self.delete_comment(cid) {
-                        Ok(()) => self.message = format!("deleted comment #{cid}"),
-                        Err(e) => self.message = format!("delete failed: {e:#}"),
+                let cid = self.comments[self.comment_cursor].id;
+                match self.delete_comment(cid) {
+                    Ok(()) => self.message = format!("deleted comment #{cid}"),
+                    Err(e) => self.message = format!("delete failed: {e:#}"),
+                }
+                TodoFormAction::Idle
+            }
+            _ => TodoFormAction::Idle,
+        }
+    }
+
+    /// Keys for the new-comment input row. All printable chars go into the
+    /// textarea; `Enter` commits; `Up` navigates back into the read rows.
+    fn comments_input_row_key(&mut self, key: KeyEvent) -> TodoFormAction {
+        match key.code {
+            KeyCode::Up => {
+                if self.comment_cursor > 0 {
+                    self.comment_cursor -= 1;
+                }
+                TodoFormAction::Idle
+            }
+            // `Down` from the input row is a no-op - there is nowhere further.
+            KeyCode::Down => TodoFormAction::Idle,
+            KeyCode::Enter => {
+                let body = self.new_comment.lines().join("\n");
+                if body.trim().is_empty() {
+                    return TodoFormAction::Idle;
+                }
+                match self.append_comment(&body) {
+                    Ok(()) => {
+                        self.new_comment = text_area("");
+                        self.message = "comment added".to_string();
+                        self.comment_cursor = self.comments.len();
                     }
+                    Err(e) => self.message = format!("comment failed: {e:#}"),
                 }
                 TodoFormAction::Idle
             }
             _ => {
-                // Anything else types into the new-comment input row.
-                if self.comment_cursor == self.comments.len() {
-                    let _ = self.new_comment.input(key);
-                }
+                let _ = text_input(&mut self.new_comment, key);
                 TodoFormAction::Idle
             }
         }
@@ -402,17 +471,25 @@ impl TodoForm {
             }
             _ => {
                 if let Some((_, area)) = self.editing_comment.as_mut() {
-                    area.input(key);
+                    text_input(area, key);
                 }
                 TodoFormAction::Idle
             }
         }
     }
 
-    /// Keys handled when the blockers section has focus. `Enter` on the input
-    /// row adds a blocker by id; `d` removes the highlighted one.
+    /// Keys handled when the blockers section has focus. Mirrors the
+    /// comments-section split: navigation/`d`-delete only apply over existing
+    /// blocker rows; the input row routes everything to the textarea so an
+    /// id like `12` can be typed without `j` or `k` hijacking the keys.
     fn blockers_section_key(&mut self, key: KeyEvent) -> TodoFormAction {
         let total_rows = self.blockers.len() + 1;
+        let on_input_row = self.blocker_cursor == self.blockers.len();
+
+        if on_input_row {
+            return self.blockers_input_row_key(key);
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.blocker_cursor > 0 {
@@ -426,39 +503,49 @@ impl TodoForm {
                 }
                 TodoFormAction::Idle
             }
-            KeyCode::Enter => {
-                if self.blocker_cursor == self.blockers.len() {
-                    let typed = self.new_blocker.lines().join("");
-                    let trimmed = typed.trim_start_matches('#').trim();
-                    let Some(id) = trimmed.parse::<u64>().ok() else {
-                        self.message = format!("blocker id '{trimmed}' is not a number");
-                        return TodoFormAction::Idle;
-                    };
-                    match self.add_blocker(id) {
-                        Ok(()) => {
-                            self.new_blocker = text_area("");
-                            self.message = format!("added blocker #{id}");
-                            self.blocker_cursor = self.blockers.len();
-                        }
-                        Err(e) => self.message = format!("add blocker failed: {e:#}"),
-                    }
+            KeyCode::Char('d') => {
+                let bid = self.blockers[self.blocker_cursor].id;
+                match self.remove_blocker(bid) {
+                    Ok(()) => self.message = format!("removed blocker #{bid}"),
+                    Err(e) => self.message = format!("remove failed: {e:#}"),
                 }
                 TodoFormAction::Idle
             }
-            KeyCode::Char('d') => {
-                if self.blocker_cursor < self.blockers.len() {
-                    let bid = self.blockers[self.blocker_cursor].id;
-                    match self.remove_blocker(bid) {
-                        Ok(()) => self.message = format!("removed blocker #{bid}"),
-                        Err(e) => self.message = format!("remove failed: {e:#}"),
+            _ => TodoFormAction::Idle,
+        }
+    }
+
+    /// Keys for the new-blocker input row. `Enter` parses the typed id and
+    /// adds the blocker; `Up` walks back into the read rows; everything else
+    /// types into the textarea.
+    fn blockers_input_row_key(&mut self, key: KeyEvent) -> TodoFormAction {
+        match key.code {
+            KeyCode::Up => {
+                if self.blocker_cursor > 0 {
+                    self.blocker_cursor -= 1;
+                }
+                TodoFormAction::Idle
+            }
+            KeyCode::Down => TodoFormAction::Idle,
+            KeyCode::Enter => {
+                let typed = self.new_blocker.lines().join("");
+                let trimmed = typed.trim_start_matches('#').trim();
+                let Some(id) = trimmed.parse::<u64>().ok() else {
+                    self.message = format!("blocker id '{trimmed}' is not a number");
+                    return TodoFormAction::Idle;
+                };
+                match self.add_blocker(id) {
+                    Ok(()) => {
+                        self.new_blocker = text_area("");
+                        self.message = format!("added blocker #{id}");
+                        self.blocker_cursor = self.blockers.len();
                     }
+                    Err(e) => self.message = format!("add blocker failed: {e:#}"),
                 }
                 TodoFormAction::Idle
             }
             _ => {
-                if self.blocker_cursor == self.blockers.len() {
-                    let _ = self.new_blocker.input(key);
-                }
+                let _ = text_input(&mut self.new_blocker, key);
                 TodoFormAction::Idle
             }
         }
@@ -689,8 +776,7 @@ impl TodoForm {
         frame.render_widget(&self.assignee, rows[3]);
         self.style_field(Field::Tags, "Tags (comma-separated)");
         frame.render_widget(&self.tags, rows[4]);
-        self.style_field(Field::Body, "Body");
-        frame.render_widget(&self.body, rows[5]);
+        self.draw_body(frame, rows[5]);
 
         self.draw_comments(frame, rows[6]);
         self.draw_blockers(frame, rows[7]);
@@ -715,6 +801,63 @@ impl TodoForm {
             Paragraph::new(line).style(Style::default().fg(Color::Yellow)),
             rows[9],
         );
+    }
+
+    /// Render the Body field as a soft-wrapped paragraph plus an overlay
+    /// cursor. We bypass [`tui_textarea::TextArea`]'s own draw because that
+    /// widget has no soft-wrap - it scrolls horizontally instead, so a pasted
+    /// line longer than the field reads as "my text vanished off the right
+    /// edge." The buffer and edit logic still live in the textarea; only the
+    /// visual representation is ours.
+    fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = FIELDS[self.focus] == Field::Body;
+        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let block = Block::bordered()
+            .title("Body")
+            .border_style(Style::default().fg(border));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let width = inner.width as usize;
+        let height = inner.height as usize;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let cursor = self.body.cursor();
+        let wrapped = crate::wrap::wrap_for_display(self.body.lines(), cursor, width);
+        let (cvr, cvc) = wrapped.cursor;
+
+        // Keep the cursor in view by adjusting the scroll offset.
+        if cvr < self.body_scroll {
+            self.body_scroll = cvr;
+        } else if cvr >= self.body_scroll + height {
+            self.body_scroll = cvr + 1 - height;
+        }
+        // Don't scroll past the last visual row.
+        let max_scroll = wrapped.lines.len().saturating_sub(height);
+        if self.body_scroll > max_scroll {
+            self.body_scroll = max_scroll;
+        }
+
+        let visible: Vec<Line> = wrapped
+            .lines
+            .iter()
+            .skip(self.body_scroll)
+            .take(height)
+            .map(|l| Line::from(l.clone()))
+            .collect();
+        frame.render_widget(Paragraph::new(visible), inner);
+
+        if focused
+            && cvr >= self.body_scroll
+            && cvr < self.body_scroll + height
+            && cvc < width
+        {
+            let cy = inner.y + (cvr - self.body_scroll) as u16;
+            let cx = inner.x + cvc as u16;
+            frame.set_cursor_position((cx, cy));
+        }
     }
 
     fn draw_comments(&mut self, frame: &mut Frame, area: Rect) {
@@ -829,15 +972,16 @@ impl TodoForm {
     }
 
     /// Set a text field's border and cursor styling for the current focus.
+    /// Body is excluded - it has its own wrapped render in [`Self::draw_body`].
     fn style_field(&mut self, field: Field, label: &'static str) {
         let focused = FIELDS[self.focus] == field;
         let area = match field {
             Field::Title => &mut self.title,
             Field::Assignee => &mut self.assignee,
             Field::Tags => &mut self.tags,
-            Field::Body => &mut self.body,
             Field::Status
             | Field::Priority
+            | Field::Body
             | Field::Comments
             | Field::Blockers => return,
         };
@@ -885,13 +1029,76 @@ fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
     Paragraph::new(format!(" {label}: < {value} >")).style(style)
 }
 
-/// Feed a key to a single-line field, swallowing Enter so it stays one line.
+/// Feed a key to a multi-line text field. We forward almost everything
+/// straight to [`tui_textarea::TextArea::input`] so its full set of
+/// emacs-style shortcuts works (Ctrl-A start of line, Ctrl-E end, Ctrl-K kill
+/// to end, Ctrl-W delete word, Ctrl-U undo, Ctrl-R redo, Ctrl-D delete next,
+/// arrow keys, etc.). Two narrow overrides:
+///
+/// - `Ctrl-J` and `Ctrl-M` insert a newline. In raw mode crossterm parses the
+///   bare bytes `\n` and `\r` as these chords, and `tui_textarea` would
+///   otherwise read `Ctrl-J` as `delete_line_by_head`. The keystrokes are not
+///   useful on their own, so treating them as Enter loses nothing and gives
+///   us a defensive fallback if a paste ever bypasses bracketed-paste mode.
+/// - `Ctrl-Z` runs undo. `tui_textarea` already binds undo to `Ctrl-U`, but
+///   `Ctrl-Z` is the muscle memory most users have for it.
+///
 /// Returns whether the field's content changed.
+pub(crate) fn text_input(area: &mut TextArea, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Char('m') if ctrl => {
+            area.insert_newline();
+            true
+        }
+        KeyCode::Char('z') if ctrl => area.undo(),
+        _ => area.input(key),
+    }
+}
+
+/// Feed a key to a single-line field, swallowing anything that would add a
+/// line break (Enter, Ctrl-J, Ctrl-M) so it stays one line. All other
+/// shortcuts go through [`text_input`].
 pub(crate) fn single_line_input(area: &mut TextArea, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if key.code == KeyCode::Enter {
         return false;
     }
-    area.input(key)
+    if ctrl && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('m')) {
+        return false;
+    }
+    text_input(area, key)
+}
+
+/// Insert a pasted string into a textarea. Each `\n` becomes an `insert_newline`,
+/// every other char goes through `insert_str`. Pastes always count as a change.
+pub(crate) fn paste_into(area: &mut TextArea, s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut first = true;
+    for line in s.split('\n') {
+        if !first {
+            area.insert_newline();
+        }
+        if !line.is_empty() {
+            area.insert_str(line);
+        }
+        first = false;
+    }
+    true
+}
+
+/// Insert a pasted string into a single-line field: all line breaks are
+/// flattened to spaces, since multi-line content has no place in a one-line
+/// input row.
+pub(crate) fn paste_into_single_line(area: &mut TextArea, s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let flat = s.replace(['\n', '\r'], " ");
+    area.insert_str(flat);
+    true
 }
 
 /// The cycle direction a key implies for an enum field, if any.
@@ -952,5 +1159,133 @@ mod tests {
         assert_eq!(form.focus, 0);
         assert!(form.title_is_empty());
         assert!(!form.dirty);
+    }
+
+    /// Regression: pasted multi-line text used to scrub itself across the body
+    /// because the raw `\n` between lines parses as Ctrl-J in raw mode and
+    /// `tui_textarea` reads Ctrl-J as `delete_line_by_head`. `text_input`
+    /// remaps that chord to a literal newline; multi-line text now lands
+    /// intact.
+    #[test]
+    fn ctrl_j_is_a_newline_in_text_input_not_a_delete() {
+        let mut area = text_area("");
+        for c in "hello".chars() {
+            assert!(text_input(
+                &mut area,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+            ));
+        }
+        // The byte `\n` arrives in raw mode as Ctrl-J.
+        assert!(text_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ));
+        for c in "world".chars() {
+            text_input(
+                &mut area,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(area.lines(), vec!["hello", "world"]);
+    }
+
+    /// `text_input` forwards the standard emacs-style editor chords to
+    /// `tui_textarea`: Ctrl-A / Ctrl-E (home / end), Ctrl-K (delete to end),
+    /// Ctrl-Z (undo, our override). The only Ctrl chord remapped here is
+    /// Ctrl-J / Ctrl-M -> newline.
+    #[test]
+    fn ctrl_letter_chords_reach_the_textarea() {
+        let mut area = text_area("hello world");
+        // Ctrl-A goes to start of line.
+        text_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(area.cursor(), (0, 0));
+        // Ctrl-E goes to end of line.
+        text_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(area.cursor(), (0, "hello world".len()));
+        // Ctrl-A then Ctrl-K kills to end of line.
+        text_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        text_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(area.lines(), vec![""]);
+    }
+
+    /// Ctrl-Z is our convenience binding for undo (`tui_textarea`'s native
+    /// one is Ctrl-U). After typing and then Ctrl-Z, the change is rolled back.
+    #[test]
+    fn ctrl_z_undoes_the_last_edit() {
+        let mut area = text_area("");
+        for c in "hi".chars() {
+            text_input(
+                &mut area,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(area.lines(), vec!["hi"]);
+        text_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert_ne!(area.lines(), vec!["hi"]);
+    }
+
+    /// Regression: pasting a multi-line block into the Body field used to
+    /// erase itself line by line. `handle_paste` inserts the payload
+    /// atomically, so every line survives.
+    #[test]
+    fn handle_paste_into_body_preserves_lines() {
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        // Tab past Title -> Status -> Priority -> Assignee -> Tags -> Body.
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        for _ in 0..5 {
+            form.handle_key(tab);
+        }
+        assert_eq!(FIELDS[form.focus], Field::Body);
+        let payload = "- one\n- two\n- three";
+        let action = form.handle_paste(payload);
+        assert_eq!(action, TodoFormAction::Dirty);
+        assert_eq!(form.body.lines(), vec!["- one", "- two", "- three"]);
+    }
+
+    /// Regression: pasting into Title flattens line breaks instead of
+    /// silently splitting the single-line field.
+    #[test]
+    fn handle_paste_into_title_flattens_newlines() {
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        assert_eq!(FIELDS[form.focus], Field::Title);
+        let action = form.handle_paste("first line\nsecond line");
+        assert_eq!(action, TodoFormAction::Dirty);
+        assert_eq!(form.title.lines(), vec!["first line second line"]);
+    }
+
+    /// Regression: while the new-comment input row is focused, typing `d`,
+    /// `j`, or `k` used to delete an existing comment or move the cursor
+    /// instead of typing a character. After the fix, those keys land in the
+    /// textarea like any other letter.
+    #[test]
+    fn new_comment_row_accepts_d_j_k_as_typed_chars() {
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        // Tab past everything to reach Comments.
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        for _ in 0..6 {
+            form.handle_key(tab);
+        }
+        assert_eq!(FIELDS[form.focus], Field::Comments);
+        // No existing comments -> cursor sits on the input row.
+        assert_eq!(form.comment_cursor, 0);
+        for c in ['d', 'j', 'k'] {
+            form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert_eq!(form.new_comment.lines(), vec!["djk"]);
     }
 }

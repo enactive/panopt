@@ -23,7 +23,7 @@ use serde_json::json;
 use tui_textarea::TextArea;
 
 use crate::mcpclient::Client;
-use crate::todo_form::{single_line_input, text_area};
+use crate::todo_form::{paste_into, paste_into_single_line, single_line_input, text_area, text_input};
 
 /// What [`ScratchpadForm::handle_key`] is telling the host to do next.
 ///
@@ -75,6 +75,10 @@ pub struct ScratchpadForm {
 
     /// Bottom-line feedback shown next to the help string.
     pub(crate) message: String,
+
+    /// First visible visual row of the soft-wrapped Body field. Drives the
+    /// `draw_body` scroll so the cursor stays on screen.
+    body_scroll: usize,
 }
 
 impl ScratchpadForm {
@@ -91,6 +95,7 @@ impl ScratchpadForm {
             locked_by: None,
             dirty: false,
             dirty_since: None,
+            body_scroll: 0,
             message: "new scratchpad - type to begin".to_string(),
         }
     }
@@ -116,6 +121,7 @@ impl ScratchpadForm {
             locked_by: None,
             dirty: false,
             dirty_since: None,
+            body_scroll: 0,
             message: format!("scratchpad #{id}"),
         }
     }
@@ -146,7 +152,25 @@ impl ScratchpadForm {
     fn field_key(&mut self, key: KeyEvent) -> ScratchpadFormAction {
         let changed = match self.focus {
             Field::Title => single_line_input(&mut self.title, key),
-            Field::Body => self.body.input(key),
+            Field::Body => text_input(&mut self.body, key),
+        };
+        if changed {
+            self.mark_dirty();
+            ScratchpadFormAction::Dirty
+        } else {
+            ScratchpadFormAction::Idle
+        }
+    }
+
+    /// Insert a bracketed-paste payload into the focused field. Multi-line
+    /// pastes into Title are flattened to spaces.
+    pub fn handle_paste(&mut self, s: &str) -> ScratchpadFormAction {
+        if s.is_empty() {
+            return ScratchpadFormAction::Idle;
+        }
+        let changed = match self.focus {
+            Field::Title => paste_into_single_line(&mut self.title, s),
+            Field::Body => paste_into(&mut self.body, s),
         };
         if changed {
             self.mark_dirty();
@@ -240,8 +264,7 @@ impl ScratchpadForm {
 
         self.style_field(Field::Title, "Title");
         frame.render_widget(&self.title, rows[1]);
-        self.style_field(Field::Body, "Body");
-        frame.render_widget(&self.body, rows[2]);
+        self.draw_body(frame, rows[2]);
 
         let context = if !self.created.is_empty() {
             format!(" created {}   updated {}", self.created, self.updated)
@@ -265,13 +288,66 @@ impl ScratchpadForm {
         );
     }
 
+    /// Render the Body field with our soft-wrap renderer. See
+    /// [`crate::todo_form::TodoForm::draw_body`] for the rationale - the same
+    /// `tui_textarea` limitation drove this widget here.
+    fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Field::Body;
+        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let block = Block::bordered()
+            .title("Body")
+            .border_style(Style::default().fg(border));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let width = inner.width as usize;
+        let height = inner.height as usize;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let cursor = self.body.cursor();
+        let wrapped = crate::wrap::wrap_for_display(self.body.lines(), cursor, width);
+        let (cvr, cvc) = wrapped.cursor;
+
+        if cvr < self.body_scroll {
+            self.body_scroll = cvr;
+        } else if cvr >= self.body_scroll + height {
+            self.body_scroll = cvr + 1 - height;
+        }
+        let max_scroll = wrapped.lines.len().saturating_sub(height);
+        if self.body_scroll > max_scroll {
+            self.body_scroll = max_scroll;
+        }
+
+        let visible: Vec<ratatui::text::Line> = wrapped
+            .lines
+            .iter()
+            .skip(self.body_scroll)
+            .take(height)
+            .map(|l| ratatui::text::Line::from(l.clone()))
+            .collect();
+        frame.render_widget(Paragraph::new(visible), inner);
+
+        if focused
+            && cvr >= self.body_scroll
+            && cvr < self.body_scroll + height
+            && cvc < width
+        {
+            let cy = inner.y + (cvr - self.body_scroll) as u16;
+            let cx = inner.x + cvc as u16;
+            frame.set_cursor_position((cx, cy));
+        }
+    }
+
     /// Set a text field's border and cursor styling for the current focus.
-    /// Mirrors [`crate::todo_form`]'s helper of the same name.
+    /// Mirrors [`crate::todo_form`]'s helper of the same name. Body is
+    /// excluded - it has its own wrapped render in [`Self::draw_body`].
     fn style_field(&mut self, field: Field, label: &'static str) {
         let focused = self.focus == field;
         let area = match field {
             Field::Title => &mut self.title,
-            Field::Body => &mut self.body,
+            Field::Body => return,
         };
         let border = if focused { Color::Yellow } else { Color::DarkGray };
         area.set_block(
@@ -340,5 +416,20 @@ mod tests {
         assert_eq!(form.handle_key(key), ScratchpadFormAction::Dirty);
         assert!(form.dirty);
         assert!(form.dirty_since.is_some());
+    }
+
+    /// Regression: a multi-line paste into Body must land intact. Before the
+    /// fix every `\n` between lines arrived as Ctrl-J and `tui_textarea`
+    /// silently wiped the line under the cursor.
+    #[test]
+    fn handle_paste_into_body_preserves_lines() {
+        let mut form = ScratchpadForm::blank("http://localhost/?ws=/x");
+        // Tab to Body.
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        form.handle_key(tab);
+        assert_eq!(form.focus, Field::Body);
+        let action = form.handle_paste("alpha\nbeta\ngamma");
+        assert_eq!(action, ScratchpadFormAction::Dirty);
+        assert_eq!(form.body.lines(), vec!["alpha", "beta", "gamma"]);
     }
 }

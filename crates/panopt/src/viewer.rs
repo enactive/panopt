@@ -16,8 +16,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use std::io::stdout;
+
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
@@ -165,7 +171,15 @@ pub fn run(
 
     let mut viewer = Viewer::new(ws, url, &slot, target);
     let mut terminal = ratatui::init();
+    // Bracketed paste turns a clipboard paste into a single `Event::Paste(s)`
+    // instead of a stream of synthetic key events. Without this, multi-line
+    // pastes arrive as a series of `Ctrl-J` events (the raw `\n` byte in raw
+    // mode), which `tui_textarea` interprets as `delete_line_by_head` - the
+    // pasted text scrubs itself across the field as each line break fires the
+    // shortcut. Failing to enable is non-fatal: typed input still works.
+    let _ = execute!(stdout(), EnableBracketedPaste);
     let outcome = viewer.event_loop(&mut terminal);
+    let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
 
     // The viewer is long-lived, but an explicit close is the user closing it;
@@ -243,6 +257,7 @@ impl Viewer {
                             return Ok(());
                         }
                     }
+                    Event::Paste(s) => self.handle_paste(&s),
                     Event::Resize(_, _) => self.needs_draw = true,
                     _ => {}
                 }
@@ -309,6 +324,22 @@ impl Viewer {
                 self.needs_draw = true;
                 false
             }
+        }
+    }
+
+    /// Handle a bracketed-paste payload. Only the form modes can receive a
+    /// paste; the list / doc views ignore it.
+    fn handle_paste(&mut self, s: &str) {
+        match &mut self.content {
+            Content::TodoForm(form) => {
+                let _ = form.handle_paste(s);
+                self.needs_draw = true;
+            }
+            Content::ScratchpadForm(form) => {
+                let _ = form.handle_paste(s);
+                self.needs_draw = true;
+            }
+            _ => {}
         }
     }
 
