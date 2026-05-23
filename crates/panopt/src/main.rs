@@ -9,8 +9,11 @@ mod edit;
 mod mcp;
 mod mcpclient;
 mod paths;
+mod roster;
 mod todo;
 mod up;
+mod viewer;
+mod viewstate;
 
 use std::path::PathBuf;
 
@@ -50,6 +53,14 @@ enum Cmd {
         #[command(subcommand)]
         action: todo::TodoCmd,
     },
+    /// Inspect and edit the project's roster of agents, commands, and terminals.
+    Roster {
+        /// Project root the roster belongs to (default: the current directory).
+        #[arg(long, global = true)]
+        ws: Option<PathBuf>,
+        #[command(subcommand)]
+        action: roster::RosterCmd,
+    },
     /// Internal: the entrypoint that runs inside an agent pane.
     #[command(name = "_agent", hide = true)]
     AgentExec {
@@ -57,6 +68,29 @@ enum Cmd {
         ws: Option<PathBuf>,
         #[arg(long)]
         id: Option<String>,
+    },
+    /// Internal: start a roster entry in this pane.
+    #[command(name = "_roster-run", hide = true)]
+    RosterRun {
+        #[arg(long)]
+        ws: Option<PathBuf>,
+        /// Numeric id of the roster entry to start.
+        id: u64,
+    },
+    /// Internal: a long-lived cockpit viewer pane.
+    #[command(name = "_viewer", hide = true)]
+    ViewerExec {
+        #[arg(long)]
+        ws: Option<PathBuf>,
+        /// Routing-file token the sidebar plugin assigned this pane.
+        #[arg(long)]
+        slot: String,
+        /// Initial item kind: todo, scratchpad, todo-list, scratchpad-list.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Initial item id, for the todo and scratchpad kinds.
+        #[arg(long)]
+        id: Option<u64>,
     },
 }
 
@@ -66,6 +100,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Up { plugin } => up::run(plugin, cli.port),
         Cmd::Agent { name } => agent::spawn(name),
         Cmd::Todo { ws, action } => todo::run(ws, action, cli.port),
+        Cmd::Roster { ws, action } => roster::run(ws, action, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
+        Cmd::RosterRun { ws, id } => roster::exec_entry(ws, id, cli.port),
+        Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
     }
 }

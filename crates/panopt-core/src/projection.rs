@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::model::{Agent, Lock, Scratchpad, Todo, TodoStatus};
+use crate::model::{Agent, Lock, RosterEntry, Scratchpad, Todo, TodoStatus};
 
 /// Per-process counter giving each temp file a unique name, so two concurrent
 /// writes to the same target never collide on the temp path.
@@ -44,6 +44,18 @@ fn scratchpad_dir(ws: &Path) -> PathBuf {
 
 fn scratchpad_path(ws: &Path, id: u64) -> PathBuf {
     scratchpad_dir(ws).join(format!("{id}.md"))
+}
+
+/// The scratchpad index file: one line linking every per-scratchpad file. The
+/// cockpit plugin reads it to list scratchpads (the per-pad files carry no
+/// index of their own).
+fn scratchpads_index_path(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("scratchpads.md")
+}
+
+/// The roster file: every persistent agent/command/terminal entry.
+fn roster_path(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("roster.md")
 }
 
 fn agents_path(ws: &Path) -> PathBuf {
@@ -153,6 +165,36 @@ pub(crate) fn render_scratchpad_md(pad: &Scratchpad) -> String {
     out
 }
 
+/// Render the scratchpad index: one line per scratchpad, each linking to that
+/// scratchpad's own file. `pads` is `(id, title)` pairs, id-ascending.
+pub(crate) fn render_scratchpads_index_md(pads: &[(u64, String)]) -> String {
+    let mut out = String::from("# Scratchpads\n\n");
+    if pads.is_empty() {
+        out.push_str("_(no scratchpads)_\n");
+        return out;
+    }
+    for (id, title) in pads {
+        out.push_str(&format!("- [#{id}](scratchpad/{id}.md) {title}\n"));
+    }
+    out
+}
+
+/// Render the roster as a markdown list, one line per entry: its kind, id, and
+/// display label. The cockpit plugin parses this to populate the agents,
+/// commands, and terminals sidebar sections.
+pub(crate) fn render_roster_md(entries: &[RosterEntry]) -> String {
+    let mut out = String::from("# Roster\n\n");
+    if entries.is_empty() {
+        out.push_str("_(no roster entries)_\n");
+        return out;
+    }
+    for e in entries {
+        let label = if e.display_name.is_empty() { &e.name } else { &e.display_name };
+        out.push_str(&format!("- [{}] #{} {}\n", e.kind.as_str(), e.id, label));
+    }
+    out
+}
+
 /// Render the connected-agent roster as a markdown list.
 ///
 /// Each agent is shown as its name and, when set, its self-reported status.
@@ -208,6 +250,8 @@ pub(crate) fn bootstrap(ws: &Path) -> io::Result<()> {
     fs::create_dir_all(todos_dir(ws))?;
     atomic_write(&panopt_dir(ws).join(".gitignore"), "*\n")?;
     atomic_write(&todos_index_path(ws), &render_todos_index_md(&[]))?;
+    atomic_write(&scratchpads_index_path(ws), &render_scratchpads_index_md(&[]))?;
+    atomic_write(&roster_path(ws), &render_roster_md(&[]))?;
     atomic_write(&agents_path(ws), &render_agents_md(&[]))?;
     atomic_write(&locks_path(ws), &render_locks_md(&[]))?;
     Ok(())
@@ -247,6 +291,16 @@ pub(crate) fn project_scratchpad(ws: &Path, pad: &Scratchpad) -> io::Result<()> 
     atomic_write(&scratchpad_path(ws, pad.id), &render_scratchpad_md(pad))
 }
 
+/// Rewrite `.panopt/scratchpads.md` from the project's `(id, title)` list.
+pub(crate) fn project_scratchpads_index(ws: &Path, pads: &[(u64, String)]) -> io::Result<()> {
+    atomic_write(&scratchpads_index_path(ws), &render_scratchpads_index_md(pads))
+}
+
+/// Rewrite `.panopt/roster.md` from the current roster.
+pub(crate) fn project_roster(ws: &Path, entries: &[RosterEntry]) -> io::Result<()> {
+    atomic_write(&roster_path(ws), &render_roster_md(entries))
+}
+
 /// Rewrite `.panopt/agents.md` from the current agent roster.
 pub(crate) fn project_agents(ws: &Path, agents: &[Agent]) -> io::Result<()> {
     atomic_write(&agents_path(ws), &render_agents_md(agents))
@@ -260,7 +314,7 @@ pub(crate) fn project_locks(ws: &Path, locks: &[Lock]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Priority, TodoComment};
+    use crate::model::{Priority, RosterKind, TodoComment};
 
     /// A todo with the given identity and otherwise-default fields.
     fn todo(id: u64, title: &str, status: TodoStatus) -> Todo {
@@ -434,8 +488,57 @@ mod tests {
             "*\n"
         );
         assert!(dir.path().join(".panopt/todos.md").is_file());
+        assert!(dir.path().join(".panopt/scratchpads.md").is_file());
+        assert!(dir.path().join(".panopt/roster.md").is_file());
         assert!(dir.path().join(".panopt/agents.md").is_file());
         assert!(dir.path().join(".panopt/locks.md").is_file());
+    }
+
+    #[test]
+    fn empty_scratchpads_index_renders_placeholder() {
+        assert_eq!(
+            render_scratchpads_index_md(&[]),
+            "# Scratchpads\n\n_(no scratchpads)_\n"
+        );
+    }
+
+    #[test]
+    fn scratchpads_index_links_each_pad() {
+        let pads = vec![(1, "design notes".to_string()), (2, "scratch".to_string())];
+        assert_eq!(
+            render_scratchpads_index_md(&pads),
+            "# Scratchpads\n\n\
+             - [#1](scratchpad/1.md) design notes\n\
+             - [#2](scratchpad/2.md) scratch\n"
+        );
+    }
+
+    #[test]
+    fn empty_roster_renders_placeholder() {
+        assert_eq!(render_roster_md(&[]), "# Roster\n\n_(no roster entries)_\n");
+    }
+
+    #[test]
+    fn roster_lists_each_entry_with_kind_and_label() {
+        let entries = vec![
+            RosterEntry {
+                id: 1,
+                kind: RosterKind::Agent,
+                name: "claude-a".into(),
+                display_name: "Mediator".into(),
+                ..Default::default()
+            },
+            RosterEntry {
+                id: 2,
+                kind: RosterKind::Command,
+                name: "Run server".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            render_roster_md(&entries),
+            "# Roster\n\n- [agent] #1 Mediator\n- [command] #2 Run server\n"
+        );
     }
 
     #[test]

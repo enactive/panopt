@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use http::request::Parts;
 use panopt_core::{
-    Agent, CoreError, Lock, Priority, ProjectId, Store, Todo, TodoPatch, TodoStatus,
+    Agent, CoreError, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Store, Todo,
+    TodoPatch, TodoStatus,
 };
 use rmcp::{
     handler::server::{common::Extension, router::tool::ToolRouter, wrapper::Parameters},
@@ -22,9 +23,10 @@ use rmcp::{
 use serde::Serialize;
 
 use crate::params::{
-    IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
-    ScratchpadReadArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCompleteArgs, TodoCreateArgs,
-    TodoDeleteArgs, TodoGetArgs, TodoUpdateArgs,
+    IdentifyArgs, LockAcquireArgs, LockReleaseArgs, RosterCreateArgs, RosterDeleteArgs,
+    RosterGetArgs, RosterUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs, ScratchpadReadArgs,
+    TodoBlockerArgs, TodoCommentAddArgs, TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs,
+    TodoGetArgs, TodoUpdateArgs,
 };
 
 /// Per-session MCP handler.
@@ -133,6 +135,34 @@ impl TodoDetailDto {
     }
 }
 
+/// Wire shape for a roster entry in `roster_list` and `roster_get` output.
+#[derive(Serialize)]
+struct RosterDto {
+    id: u64,
+    kind: &'static str,
+    name: String,
+    display_name: String,
+    command: String,
+    cwd: String,
+    position: i64,
+    created_at: String,
+}
+
+impl RosterDto {
+    fn from_entry(e: RosterEntry) -> Self {
+        RosterDto {
+            id: e.id,
+            kind: e.kind.as_str(),
+            name: e.name,
+            display_name: e.display_name,
+            command: e.command,
+            cwd: e.cwd,
+            position: e.position,
+            created_at: e.created_at,
+        }
+    }
+}
+
 /// Wire shape for an agent in `agent_list` and `whoami` output.
 #[derive(Serialize)]
 struct AgentDto {
@@ -194,6 +224,7 @@ fn map_core_err(e: CoreError) -> McpError {
         // the daemon cannot reach.
         CoreError::ScratchpadNotFound(_)
         | CoreError::TodoNotFound(_)
+        | CoreError::RosterNotFound(_)
         | CoreError::BadRequest(_)
         | CoreError::Workspace(_) => McpError::invalid_params(e.to_string(), None),
         // Internal: a stale project handle, a database fault, or a failed write.
@@ -325,6 +356,16 @@ fn parse_priority(s: &str) -> Result<Priority, McpError> {
     Priority::parse(s).ok_or_else(|| {
         McpError::invalid_params(
             format!("invalid priority '{s}': expected high, medium, or low"),
+            None,
+        )
+    })
+}
+
+/// Parse a roster-kind token from a tool argument, with a caller-facing error.
+fn parse_roster_kind(s: &str) -> Result<RosterKind, McpError> {
+    RosterKind::parse(s).ok_or_else(|| {
+        McpError::invalid_params(
+            format!("invalid kind '{s}': expected agent, command, or terminal"),
             None,
         )
     })
@@ -690,6 +731,103 @@ impl Handler {
         };
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
+
+    #[tool(description = "Create a roster entry - a persistent agent, command, or terminal for \
+                          this project. kind is one of agent/command/terminal. Returns its \
+                          numeric id.")]
+    async fn roster_create(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterCreateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = parse_roster_kind(&args.kind)?;
+        let id = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_create(
+                project,
+                kind,
+                args.name,
+                args.display_name.unwrap_or_default(),
+                args.command.unwrap_or_default(),
+                args.cwd.unwrap_or_default(),
+            )
+            .map_err(map_core_err)?
+        };
+        Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
+    }
+
+    #[tool(description = "List this project's roster as a JSON array of {id, kind, name, \
+                          display_name, command, cwd, position, created_at}.")]
+    async fn roster_list(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let dtos: Vec<RosterDto> = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_list(project)
+                .map_err(map_core_err)?
+                .into_iter()
+                .map(RosterDto::from_entry)
+                .collect()
+        };
+        json_result(&dtos)
+    }
+
+    #[tool(description = "Fetch one roster entry in full, addressed by numeric id.")]
+    async fn roster_get(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            RosterDto::from_entry(
+                st.roster_get(project, args.roster_id).map_err(map_core_err)?,
+            )
+        };
+        json_result(&dto)
+    }
+
+    #[tool(description = "Edit a roster entry's fields. Every argument but roster_id is \
+                          optional; an omitted field is left unchanged.")]
+    async fn roster_update(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterUpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let patch = RosterPatch {
+            name: args.name,
+            display_name: args.display_name,
+            command: args.command,
+            cwd: args.cwd,
+            position: args.position,
+        };
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_update(project, args.roster_id, patch)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Delete a roster entry, addressed by numeric id.")]
+    async fn roster_delete(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<RosterDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.roster_delete(project, args.roster_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
 }
 
 #[tool_handler]
@@ -719,6 +857,10 @@ impl ServerHandler for Handler {
                  and todo_comment_add. Each todo also projects to .panopt/todos/<id>.md.\n\
                  - Scratchpads: scratchpad_create (returns an id), scratchpad_list, \
                  scratchpad_append, scratchpad_read. Reference scratchpads by numeric id.\n\
+                 - Roster: roster_create (kind agent/command/terminal, returns an id), \
+                 roster_list, roster_get, roster_update, roster_delete. The roster is the \
+                 project's persistent agents, commands, and terminals; the cockpit launches \
+                 and tracks them. Projected to .panopt/roster.md.\n\
                  State is persisted, shared live across every agent on the same project, \
                  and mirrored into .panopt/*.md under the project root."
                     .to_string(),

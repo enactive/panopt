@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -83,6 +83,29 @@ CREATE TABLE todo_blockers (
 );
 ";
 
+/// Version 3: the persistent agent/command/terminal roster (todo #67).
+///
+/// Adds one `roster` table holding all three kinds, distinguished by a `kind`
+/// column, modeled on Solo's `processes` table. Like `todos` and `scratchpads`
+/// it is keyed `(project_id, id)` with a per-project id counter on `projects`.
+/// Columns are deliberately minimal; per-entry settings (auto-start, env, an
+/// agent-tool link) are left for later additions.
+const SCHEMA_V3: &str = "
+ALTER TABLE projects ADD COLUMN next_roster_id INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE roster (
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
+    id           INTEGER NOT NULL,
+    kind         TEXT    NOT NULL,
+    name         TEXT    NOT NULL,
+    display_name TEXT    NOT NULL DEFAULT '',
+    command      TEXT    NOT NULL DEFAULT '',
+    cwd          TEXT    NOT NULL DEFAULT '',
+    position     INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL,
+    PRIMARY KEY (project_id, id)
+);
+";
+
 /// Bring `conn` up to [`SCHEMA_VERSION`], creating tables on a fresh database.
 ///
 /// Idempotent: a database already at the current version is left untouched.
@@ -95,6 +118,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
     if version < 2 {
         conn.execute_batch(SCHEMA_V2)?;
+    }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3)?;
     }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -163,5 +189,50 @@ mod tests {
             .query_row("SELECT created_at FROM todos WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert!(!created.is_empty(), "created_at should be backfilled");
+    }
+
+    #[test]
+    fn fresh_database_has_the_v3_roster_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO roster (project_id, id, kind, name, created_at)
+                 VALUES (1, 1, 'agent', 'Claude', '');",
+        )
+        .unwrap();
+        let next: i64 = conn
+            .query_row("SELECT next_roster_id FROM projects WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn v2_database_upgrades_to_v3_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Stand up a v2 database by hand: the v1+v2 schema, version pinned to 2.
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch("INSERT INTO projects (id, root) VALUES (1, '/x');")
+            .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The roster table and the new per-project counter both exist.
+        conn.execute_batch(
+            "INSERT INTO roster (project_id, id, kind, name, created_at)
+                 VALUES (1, 1, 'command', 'Run', '');",
+        )
+        .unwrap();
+        let next: i64 = conn
+            .query_row("SELECT next_roster_id FROM projects WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(next, 1);
     }
 }

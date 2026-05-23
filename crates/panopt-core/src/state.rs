@@ -18,7 +18,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
-use crate::model::{Agent, Lock, Priority, ProjectId, Scratchpad, Todo, TodoComment, TodoPatch, TodoStatus};
+use crate::model::{
+    Agent, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad, Todo,
+    TodoComment, TodoPatch, TodoStatus,
+};
 use crate::projection;
 use crate::registry::Registry;
 
@@ -257,6 +260,7 @@ impl Store {
             next as u64
         };
         self.reproject_scratchpad(project, id)?;
+        self.reproject_scratchpads_index(project)?;
         Ok(id)
     }
 
@@ -316,6 +320,145 @@ impl Store {
             )
             .optional()?
             .ok_or(CoreError::ScratchpadNotFound(id))
+    }
+
+    // --- roster ---
+
+    /// Create a roster entry in `project` and return its id. `position` is set
+    /// to the new id so entries default to creation order yet stay reorderable.
+    pub fn roster_create(
+        &mut self,
+        project: ProjectId,
+        kind: RosterKind,
+        name: String,
+        display_name: String,
+        command: String,
+        cwd: String,
+    ) -> Result<u64, CoreError> {
+        let pid = project.0;
+        let id = {
+            let tx = self.conn.transaction()?;
+            let next = next_id(&tx, pid, "next_roster_id")?;
+            tx.execute(
+                "INSERT INTO roster
+                    (project_id, id, kind, name, display_name, command, cwd, position, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
+                params![pid, next, kind.as_str(), name, display_name, command, cwd, next],
+            )?;
+            tx.execute(
+                "UPDATE projects SET next_roster_id = ?1 WHERE id = ?2",
+                params![next + 1, pid],
+            )?;
+            tx.commit()?;
+            next as u64
+        };
+        self.reproject_roster(project)?;
+        Ok(id)
+    }
+
+    /// List a project's roster entries, ordered by `position` then `id`.
+    pub fn roster_list(&self, project: ProjectId) -> Result<Vec<RosterEntry>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, display_name, command, cwd, position, created_at
+               FROM roster WHERE project_id = ?1 ORDER BY position, id",
+        )?;
+        let rows = stmt.query_map([project.0], |r| {
+            let kind: String = r.get(1)?;
+            Ok(RosterEntry {
+                id: r.get::<_, i64>(0)? as u64,
+                kind: RosterKind::parse(&kind).unwrap_or_default(),
+                name: r.get(2)?,
+                display_name: r.get(3)?,
+                command: r.get(4)?,
+                cwd: r.get(5)?,
+                position: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fetch one roster entry, or [`CoreError::RosterNotFound`] if it is absent.
+    pub fn roster_get(&self, project: ProjectId, id: u64) -> Result<RosterEntry, CoreError> {
+        self.fetch_roster(project, id)
+    }
+
+    /// Apply a [`RosterPatch`]: every `Some` field is written, every `None`
+    /// field is left as-is.
+    pub fn roster_update(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        patch: RosterPatch,
+    ) -> Result<(), CoreError> {
+        let mut entry = self.fetch_roster(project, id)?;
+        if let Some(v) = patch.name {
+            entry.name = v;
+        }
+        if let Some(v) = patch.display_name {
+            entry.display_name = v;
+        }
+        if let Some(v) = patch.command {
+            entry.command = v;
+        }
+        if let Some(v) = patch.cwd {
+            entry.cwd = v;
+        }
+        if let Some(v) = patch.position {
+            entry.position = v;
+        }
+        self.conn.execute(
+            "UPDATE roster
+                SET name = ?1, display_name = ?2, command = ?3, cwd = ?4, position = ?5
+              WHERE project_id = ?6 AND id = ?7",
+            params![
+                entry.name,
+                entry.display_name,
+                entry.command,
+                entry.cwd,
+                entry.position,
+                project.0,
+                id as i64,
+            ],
+        )?;
+        self.reproject_roster(project)
+    }
+
+    /// Delete a roster entry.
+    pub fn roster_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        let changed = self.conn.execute(
+            "DELETE FROM roster WHERE project_id = ?1 AND id = ?2",
+            params![project.0, id as i64],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::RosterNotFound(id));
+        }
+        self.reproject_roster(project)
+    }
+
+    /// Fetch one roster entry by id within `project`.
+    fn fetch_roster(&self, project: ProjectId, id: u64) -> Result<RosterEntry, CoreError> {
+        self.conn
+            .query_row(
+                "SELECT kind, name, display_name, command, cwd, position, created_at
+                   FROM roster WHERE project_id = ?1 AND id = ?2",
+                params![project.0, id as i64],
+                |r| {
+                    let kind: String = r.get(0)?;
+                    Ok(RosterEntry {
+                        id,
+                        kind: RosterKind::parse(&kind).unwrap_or_default(),
+                        name: r.get(1)?,
+                        display_name: r.get(2)?,
+                        command: r.get(3)?,
+                        cwd: r.get(4)?,
+                        position: r.get(5)?,
+                        created_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(CoreError::RosterNotFound(id))
     }
 
     // --- todos ---
@@ -630,6 +773,18 @@ impl Store {
         Ok(())
     }
 
+    fn reproject_scratchpads_index(&self, project: ProjectId) -> Result<(), CoreError> {
+        let root = self.project_root(project)?;
+        projection::project_scratchpads_index(&root, &self.scratchpad_list(project)?)?;
+        Ok(())
+    }
+
+    fn reproject_roster(&self, project: ProjectId) -> Result<(), CoreError> {
+        let root = self.project_root(project)?;
+        projection::project_roster(&root, &self.roster_list(project)?)?;
+        Ok(())
+    }
+
     fn reproject_agents(&self, project: ProjectId) -> Result<(), CoreError> {
         let root = self.project_root(project)?;
         projection::project_agents(&root, &self.registry.list(project.0))?;
@@ -646,8 +801,10 @@ impl Store {
     /// project per process by [`Self::ensure_project`].
     fn reproject_all(&self, root: &Path, project: ProjectId) -> Result<(), CoreError> {
         projection::project_todos(root, &self.todo_list(project)?)?;
+        projection::project_roster(root, &self.roster_list(project)?)?;
         projection::project_agents(root, &self.registry.list(project.0))?;
         projection::project_locks(root, &self.lock_list(project))?;
+        projection::project_scratchpads_index(root, &self.scratchpad_list(project)?)?;
         for (id, _) in self.scratchpad_list(project)? {
             projection::project_scratchpad(root, &self.fetch_scratchpad(project, id)?)?;
         }
@@ -1030,5 +1187,75 @@ mod tests {
         assert_eq!(fx.store.lock_acquire(b, "y", "build".into(), None).unwrap(), None);
         assert_eq!(fx.store.lock_list(a).len(), 1);
         assert_eq!(fx.store.lock_list(b).len(), 1);
+    }
+
+    #[test]
+    fn roster_create_list_update_delete_and_project() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+
+        let id = fx
+            .store
+            .roster_create(
+                p,
+                RosterKind::Agent,
+                "claude".into(),
+                "Mediator".into(),
+                "claude --model sonnet".into(),
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(id, 1);
+
+        let entries = fx.store.roster_list(p).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, RosterKind::Agent);
+        assert_eq!(entries[0].display_name, "Mediator");
+
+        // The roster is projected to disk for the cockpit plugin to read.
+        let roster_md = std::fs::read_to_string(root.join(".panopt/roster.md")).unwrap();
+        assert!(roster_md.contains("- [agent] #1 Mediator"), "{roster_md}");
+
+        fx.store
+            .roster_update(
+                p,
+                id,
+                RosterPatch { command: Some("claude".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(fx.store.roster_get(p, id).unwrap().command, "claude");
+
+        fx.store.roster_delete(p, id).unwrap();
+        assert!(fx.store.roster_list(p).unwrap().is_empty());
+        assert!(matches!(
+            fx.store.roster_delete(p, id),
+            Err(CoreError::RosterNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn roster_ids_are_independent_of_todos_and_scratchpads() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        fx.store.todo_create(p, "a".into()).unwrap();
+        fx.store.scratchpad_create(p, "pad".into()).unwrap();
+        let kind = RosterKind::Command;
+        assert_eq!(
+            fx.store
+                .roster_create(p, kind, "run".into(), String::new(), "make".into(), String::new())
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn scratchpad_create_projects_the_index() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        fx.store.scratchpad_create(p, "design notes".into()).unwrap();
+        fx.store.scratchpad_create(p, "scratch".into()).unwrap();
+        let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
+        assert!(index.contains("- [#1](scratchpad/1.md) design notes"), "{index}");
+        assert!(index.contains("- [#2](scratchpad/2.md) scratch"), "{index}");
     }
 }

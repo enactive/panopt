@@ -99,6 +99,56 @@ pub struct TodoCommentAddArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterCreateArgs {
+    /// Kind of entry: one of agent, command, terminal.
+    pub kind: String,
+    /// Identifier-style name for the entry.
+    pub name: String,
+    /// Optional human label shown in the cockpit. Omit to use `name`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Shell command the entry launches. Omit for a bare terminal.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Working directory for the launched command. Omit to use the project root.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterGetArgs {
+    /// Numeric id of the roster entry to fetch.
+    pub roster_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterUpdateArgs {
+    /// Numeric id of the roster entry to edit.
+    pub roster_id: u64,
+    /// New name. Omit to leave unchanged.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New display label. Omit to leave unchanged.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// New launch command. Omit to leave unchanged.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// New working directory. Omit to leave unchanged.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// New sort position. Omit to leave unchanged.
+    #[serde(default)]
+    pub position: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RosterDeleteArgs {
+    /// Numeric id of the roster entry to delete.
+    pub roster_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct IdentifyArgs {
     /// Human-readable name for this agent, shown to others in the registry.
     pub name: String,

@@ -199,24 +199,26 @@ files and browse code - a tool reached for, not the frame.
 - **Projected files** - `.panopt/` markdown files mirroring daemon state into
   the workspace, readable by any editor.
 - **PANopt Zellij plugin** - a Rust-to-WASM Zellij plugin that renders the
-  coordination sidebar: a grouped, navigable list of agents and todos, pinned
-  as a pane in the Zellij layout. It focuses a pane when the user selects it.
+  coordination sidebar: five collapsible sections (todos, agents, terminals,
+  commands, scratchpads), pinned as a pane in the Zellij layout. Selecting an
+  item swaps its pane into the single content slot on the right (Section 5.5).
+- **Viewer panes** - long-lived `panopt _viewer` panes that display a todo,
+  scratchpad, or section list, re-pointed by the sidebar through a routing file.
 - **Agents** - external CLIs (Claude Code and similar), run as Zellij panes or
   tabs, each configured with the daemon as an MCP server.
 - **`panopt`** - the launcher CLI. Starts `panoptd` on demand and opens agent
   panes in Zellij, each with a stable per-agent identity (Section 9). Its
-  `todo` subcommand is a small MCP client for editing a project's todos from a
-  shell, and is what the cockpit's todo form shells out to. A standalone TUI
-  client of the daemon may be added later; the Zellij plugin remains the
-  primary in-cockpit dashboard.
+  `todo` and `roster` subcommands are small MCP clients for editing a project's
+  todos and roster from a shell; the cockpit's todo form and viewer panes are
+  also `panopt` subcommands.
 
 ### 5.2 Diagram
 
 ```
         Zellij  (terminal multiplexer - the cockpit, one window)
   +-------------------------------------------------------+
-  |  agent panes / tabs       PANopt plugin pane          |
-  |  [agent A] [agent B]      (coordination sidebar)      |
+  |  one content pane         PANopt plugin pane          |
+  |  (viewer / agent / ...)   (coordination sidebar)      |
   +------|---------|-------------------|------------------+
          |  MCP    |  MCP              | reads .panopt/*.md
          | (HTTP)  | (HTTP)           | + focuses panes
@@ -294,19 +296,29 @@ Zellij-native:
    of the design - it works under Zellij, a bare editor, or anything else.
 
 2. **The Zellij plugin (the cockpit sidebar).** A Rust-to-WASM Zellij plugin,
-   pinned as a sidebar pane in the layout, renders a grouped, navigable list of
-   the agents and the todos. It reads the projected `.panopt/` files and
-   Zellij's own live pane state, and - the part a passive file view cannot do -
-   focuses the corresponding pane when the user selects an entry, opens a new
-   agent pane on `a` or a `panopt:spawn-agent` pipe message, and opens the todo
-   form on `Enter` over a todo (or `c` for a new one). It is the cockpit's
-   launcher, never an editor: the form itself is `panopt todo edit`, a `ratatui`
-   TUI in a *floating* pane, so a real editing surface gets real room while the
-   narrow sidebar stays a list. That makes the plugin a real switcher: the
-   coherent grouped window list the editor-host design could not provide. A
-   WASM plugin is Zellij's sanctioned extension point and
-   requires no fork; it requests Zellij permissions (`ReadApplicationState`,
-   `ChangeApplicationState`, `RunCommands`) once, then is cached.
+   pinned as a sidebar pane in the layout, renders five collapsible sections -
+   todos, agents, terminals, commands, scratchpads - read from the projected
+   `.panopt/` files and Zellij's own live pane state. A caret collapses each
+   section; the mouse and the arrow keys both drive it.
+
+   Selecting an item shows it in one content pane on the right. The cockpit
+   starts with the sidebar and a single empty `panopt _viewer`; selecting an
+   item swaps its pane into that one slot and suppresses whatever was there - a
+   suppressed pane keeps running, hidden, with no stack and no title bar. Todos,
+   scratchpads, and section lists all share the one re-pointable viewer pane,
+   which the plugin re-points by writing a small routing file the viewer polls;
+   an agent, command, or terminal is its own pane, swapped in whole. Moving the
+   cursor previews the selected item in the slot without taking focus off the
+   sidebar; Enter or a click swaps it in and focuses it. If the user splits the
+   content pane, a selection swaps into whichever pane was focused last before
+   the sidebar took focus. The plugin never closes a pane - agents, commands,
+   terminals, and viewers alike are the user's to keep.
+
+   It is still the cockpit's launcher, not an editor: creating and quick-editing
+   a todo open `panopt todo edit`, a `ratatui` form, in a floating pane. A WASM
+   plugin is Zellij's sanctioned extension point and requires no fork; it
+   requests Zellij permissions (`ReadApplicationState`, `ChangeApplicationState`,
+   `RunCommands`) once, then is cached.
 
 The earlier draft named "no pixel-native panel" as the one real limitation of
 the no-fork decision. The Zellij plugin removes most of it: the sidebar is a
@@ -337,10 +349,11 @@ view first and an input second.
 
 Append-oriented shared notes, organized into sections and tags.
 
-Projection: `.panopt/scratchpad/<id>.md`. Because scratchpads are
-append-mostly, bidirectional sync is clean: a user editing in any editor and an
-agent appending via MCP both land, and the daemon reconciles by section.
-Appends are conflict-free by construction.
+Projection: one file per scratchpad at `.panopt/scratchpad/<id>.md`, plus a
+`.panopt/scratchpads.md` index that links them all (the cockpit reads the index
+to list them). Because scratchpads are append-mostly, bidirectional sync is
+clean: a user editing in any editor and an agent appending via MCP both land,
+and the daemon reconciles by section. Appends are conflict-free by construction.
 
 ### 6.3 Agent registry and locks
 
@@ -380,9 +393,9 @@ A single SQLite database holds every project. One database file is simpler to
 operate than a file per project, and SQLite gives durability and queryability
 with no server.
 
-Three tables: `projects`, `todos`, and `scratchpads`. The `todos` and
-`scratchpads` rows are keyed by `(project_id, id)`, so ids restart at 1 in each
-project and read naturally in the projected files. Per-project id counters live
+Four tables: `projects`, `todos`, `scratchpads`, and `roster` (Section 6.6).
+The `todos`, `scratchpads`, and `roster` rows are keyed by `(project_id, id)`,
+so ids restart at 1 in each project and read naturally in the projected files. Per-project id counters live
 on the `projects` row and are bumped in the same transaction as the insert, so
 an id is never handed out twice and never reused after a deletion. Each mutation
 commits its transaction and then re-projects the affected `.panopt/` file; the
@@ -400,6 +413,23 @@ The daemon is the single source of truth. Projected files are derived state.
   structural edits go through commands. Where a direct file edit and a daemon
   update collide, the daemon's value wins (last-writer-wins under daemon
   authority).
+
+### 6.6 Roster
+
+The roster is a project's persistent agents, commands, and terminals - the
+launchable processes the cockpit knows about. It is one SQLite table modeled on
+Solo's `processes` table, with a `kind` column (`agent` / `command` /
+`terminal`) distinguishing the three. The columns are deliberately minimal -
+name, command, working directory - with room for per-entry settings (auto-start,
+environment, an agent-tool link) to be added later.
+
+Whether an entry is currently running is *not* stored: the cockpit derives it
+from live Zellij pane state. A not-running entry is offered a "start" action.
+The roster is projected to `.panopt/roster.md`.
+
+The roster is distinct from the agent registry (Section 6.3): the registry is
+the ephemeral set of agents *currently connected* over MCP, while the roster is
+the durable set of processes the project is *configured* to run.
 
 ## 7. Proof of Concept
 

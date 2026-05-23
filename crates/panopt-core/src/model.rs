@@ -144,6 +144,73 @@ pub struct TodoPatch {
     pub tags: Option<Vec<String>>,
 }
 
+/// What a [`RosterEntry`] launches: an agent CLI, a project command, or a
+/// plain terminal. Modeled on the values of Solo's `processes.kind` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RosterKind {
+    #[default]
+    Agent,
+    Command,
+    Terminal,
+}
+
+impl RosterKind {
+    /// The token stored in SQLite and used on the wire and in the projection.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RosterKind::Agent => "agent",
+            RosterKind::Command => "command",
+            RosterKind::Terminal => "terminal",
+        }
+    }
+
+    /// Parse a stored or wire token; `None` for an unrecognized string.
+    pub fn parse(s: &str) -> Option<RosterKind> {
+        match s {
+            "agent" => Some(RosterKind::Agent),
+            "command" => Some(RosterKind::Command),
+            "terminal" => Some(RosterKind::Terminal),
+            _ => None,
+        }
+    }
+}
+
+/// A persistent, per-project roster entry: a launchable agent, command, or
+/// terminal. Modeled on a row of Solo's `processes` table.
+///
+/// Whether the entry is currently running is *not* stored here - the cockpit
+/// derives that from live Zellij pane state. The roster holds only the durable
+/// definition.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RosterEntry {
+    /// Numeric id, unique within the project, restarting at 1 per project.
+    pub id: u64,
+    pub kind: RosterKind,
+    /// Identifier-style name.
+    pub name: String,
+    /// Optional human label for the cockpit; falls back to `name` when empty.
+    pub display_name: String,
+    /// The shell command this entry launches. Empty for a plain terminal.
+    pub command: String,
+    /// Working directory for the launched command; empty means the project root.
+    pub cwd: String,
+    /// Sort key within the project's roster.
+    pub position: i64,
+    /// SQLite `datetime('now')` text (UTC).
+    pub created_at: String,
+}
+
+/// A set of optional edits to a [`RosterEntry`], applied by
+/// [`crate::Store::roster_update`]. Each `None` field is left untouched.
+#[derive(Debug, Default, Clone)]
+pub struct RosterPatch {
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub position: Option<i64>,
+}
+
 /// A connected agent, as tracked by the in-memory registry.
 ///
 /// Agents are ephemeral - the registry holds only those currently connected -

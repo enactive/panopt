@@ -13,6 +13,10 @@ pub enum CoreError {
     #[error("todo {0} not found")]
     TodoNotFound(u64),
 
+    /// No roster entry exists with the given id in the project.
+    #[error("roster entry {0} not found")]
+    RosterNotFound(u64),
+
     /// A caller-supplied argument was rejected - for example, a todo asked to
     /// block itself. The message is safe to surface to the caller.
     #[error("{0}")]
