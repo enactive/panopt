@@ -23,6 +23,8 @@ pub struct Scratchpad {
     pub id: u64,
     pub title: String,
     pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Lifecycle state of a [`Todo`].

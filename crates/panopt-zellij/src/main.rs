@@ -1646,6 +1646,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_scratchpad_index_line_with_updated_timestamp() {
+        // The post-V4 form embeds `- updated <ts>` in the trailing label.
+        // The parser treats everything after `") "` as the label, so the
+        // timestamp simply flows into the cockpit's row text.
+        let (id, label) = parse_index_line(
+            "- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21",
+        )
+        .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(label, "Sample Notes - updated 2026-05-23 18:05:21");
+    }
+
+    #[test]
     fn ignores_non_index_lines() {
         assert!(parse_index_line("# Todos").is_none());
         assert!(parse_index_line("_(no todos)_").is_none());

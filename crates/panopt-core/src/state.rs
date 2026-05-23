@@ -269,7 +269,8 @@ impl Store {
             let tx = self.conn.transaction()?;
             let next = next_id(&tx, pid, "next_scratchpad_id")?;
             tx.execute(
-                "INSERT INTO scratchpads (project_id, id, title, body) VALUES (?1, ?2, ?3, '')",
+                "INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '', datetime('now'), datetime('now'))",
                 params![pid, next, title],
             )?;
             tx.execute(
@@ -279,8 +280,7 @@ impl Store {
             tx.commit()?;
             next as u64
         };
-        self.reproject_scratchpad(project, id)?;
-        self.reproject_scratchpads_index(project)?;
+        self.reproject_scratchpad_full(project, id)?;
         Ok(id)
     }
 
@@ -309,10 +309,12 @@ impl Store {
         }
         body.push_str(content);
         self.conn.execute(
-            "UPDATE scratchpads SET body = ?1 WHERE project_id = ?2 AND id = ?3",
+            "UPDATE scratchpads
+                SET body = ?1, updated_at = datetime('now')
+              WHERE project_id = ?2 AND id = ?3",
             params![body, project.0, id as i64],
         )?;
-        self.reproject_scratchpad(project, id)
+        self.reproject_scratchpad_full(project, id)
     }
 
     /// Read the full body of a scratchpad.
@@ -334,9 +336,18 @@ impl Store {
     fn fetch_scratchpad(&self, project: ProjectId, id: u64) -> Result<Scratchpad, CoreError> {
         self.conn
             .query_row(
-                "SELECT title, body FROM scratchpads WHERE project_id = ?1 AND id = ?2",
+                "SELECT title, body, created_at, updated_at FROM scratchpads
+                  WHERE project_id = ?1 AND id = ?2",
                 params![project.0, id as i64],
-                |r| Ok(Scratchpad { id, title: r.get(0)?, body: r.get(1)? }),
+                |r| {
+                    Ok(Scratchpad {
+                        id,
+                        title: r.get(0)?,
+                        body: r.get(1)?,
+                        created_at: r.get(2)?,
+                        updated_at: r.get(3)?,
+                    })
+                },
             )
             .optional()?
             .ok_or(CoreError::ScratchpadNotFound(id))
@@ -795,8 +806,43 @@ impl Store {
 
     fn reproject_scratchpads_index(&self, project: ProjectId) -> Result<(), CoreError> {
         let root = self.project_root(project)?;
-        projection::project_scratchpads_index(&root, &self.scratchpad_list(project)?)?;
+        projection::project_scratchpads_index(&root, &self.scratchpad_index_rows(project)?)?;
         Ok(())
+    }
+
+    /// Rewrite both the per-scratchpad file and the scratchpad index, so every
+    /// mutation that touches a scratchpad refreshes the projection completely.
+    /// The single helper makes the index step impossible for a caller to skip,
+    /// matching the all-or-nothing shape `reproject_todos` already has.
+    fn reproject_scratchpad_full(
+        &self,
+        project: ProjectId,
+        id: u64,
+    ) -> Result<(), CoreError> {
+        self.reproject_scratchpad(project, id)?;
+        self.reproject_scratchpads_index(project)
+    }
+
+    /// `(id, title, updated_at)` for every scratchpad in `project`, id-ascending.
+    /// The projection layer renders the `updated_at` into each index line; the
+    /// public `scratchpad_list` stays the narrow `(id, title)` shape the MCP
+    /// wire summary expects.
+    fn scratchpad_index_rows(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<(u64, String, String)>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, updated_at FROM scratchpads
+              WHERE project_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([project.0], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn reproject_roster(&self, project: ProjectId) -> Result<(), CoreError> {
@@ -824,7 +870,7 @@ impl Store {
         projection::project_roster(root, &self.roster_list(project)?)?;
         projection::project_agents(root, &self.registry.list(project.0))?;
         projection::project_locks(root, &self.lock_list(project))?;
-        projection::project_scratchpads_index(root, &self.scratchpad_list(project)?)?;
+        projection::project_scratchpads_index(root, &self.scratchpad_index_rows(project)?)?;
         for (id, _) in self.scratchpad_list(project)? {
             projection::project_scratchpad(root, &self.fetch_scratchpad(project, id)?)?;
         }
@@ -899,6 +945,53 @@ mod tests {
         fx.store.scratchpad_append(p, id, "first").unwrap();
         fx.store.scratchpad_append(p, id, "second").unwrap();
         assert_eq!(fx.store.scratchpad_read(p, id).unwrap(), "first\nsecond");
+    }
+
+    #[test]
+    fn scratchpad_create_sets_created_and_updated_timestamps() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
+        let pad = fx.store.fetch_scratchpad(p, id).unwrap();
+        assert!(!pad.created_at.is_empty(), "created_at is set on create");
+        assert!(!pad.updated_at.is_empty(), "updated_at is set on create");
+    }
+
+    #[test]
+    fn scratchpad_append_bumps_updated_at_and_rewrites_index() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
+        let before = fx.store.fetch_scratchpad(p, id).unwrap().updated_at;
+
+        // datetime('now') has 1-second resolution, so cross a second boundary
+        // to be sure the timestamp moves; the same constraint todos face.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fx.store.scratchpad_append(p, id, "more").unwrap();
+
+        let after = fx.store.fetch_scratchpad(p, id).unwrap().updated_at;
+        assert!(after > before, "updated_at must advance on append");
+
+        // And the index file now carries the new timestamp - the bytes change
+        // so the cockpit's 1s file poller observes the refresh.
+        let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
+        assert!(
+            index.contains(&format!("updated {after}")),
+            "index reflects the bumped updated_at\n{index}",
+        );
+    }
+
+    #[test]
+    fn scratchpad_append_rewrites_the_index_even_after_deletion() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
+        // Remove the index to prove `scratchpad_append` rewrites it - this
+        // is what guards against the pre-fix asymmetry where append skipped
+        // the index reprojection entirely.
+        std::fs::remove_file(root.join(".panopt/scratchpads.md")).unwrap();
+        fx.store.scratchpad_append(p, id, "more").unwrap();
+        assert!(root.join(".panopt/scratchpads.md").exists());
     }
 
     #[test]
@@ -1078,7 +1171,13 @@ mod tests {
         fx.store.scratchpad_append(p, sid, "second").unwrap();
         let sp_md =
             std::fs::read_to_string(root.join(format!(".panopt/scratchpad/{sid}.md"))).unwrap();
-        assert_eq!(sp_md, "# notes\n\nfirst\nsecond\n");
+        // Per-pad files now carry a `created`/`updated` frontmatter block;
+        // the wall-clock timestamps inside are checked structurally rather
+        // than by exact match.
+        assert!(sp_md.starts_with("---\n"), "{sp_md}");
+        assert!(sp_md.contains("created: "), "{sp_md}");
+        assert!(sp_md.contains("updated: "), "{sp_md}");
+        assert!(sp_md.contains("# notes\n\nfirst\nsecond\n"), "{sp_md}");
     }
 
     #[test]

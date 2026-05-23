@@ -155,9 +155,16 @@ pub(crate) fn render_todo_md(todo: &Todo) -> String {
     out
 }
 
-/// Render a scratchpad as its title (H1) followed by its body verbatim.
+/// Render a scratchpad as a `---` frontmatter block of created/updated
+/// timestamps, the title as an H1, then its body verbatim. The frontmatter
+/// mirrors `render_todo_md` so every per-item file in the projection carries
+/// the same structured-then-prose shape.
 pub(crate) fn render_scratchpad_md(pad: &Scratchpad) -> String {
-    let mut out = format!("# {}\n\n", pad.title);
+    let mut out = String::from("---\n");
+    out.push_str(&format!("created: {}\n", pad.created_at));
+    out.push_str(&format!("updated: {}\n", pad.updated_at));
+    out.push_str("---\n\n");
+    out.push_str(&format!("# {}\n\n", pad.title));
     out.push_str(&pad.body);
     if !pad.body.is_empty() && !pad.body.ends_with('\n') {
         out.push('\n');
@@ -166,15 +173,20 @@ pub(crate) fn render_scratchpad_md(pad: &Scratchpad) -> String {
 }
 
 /// Render the scratchpad index: one line per scratchpad, each linking to that
-/// scratchpad's own file. `pads` is `(id, title)` pairs, id-ascending.
-pub(crate) fn render_scratchpads_index_md(pads: &[(u64, String)]) -> String {
+/// scratchpad's own file. `pads` is `(id, title, updated_at)`, id-ascending;
+/// the `updated_at` is embedded in the trailing label so every append changes
+/// the rendered bytes, which is how the cockpit sidebar (a 1s file poller)
+/// notices the change.
+pub(crate) fn render_scratchpads_index_md(pads: &[(u64, String, String)]) -> String {
     let mut out = String::from("# Scratchpads\n\n");
     if pads.is_empty() {
         out.push_str("_(no scratchpads)_\n");
         return out;
     }
-    for (id, title) in pads {
-        out.push_str(&format!("- [#{id}](scratchpad/{id}.md) {title}\n"));
+    for (id, title, updated) in pads {
+        out.push_str(&format!(
+            "- [#{id}](scratchpad/{id}.md) {title} - updated {updated}\n",
+        ));
     }
     out
 }
@@ -291,8 +303,12 @@ pub(crate) fn project_scratchpad(ws: &Path, pad: &Scratchpad) -> io::Result<()> 
     atomic_write(&scratchpad_path(ws, pad.id), &render_scratchpad_md(pad))
 }
 
-/// Rewrite `.panopt/scratchpads.md` from the project's `(id, title)` list.
-pub(crate) fn project_scratchpads_index(ws: &Path, pads: &[(u64, String)]) -> io::Result<()> {
+/// Rewrite `.panopt/scratchpads.md` from the project's
+/// `(id, title, updated_at)` list.
+pub(crate) fn project_scratchpads_index(
+    ws: &Path,
+    pads: &[(u64, String, String)],
+) -> io::Result<()> {
     atomic_write(&scratchpads_index_path(ws), &render_scratchpads_index_md(pads))
 }
 
@@ -411,9 +427,25 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_renders_title_then_body() {
-        let pad = Scratchpad { id: 3, title: "notes".into(), body: "line one".into() };
-        assert_eq!(render_scratchpad_md(&pad), "# notes\n\nline one\n");
+    fn scratchpad_renders_frontmatter_title_then_body() {
+        let pad = Scratchpad {
+            id: 3,
+            title: "notes".into(),
+            body: "line one".into(),
+            created_at: "2026-05-23 18:05:00".into(),
+            updated_at: "2026-05-23 18:05:21".into(),
+        };
+        assert_eq!(
+            render_scratchpad_md(&pad),
+            "---\n\
+             created: 2026-05-23 18:05:00\n\
+             updated: 2026-05-23 18:05:21\n\
+             ---\n\
+             \n\
+             # notes\n\
+             \n\
+             line one\n",
+        );
     }
 
     #[test]
@@ -504,12 +536,15 @@ mod tests {
 
     #[test]
     fn scratchpads_index_links_each_pad() {
-        let pads = vec![(1, "design notes".to_string()), (2, "scratch".to_string())];
+        let pads = vec![
+            (1, "design notes".to_string(), "2026-05-23 18:05:21".to_string()),
+            (2, "scratch".to_string(), "2026-05-23 18:06:00".to_string()),
+        ];
         assert_eq!(
             render_scratchpads_index_md(&pads),
             "# Scratchpads\n\n\
-             - [#1](scratchpad/1.md) design notes\n\
-             - [#2](scratchpad/2.md) scratch\n"
+             - [#1](scratchpad/1.md) design notes - updated 2026-05-23 18:05:21\n\
+             - [#2](scratchpad/2.md) scratch - updated 2026-05-23 18:06:00\n"
         );
     }
 
