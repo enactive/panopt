@@ -688,6 +688,114 @@ impl Store {
         Ok(comment_id)
     }
 
+    /// Replace the body of an existing comment. The author and `created_at`
+    /// timestamp are preserved - a comment edit is not a re-post.
+    pub fn todo_comment_update(
+        &mut self,
+        project: ProjectId,
+        todo_id: u64,
+        comment_id: u64,
+        body: String,
+    ) -> Result<(), CoreError> {
+        let changed = self.conn.execute(
+            "UPDATE todo_comments SET body = ?1
+              WHERE project_id = ?2 AND todo_id = ?3 AND id = ?4",
+            params![body, project.0, todo_id as i64, comment_id as i64],
+        )?;
+        if changed == 0 {
+            // The comment row is missing; surface whichever id is at fault.
+            self.fetch_todo(project, todo_id)?;
+            return Err(CoreError::TodoCommentNotFound { todo_id, comment_id });
+        }
+        self.touch_todo(project, todo_id)?;
+        self.reproject_todos(project)
+    }
+
+    /// Remove a comment from a todo. The comment id is **not** reused - the
+    /// per-todo `next_comment_id` counter keeps advancing, so a later
+    /// `todo_comment_add` lands at the next fresh id.
+    pub fn todo_comment_delete(
+        &mut self,
+        project: ProjectId,
+        todo_id: u64,
+        comment_id: u64,
+    ) -> Result<(), CoreError> {
+        let changed = self.conn.execute(
+            "DELETE FROM todo_comments
+              WHERE project_id = ?1 AND todo_id = ?2 AND id = ?3",
+            params![project.0, todo_id as i64, comment_id as i64],
+        )?;
+        if changed == 0 {
+            self.fetch_todo(project, todo_id)?;
+            return Err(CoreError::TodoCommentNotFound { todo_id, comment_id });
+        }
+        self.touch_todo(project, todo_id)?;
+        self.reproject_todos(project)
+    }
+
+    /// Replace a todo's blocker set with `blockers` in one transactional step.
+    /// Convenience over the per-id `add`/`remove` calls, which the form uses
+    /// during debounced autosave to avoid a half-applied state.
+    pub fn todo_set_blockers(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        blockers: Vec<u64>,
+    ) -> Result<(), CoreError> {
+        // Reject self-blocking up front so the diff loop does not silently skip it.
+        if blockers.iter().any(|b| *b == id) {
+            return Err(CoreError::BadRequest("a todo cannot block itself".into()));
+        }
+        // Make sure the blocked todo and every requested blocker exists before
+        // mutating anything; otherwise a half-applied set leaks on error.
+        self.fetch_todo(project, id)?;
+        for b in &blockers {
+            self.fetch_todo(project, *b)?;
+        }
+        let desired: HashSet<u64> = blockers.into_iter().collect();
+        let current: HashSet<u64> = self.todo_blockers(project, id)?.into_iter().collect();
+        for &remove in current.difference(&desired) {
+            self.conn.execute(
+                "DELETE FROM todo_blockers
+                  WHERE project_id = ?1 AND todo_id = ?2 AND blocker_id = ?3",
+                params![project.0, id as i64, remove as i64],
+            )?;
+        }
+        for &add in desired.difference(&current) {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO todo_blockers (project_id, todo_id, blocker_id)
+                 VALUES (?1, ?2, ?3)",
+                params![project.0, id as i64, add as i64],
+            )?;
+        }
+        self.touch_todo(project, id)?;
+        self.reproject_todos(project)
+    }
+
+    /// The sorted, deduped union of every tag used by any todo in `project`.
+    /// Cheap to recompute on demand; the form uses it for tag autocomplete.
+    pub fn todo_tags_list(&self, project: ProjectId) -> Result<Vec<String>, CoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tags FROM todos WHERE project_id = ?1")?;
+        let rows = stmt.query_map([project.0], |r| r.get::<_, String>(0))?;
+        let mut set: HashSet<String> = HashSet::new();
+        for row in rows {
+            let json = row?;
+            // A bad tag JSON blob is treated as empty rather than aborting the
+            // whole list - the form should not bomb out on a stray write.
+            let tags: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+            for t in tags {
+                if !t.is_empty() {
+                    set.insert(t);
+                }
+            }
+        }
+        let mut tags: Vec<String> = set.into_iter().collect();
+        tags.sort();
+        Ok(tags)
+    }
+
     /// Set or clear `completed_at` to match `status`: a `Completed` todo keeps
     /// any existing timestamp or gets one now; any other status clears it.
     fn reconcile_completed_at(
@@ -1084,6 +1192,108 @@ mod tests {
         fx.store.todo_delete(p, a).unwrap();
         assert!(fx.store.todo_get(p, b).unwrap().blockers.is_empty());
         assert!(matches!(fx.store.todo_get(p, a), Err(CoreError::TodoNotFound(_))));
+    }
+
+    #[test]
+    fn comment_update_replaces_body_and_keeps_metadata() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.todo_create(p, "task".into()).unwrap();
+        let cid = fx
+            .store
+            .todo_comment_add(p, id, "alice".into(), "first draft".into())
+            .unwrap();
+        let original = fx.store.todo_get(p, id).unwrap().comments[0].clone();
+
+        fx.store.todo_comment_update(p, id, cid, "polished".into()).unwrap();
+        let after = fx.store.todo_get(p, id).unwrap().comments[0].clone();
+        assert_eq!(after.body, "polished");
+        assert_eq!(after.author, original.author);
+        assert_eq!(after.created_at, original.created_at);
+    }
+
+    #[test]
+    fn comment_delete_removes_it_and_does_not_reuse_the_id() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.todo_create(p, "task".into()).unwrap();
+        let c1 = fx.store.todo_comment_add(p, id, "a".into(), "1".into()).unwrap();
+        let _c2 = fx.store.todo_comment_add(p, id, "a".into(), "2".into()).unwrap();
+
+        fx.store.todo_comment_delete(p, id, c1).unwrap();
+        let comments = fx.store.todo_get(p, id).unwrap().comments;
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "2");
+
+        // The next add lands at 3, not 1: ids never recycle.
+        let c3 = fx.store.todo_comment_add(p, id, "a".into(), "3".into()).unwrap();
+        assert_eq!(c3, 3);
+    }
+
+    #[test]
+    fn comment_update_and_delete_errors_on_missing_ids() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.todo_create(p, "task".into()).unwrap();
+        // No such comment on an existing todo.
+        assert!(matches!(
+            fx.store.todo_comment_update(p, id, 999, "x".into()),
+            Err(CoreError::TodoCommentNotFound { todo_id, comment_id })
+                if todo_id == id && comment_id == 999
+        ));
+        // No such todo at all.
+        assert!(matches!(
+            fx.store.todo_comment_delete(p, 999, 1),
+            Err(CoreError::TodoNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn set_blockers_diffs_against_the_current_set() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let a = fx.store.todo_create(p, "a".into()).unwrap();
+        let b = fx.store.todo_create(p, "b".into()).unwrap();
+        let c = fx.store.todo_create(p, "c".into()).unwrap();
+        let target = fx.store.todo_create(p, "t".into()).unwrap();
+
+        // From empty -> {a, b}.
+        fx.store.todo_set_blockers(p, target, vec![a, b]).unwrap();
+        assert_eq!(fx.store.todo_get(p, target).unwrap().blockers, vec![a, b]);
+
+        // From {a, b} -> {b, c}: a removed, c added.
+        fx.store.todo_set_blockers(p, target, vec![b, c]).unwrap();
+        assert_eq!(fx.store.todo_get(p, target).unwrap().blockers, vec![b, c]);
+
+        // Empty clears.
+        fx.store.todo_set_blockers(p, target, vec![]).unwrap();
+        assert!(fx.store.todo_get(p, target).unwrap().blockers.is_empty());
+
+        // Self-blocking is rejected; a missing blocker errors before any write.
+        assert!(matches!(
+            fx.store.todo_set_blockers(p, target, vec![target]),
+            Err(CoreError::BadRequest(_))
+        ));
+        assert!(matches!(
+            fx.store.todo_set_blockers(p, target, vec![a, 999]),
+            Err(CoreError::TodoNotFound(999))
+        ));
+        assert!(fx.store.todo_get(p, target).unwrap().blockers.is_empty());
+    }
+
+    #[test]
+    fn tags_list_unions_and_sorts_across_todos() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let a = fx.store.todo_create(p, "a".into()).unwrap();
+        let b = fx.store.todo_create(p, "b".into()).unwrap();
+        fx.store
+            .todo_update(p, a, TodoPatch { tags: Some(vec!["zeta".into(), "alpha".into()]), ..Default::default() })
+            .unwrap();
+        fx.store
+            .todo_update(p, b, TodoPatch { tags: Some(vec!["beta".into(), "alpha".into()]), ..Default::default() })
+            .unwrap();
+        assert_eq!(fx.store.todo_tags_list(p).unwrap(), vec!["alpha", "beta", "zeta"]);
     }
 
     #[test]

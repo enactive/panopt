@@ -7,6 +7,7 @@ mod agent;
 mod close_gate;
 mod daemon;
 mod edit;
+mod form;
 mod mcp;
 mod mcpclient;
 mod paths;

@@ -13,6 +13,10 @@ pub enum CoreError {
     #[error("todo {0} not found")]
     TodoNotFound(u64),
 
+    /// No comment exists with the given id on the named todo.
+    #[error("todo {todo_id} has no comment {comment_id}")]
+    TodoCommentNotFound { todo_id: u64, comment_id: u64 },
+
     /// No roster entry exists with the given id in the project.
     #[error("roster entry {0} not found")]
     RosterNotFound(u64),

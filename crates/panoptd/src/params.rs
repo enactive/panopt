@@ -99,6 +99,47 @@ pub struct TodoCommentAddArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoCommentUpdateArgs {
+    /// Numeric id of the todo the comment lives on.
+    pub todo_id: u64,
+    /// Numeric id of the comment to edit (per-todo, restarts at 1 in each todo).
+    pub comment_id: u64,
+    /// Replacement body. The author and timestamp are preserved.
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoCommentDeleteArgs {
+    /// Numeric id of the todo the comment lives on.
+    pub todo_id: u64,
+    /// Numeric id of the comment to delete.
+    pub comment_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoSetBlockersArgs {
+    /// Numeric id of the todo whose blocker set is being replaced.
+    pub todo_id: u64,
+    /// Replacement set of blocker ids. May be empty to clear all blockers.
+    pub blocker_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoLockArgs {
+    /// Numeric id of the todo to claim. The advisory lock name is `todo:<id>`.
+    pub todo_id: u64,
+    /// Optional reason, shown to other agents in `lock_status`.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoUnlockArgs {
+    /// Numeric id of the todo whose lock to release.
+    pub todo_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RosterCreateArgs {
     /// Kind of entry: one of agent, command, terminal.
     pub kind: String,

@@ -115,13 +115,48 @@ CREATE TABLE roster (
 /// todo index line through its status/priority fields. The backfill mirrors
 /// the v1->v2 todo backfill: any pre-existing scratchpad lands with both
 /// timestamps set to `datetime('now')`.
-const SCHEMA_V4: &str = "
-ALTER TABLE scratchpads ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
-ALTER TABLE scratchpads ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
-UPDATE scratchpads
-   SET created_at = datetime('now'), updated_at = datetime('now')
- WHERE created_at = '';
-";
+///
+/// The `ALTER`s run through [`add_column_if_missing`] rather than a raw
+/// `execute_batch`, so a database stuck at `user_version = 3` whose
+/// `scratchpads` table already carries the v4 columns - the transitional
+/// state of any machine that ran an in-development v4 binary before the
+/// `user_version` bump landed - upgrades cleanly instead of failing on
+/// "duplicate column name". The backfill is unconditionally safe.
+fn apply_v4(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "scratchpads", "created_at", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "scratchpads", "updated_at", "TEXT NOT NULL DEFAULT ''")?;
+    conn.execute_batch(
+        "UPDATE scratchpads
+            SET created_at = datetime('now'), updated_at = datetime('now')
+          WHERE created_at = '';",
+    )
+}
+
+/// Add `column` to `table` only if it is not already there. Used by migrations
+/// that may collide with a transitional dev-database state where the column
+/// landed before its `user_version` bump did. `decl` is the type+constraint
+/// text after the column name, exactly as it would appear in an `ALTER TABLE`.
+///
+/// `column` and `table` are fixed in-crate identifiers, not caller input, so
+/// interpolating them into the SQL is safe.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let existing: String = row.get(1)?;
+        if existing == column {
+            return Ok(());
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))
+}
 
 /// Bring `conn` up to [`SCHEMA_VERSION`], creating tables on a fresh database.
 ///
@@ -140,7 +175,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(SCHEMA_V3)?;
     }
     if version < 4 {
-        conn.execute_batch(SCHEMA_V4)?;
+        apply_v4(conn)?;
     }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -278,6 +313,43 @@ mod tests {
             .unwrap();
         assert!(!created.is_empty(), "created_at backfilled");
         assert!(!updated.is_empty(), "updated_at backfilled");
+    }
+
+    #[test]
+    fn v4_migration_tolerates_a_transitional_database_with_columns_already_present() {
+        // Models the local-dev drift that prompted this guard: an earlier
+        // in-development v4 binary ran the ALTER on `scratchpads` but did not
+        // bump `user_version`, so the database now reports v3 yet already
+        // carries the v4 columns. `migrate` should upgrade it cleanly instead
+        // of failing on a duplicate-column ALTER.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE scratchpads ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
+             ALTER TABLE scratchpads ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+                 VALUES (1, 1, 'pre-bumped', 'note', '', '');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The backfill still runs, so the empty timestamps land at real ones.
+        let updated: String = conn
+            .query_row("SELECT updated_at FROM scratchpads WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(!updated.is_empty(), "updated_at backfilled even in the drift case");
     }
 
     #[test]

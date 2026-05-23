@@ -1,39 +1,50 @@
-//! `panopt _viewer` - a long-lived cockpit viewer pane.
+//! `panopt _viewer` - a long-lived cockpit content pane.
 //!
-//! Renders one item - a todo, a scratchpad, or a section list - from the
-//! project's `.panopt/` projection, scrollable and read-only. The sidebar
-//! plugin re-points the viewer at a different item by writing a routing file
-//! the viewer polls; switching item saves the outgoing item's scroll position
-//! and restores the incoming one's (see [`crate::viewstate`]).
+//! Renders one item from the project's `.panopt/` projection - a scratchpad,
+//! a list of items - or, for the todo kinds, hosts the shared editable form
+//! defined in [`crate::form`]. The sidebar plugin re-points the pane at a
+//! different item by writing a routing file the viewer polls; switching item
+//! saves the outgoing item's scroll position and restores the incoming one's
+//! (see [`crate::viewstate`]).
 //!
-//! Content always comes from the projected `.panopt/*.md` files, which the
-//! daemon keeps current, so the viewer never holds a stale snapshot and needs
-//! no MCP connection of its own. The pane is long-lived: it closes only when
-//! the user presses `q`, never on its own.
+//! Most content comes from the projected `.panopt/*.md` files, which the
+//! daemon keeps current. Todos are special: the viewer opens an MCP session
+//! and renders the form against live `todo_get` data, autosaving on a
+//! debounce. The pane is long-lived: it closes only when the user presses
+//! Ctrl-C, never on its own.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use crate::form::Form;
+use crate::mcpclient::Client;
+use crate::todo::observer_url;
 use crate::viewstate::{self, ViewState};
 
 /// How often the viewer wakes to poll the routing file and refresh content.
 const TICK: Duration = Duration::from_millis(250);
 /// The shortest gap between re-reads of the displayed content file.
 const REFRESH: Duration = Duration::from_millis(800);
+/// How long an unsaved scalar-field edit waits before the viewer flushes it.
+const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// What a viewer pane is currently showing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Target {
     Todo(u64),
+    /// A brand-new todo, not yet persisted. The form sends `todo_create` on
+    /// the first autosave with a non-empty title; from then on it behaves
+    /// like a `Todo(id)`.
+    NewTodo,
     Scratchpad(u64),
     TodoList,
     ScratchpadList,
@@ -42,10 +53,12 @@ enum Target {
 
 impl Target {
     /// Parse a routing payload's `kind`/`id` pair into a target. The `empty`
-    /// kind lets the sidebar clear the viewer when nothing is selected.
+    /// kind lets the sidebar clear the viewer when nothing is selected; the
+    /// `new-todo` kind opens a blank form.
     fn parse(kind: &str, id: Option<u64>) -> Option<Target> {
         match (kind, id) {
             ("todo", Some(id)) => Some(Target::Todo(id)),
+            ("new-todo", _) => Some(Target::NewTodo),
             ("scratchpad", Some(id)) => Some(Target::Scratchpad(id)),
             ("todo-list", _) => Some(Target::TodoList),
             ("scratchpad-list", _) => Some(Target::ScratchpadList),
@@ -55,9 +68,12 @@ impl Target {
     }
 
     /// The [`crate::viewstate`] key under which this target's position is kept.
+    /// The form modes have no scroll position so their keys are stable but
+    /// unused for restoration.
     fn key(&self) -> String {
         match self {
             Target::Todo(id) => format!("todo:{id}"),
+            Target::NewTodo => "todo:new".to_string(),
             Target::Scratchpad(id) => format!("scratchpad:{id}"),
             Target::TodoList => "list:todos".to_string(),
             Target::ScratchpadList => "list:scratchpads".to_string(),
@@ -69,12 +85,17 @@ impl Target {
         matches!(self, Target::TodoList | Target::ScratchpadList)
     }
 
+    fn is_form(&self) -> bool {
+        matches!(self, Target::Todo(_) | Target::NewTodo)
+    }
+
     /// The projected `.panopt/` file backing this target, relative to the
-    /// project root.
+    /// project root. The todo targets render through the form and don't read
+    /// the projection, so they return `None`.
     fn content_path(&self, ws: &Path) -> Option<PathBuf> {
         let panopt = ws.join(".panopt");
         match self {
-            Target::Todo(id) => Some(panopt.join("todos").join(format!("{id}.md"))),
+            Target::Todo(_) | Target::NewTodo => None,
             Target::Scratchpad(id) => Some(panopt.join("scratchpad").join(format!("{id}.md"))),
             Target::TodoList => Some(panopt.join("todos.md")),
             Target::ScratchpadList => Some(panopt.join("scratchpads.md")),
@@ -91,6 +112,9 @@ enum Content {
     List(Vec<ListEntry>),
     /// A status line: an empty target or a missing file.
     Message(String),
+    /// The editable todo form. The viewer owns the form state but delegates
+    /// rendering and key handling to it.
+    Form(Form),
 }
 
 /// One row of a list view: where selecting it routes, and its display label.
@@ -100,26 +124,32 @@ struct ListEntry {
 }
 
 /// Run the viewer. `slot` is the routing token the plugin assigned this pane;
-/// `kind`/`id` are the initial item. `_port` is reserved for in-pane editing.
+/// `kind`/`id` are the initial item. The MCP URL is built from `ws` + `port`
+/// so the form modes can call the daemon.
 pub fn run(
     ws: Option<PathBuf>,
-    _port: u16,
+    port: u16,
     slot: String,
     kind: Option<String>,
     id: Option<u64>,
 ) -> Result<()> {
     let ws = crate::todo::resolve_ws(ws)?;
+    // Build the observer URL up front; every form load reuses it. An observer
+    // connection cannot acquire locks, which is fine for this pass - the
+    // form only displays `locked_by` from todo_get and does not call
+    // todo_lock. Active lock acquisition is a follow-up.
+    let url = observer_url(Some(ws.clone()), port)?;
     let target = kind
         .as_deref()
         .and_then(|k| Target::parse(k, id))
         .unwrap_or(Target::Empty);
 
-    let mut viewer = Viewer::new(ws, &slot, target);
+    let mut viewer = Viewer::new(ws, url, &slot, target);
     let mut terminal = ratatui::init();
     let outcome = viewer.event_loop(&mut terminal);
     ratatui::restore();
 
-    // The viewer is long-lived, but an explicit `q` is the user closing it;
+    // The viewer is long-lived, but an explicit close is the user closing it;
     // close the Zellij pane too so it does not linger as a spent command pane.
     if std::env::var_os("ZELLIJ").is_some() {
         let _ = std::process::Command::new("zellij")
@@ -133,6 +163,8 @@ pub fn run(
 struct Viewer {
     /// Project root - the `.panopt/` tree and the viewstate namespace.
     ws: PathBuf,
+    /// Daemon MCP URL, used by the form's MCP calls.
+    url: String,
     /// Routing file the sidebar plugin writes to re-point this pane.
     routing_path: PathBuf,
     /// Last-seen mtime of the routing file, to detect a re-point.
@@ -152,7 +184,7 @@ struct Viewer {
 }
 
 impl Viewer {
-    fn new(ws: PathBuf, slot: &str, target: Target) -> Viewer {
+    fn new(ws: PathBuf, url: String, slot: &str, target: Target) -> Viewer {
         let routing_path = ws
             .join(".panopt")
             .join(".cockpit")
@@ -161,6 +193,7 @@ impl Viewer {
         let vs = viewstate::get(&ws, &target.key());
         let mut viewer = Viewer {
             ws,
+            url,
             routing_path,
             routing_mtime,
             target,
@@ -176,8 +209,8 @@ impl Viewer {
         viewer
     }
 
-    /// Draw, wait briefly for input, poll for re-points and content changes;
-    /// repeat until the user quits.
+    /// Draw, wait briefly for input, poll for re-points and content changes,
+    /// flush any pending autosave; repeat until the user closes the pane.
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             if self.needs_draw {
@@ -197,26 +230,51 @@ impl Viewer {
             }
             self.poll_routing();
             self.maybe_refresh();
+            self.maybe_autosave();
         }
     }
 
-    /// Handle one key press; return `true` to quit.
+    /// Handle one key press; return `true` to quit. In form mode the form
+    /// handles most keys; Ctrl-C is reserved as the close gesture so it does
+    /// not collide with typed input.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('c') if ctrl => return true,
-            KeyCode::Char('q') => return true,
-            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
-            KeyCode::PageUp => self.move_by(-(self.viewport.max(1) as i64)),
-            KeyCode::PageDown => self.move_by(self.viewport.max(1) as i64),
-            KeyCode::Home | KeyCode::Char('g') => self.move_by(i64::MIN / 2),
-            KeyCode::End | KeyCode::Char('G') => self.move_by(i64::MAX / 2),
-            KeyCode::Enter => self.open_selected(),
-            _ => return false,
+        match &mut self.content {
+            Content::Form(form) => {
+                if ctrl && matches!(key.code, KeyCode::Char('c')) {
+                    // Flush any unsaved edits before the pane goes away.
+                    let _ = form.flush();
+                    return true;
+                }
+                match form.handle_key(key) {
+                    crate::form::FormAction::Close => {
+                        let _ = form.flush();
+                        return true;
+                    }
+                    crate::form::FormAction::Dirty | crate::form::FormAction::Idle => {}
+                }
+                self.needs_draw = true;
+                false
+            }
+            _ => {
+                match key.code {
+                    KeyCode::Char('c') if ctrl => return true,
+                    // `q` closes only outside the form; in form mode the user
+                    // can type a `q` into the title.
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
+                    KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
+                    KeyCode::PageUp => self.move_by(-(self.viewport.max(1) as i64)),
+                    KeyCode::PageDown => self.move_by(self.viewport.max(1) as i64),
+                    KeyCode::Home | KeyCode::Char('g') => self.move_by(i64::MIN / 2),
+                    KeyCode::End | KeyCode::Char('G') => self.move_by(i64::MAX / 2),
+                    KeyCode::Enter => self.open_selected(),
+                    _ => return false,
+                }
+                self.needs_draw = true;
+                false
+            }
         }
-        self.needs_draw = true;
-        false
     }
 
     /// Move the cursor (list mode) or the scroll offset (document mode) by
@@ -231,7 +289,7 @@ impl Viewer {
                 let max = (lines.len() as i64 - self.viewport as i64).max(0);
                 self.scroll = (self.scroll as i64 + delta).clamp(0, max) as u16;
             }
-            Content::Message(_) => {}
+            Content::Message(_) | Content::Form(_) => {}
         }
     }
 
@@ -246,10 +304,15 @@ impl Viewer {
     }
 
     /// Re-point the viewer at `target`, persisting the outgoing item's
-    /// position and restoring the incoming one's.
+    /// position, restoring the incoming one's, and flushing the form if we
+    /// are leaving one.
     fn switch(&mut self, target: Target) {
         if target == self.target {
             return;
+        }
+        // Flush a pending form edit before it disappears.
+        if let Content::Form(form) = &mut self.content {
+            let _ = form.flush();
         }
         viewstate::set(
             &self.ws,
@@ -284,7 +347,9 @@ impl Viewer {
         }
     }
 
-    /// Re-read the content file if it changed since the last read.
+    /// Re-read the content file if it changed since the last read. Form modes
+    /// have no backing file - their refresh runs through the MCP client and
+    /// is currently load-once-on-switch; see the autosave path for writes.
     fn maybe_refresh(&mut self) {
         if self.last_refresh.elapsed() < REFRESH {
             return;
@@ -297,22 +362,48 @@ impl Viewer {
         }
     }
 
-    /// Load the current target's content from the `.panopt/` projection.
+    /// If a form edit has been pending for at least [`DEBOUNCE`], flush it.
+    /// Errors are surfaced in the form's message line by the form itself.
+    fn maybe_autosave(&mut self) {
+        let Content::Form(form) = &mut self.content else {
+            return;
+        };
+        if form.dirty_since.map_or(false, |t| t.elapsed() >= DEBOUNCE) {
+            if let Err(e) = form.flush() {
+                form.message = format!("autosave failed: {e:#}");
+            }
+            self.needs_draw = true;
+        }
+    }
+
+    /// Load the current target's content. For form targets this calls the
+    /// daemon's `todo_get` (or constructs a blank form) and builds a
+    /// [`Form`]; for everything else it reads the `.panopt/` projection.
     fn reload_content(&mut self) {
         let path = self.target.content_path(&self.ws);
         self.content_mtime = path.as_deref().and_then(mtime);
         self.content = match &self.target {
             Target::Empty => Content::Message("Select an item in the sidebar.".to_string()),
-            Target::Todo(id) | Target::Scratchpad(id) => {
+            Target::NewTodo => Content::Form(Form::blank(&self.url)),
+            Target::Todo(id) => match load_todo(&self.url, *id) {
+                Ok(todo) => {
+                    let url = self.url.clone();
+                    let blocker_titles = |bid: u64| resolve_blocker_title(&url, bid);
+                    match Form::from_todo(&self.url, &todo, &blocker_titles) {
+                        Ok(form) => Content::Form(form),
+                        Err(e) => Content::Message(format!("could not parse todo #{id}: {e:#}")),
+                    }
+                }
+                Err(e) => Content::Message(format!("could not load todo #{id}: {e:#}")),
+            },
+            Target::Scratchpad(id) => {
                 let id = *id;
                 match path.and_then(|p| std::fs::read_to_string(p).ok()) {
                     Some(text) => Content::Doc(text.lines().map(str::to_string).collect()),
                     None => Content::Message(format!("#{id} is no longer present.")),
                 }
             }
-            Target::TodoList => {
-                Content::List(read_index(path.as_deref(), |id| Target::Todo(id)))
-            }
+            Target::TodoList => Content::List(read_index(path.as_deref(), |id| Target::Todo(id))),
             Target::ScratchpadList => {
                 Content::List(read_index(path.as_deref(), |id| Target::Scratchpad(id)))
             }
@@ -335,11 +426,19 @@ impl Viewer {
                     self.scroll = max;
                 }
             }
-            Content::Message(_) => {}
+            Content::Message(_) | Content::Form(_) => {}
         }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        // Form mode owns the entire pane - its draw renders header, fields,
+        // sections, and footer itself. Other modes use the legacy 3-row layout
+        // (header / content / footer).
+        if let Content::Form(form) = &mut self.content {
+            form.draw(frame, frame.area());
+            return;
+        }
+
         let rows = Layout::vertical([
             Constraint::Length(1), // header
             Constraint::Min(0),    // content
@@ -353,16 +452,24 @@ impl Viewer {
             rows[0],
         );
 
+        self.draw_body(frame, rows[1]);
+
+        frame.render_widget(
+            Paragraph::new(self.footer()).style(Style::default().fg(Color::Yellow)),
+            rows[2],
+        );
+    }
+
+    fn draw_body(&self, frame: &mut Frame, area: Rect) {
         match &self.content {
             Content::Doc(lines) => {
-                let text = Text::from(
-                    lines.iter().map(|l| Line::from(l.clone())).collect::<Vec<_>>(),
-                );
+                let text =
+                    Text::from(lines.iter().map(|l| Line::from(l.clone())).collect::<Vec<_>>());
                 frame.render_widget(
                     Paragraph::new(text)
                         .wrap(Wrap { trim: false })
                         .scroll((self.scroll, 0)),
-                    rows[1],
+                    area,
                 );
             }
             Content::List(entries) => {
@@ -387,26 +494,23 @@ impl Viewer {
                 } else {
                     Text::from(lines)
                 };
-                frame.render_widget(Paragraph::new(body), rows[1]);
+                frame.render_widget(Paragraph::new(body), area);
             }
             Content::Message(msg) => {
                 frame.render_widget(
                     Paragraph::new(format!(" {msg}"))
                         .style(Style::default().fg(Color::DarkGray)),
-                    rows[1],
+                    area,
                 );
             }
+            Content::Form(_) => unreachable!("form mode short-circuits draw"),
         }
-
-        frame.render_widget(
-            Paragraph::new(self.footer()).style(Style::default().fg(Color::Yellow)),
-            rows[2],
-        );
     }
 
     fn header(&self) -> String {
         match &self.target {
             Target::Todo(id) => format!(" Todo #{id}"),
+            Target::NewTodo => " New todo".to_string(),
             Target::Scratchpad(id) => format!(" Scratchpad #{id}"),
             Target::TodoList => " Todos".to_string(),
             Target::ScratchpadList => " Scratchpads".to_string(),
@@ -415,12 +519,37 @@ impl Viewer {
     }
 
     fn footer(&self) -> String {
-        if self.target.is_list() {
+        if self.target.is_form() {
+            // The form draws its own footer; the viewer-level footer is unused
+            // in form mode, but we still produce a string for the type's sake.
+            String::new()
+        } else if self.target.is_list() {
             " j/k move   Enter open   q close".to_string()
         } else {
             " j/k scroll   g/G top/bottom   q close".to_string()
         }
     }
+}
+
+/// One-shot `todo_get` against the daemon.
+fn load_todo(url: &str, id: u64) -> Result<Value> {
+    let client = Client::connect(url)?;
+    let outcome = client.call("todo_get", json!({ "todo_id": id }));
+    client.close();
+    outcome
+}
+
+/// Resolve a blocker id's display title via a one-shot `todo_get`. Failure
+/// (e.g. the blocker was deleted) yields `None` so the form falls back to
+/// just the id.
+fn resolve_blocker_title(url: &str, id: u64) -> Option<String> {
+    let client = Client::connect(url).ok()?;
+    let title = client
+        .call("todo_get", json!({ "todo_id": id }))
+        .ok()
+        .and_then(|v| v["title"].as_str().map(str::to_string));
+    client.close();
+    title
 }
 
 /// Read a `.panopt/` index file into list entries, mapping each id through
@@ -506,10 +635,12 @@ mod tests {
     #[test]
     fn target_parse_and_key_round_trip() {
         assert_eq!(Target::parse("todo", Some(4)), Some(Target::Todo(4)));
+        assert_eq!(Target::parse("new-todo", None), Some(Target::NewTodo));
         assert_eq!(Target::parse("scratchpad-list", None), Some(Target::ScratchpadList));
         assert_eq!(Target::parse("empty", None), Some(Target::Empty));
         assert_eq!(Target::parse("todo", None), None);
         assert_eq!(Target::Todo(4).key(), "todo:4");
+        assert_eq!(Target::NewTodo.key(), "todo:new");
         assert_eq!(Target::TodoList.key(), "list:todos");
     }
 
@@ -518,5 +649,21 @@ mod tests {
         assert_eq!(list_scroll(0, 5, 20), 0);
         assert_eq!(list_scroll(19, 5, 20), 15);
         assert_eq!(list_scroll(3, 10, 4), 0);
+    }
+
+    #[test]
+    fn target_form_check_covers_todo_and_new_todo() {
+        assert!(Target::Todo(1).is_form());
+        assert!(Target::NewTodo.is_form());
+        assert!(!Target::Scratchpad(1).is_form());
+        assert!(!Target::TodoList.is_form());
+    }
+
+    #[test]
+    fn content_path_is_none_for_form_targets() {
+        let ws = Path::new("/tmp/x");
+        assert!(Target::Todo(1).content_path(ws).is_none());
+        assert!(Target::NewTodo.content_path(ws).is_none());
+        assert!(Target::TodoList.content_path(ws).is_some());
     }
 }

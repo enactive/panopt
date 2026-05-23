@@ -767,7 +767,12 @@ impl PanoptSidebar {
             BareKey::Right => self.set_collapsed(self.focus.section, false),
             BareKey::Enter => self.activate_focus(),
             BareKey::Char('a') => self.spawn_agent_pane(None),
-            BareKey::Char('c') => self.open_todo_form(None),
+            // `c` opens a fresh todo form in the slot - the routing kind
+            // `new-todo` tells the viewer to construct a blank Form rather
+            // than load a `.panopt/todos/<id>.md`. `e` is a focused alias of
+            // pressing Enter on a todo: route the same way but force focus
+            // into the form so the user can type immediately.
+            BareKey::Char('c') => self.open_document("new-todo", None, true),
             BareKey::Char('e') => self.edit_focused_todo(),
             _ => return false,
         }
@@ -881,10 +886,13 @@ impl PanoptSidebar {
         }
     }
 
-    /// Open the floating todo form for the focused todo, if one is focused.
+    /// Open the in-slot todo form for the focused todo, if one is focused.
+    /// Identical to pressing Enter on the same row, but with focus forced
+    /// into the form so the user can type immediately - useful when the
+    /// sidebar still has keyboard focus.
     fn edit_focused_todo(&mut self) {
         if let Some(ItemTarget::Todo(id)) = self.focused_target() {
-            self.open_todo_form(Some(id));
+            self.open_document("todo", Some(id), true);
         }
     }
 
@@ -1099,27 +1107,6 @@ impl PanoptSidebar {
             }
         };
         self.agent_labels.insert(tid, label);
-    }
-
-    /// Open the todo form in a floating pane: `panopt todo edit <id>`, or
-    /// `--new` when `id` is `None`. Creating and quick-editing a todo use the
-    /// floating form; browsing one uses the viewer.
-    fn open_todo_form(&self, id: Option<u64>) {
-        let Some(ws) = self.launch_cwd() else {
-            return;
-        };
-        let mut args = vec!["todo".to_string(), "edit".to_string()];
-        match id {
-            Some(id) => args.push(id.to_string()),
-            None => args.push("--new".to_string()),
-        }
-        args.push("--port".to_string());
-        args.push(self.port.clone());
-        open_command_pane_floating(
-            CommandToRun { path: PathBuf::from(&self.panopt_bin), args, cwd: Some(ws) },
-            None,
-            BTreeMap::new(),
-        );
     }
 
     /// The cwd for a launched pane: the project root. `None` when permissions
