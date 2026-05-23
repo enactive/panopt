@@ -304,12 +304,31 @@ pub(crate) fn project_scratchpad(ws: &Path, pad: &Scratchpad) -> io::Result<()> 
 }
 
 /// Rewrite `.panopt/scratchpads.md` from the project's
-/// `(id, title, updated_at)` list.
+/// `(id, title, updated_at)` list, and sweep per-scratchpad files whose
+/// scratchpad has been deleted. Mirrors the sweep in [`project_todos`] so the
+/// index is the source of truth for which files should exist.
 pub(crate) fn project_scratchpads_index(
     ws: &Path,
     pads: &[(u64, String, String)],
 ) -> io::Result<()> {
-    atomic_write(&scratchpads_index_path(ws), &render_scratchpads_index_md(pads))
+    atomic_write(&scratchpads_index_path(ws), &render_scratchpads_index_md(pads))?;
+
+    let live: HashSet<u64> = pads.iter().map(|(id, _, _)| *id).collect();
+    if let Ok(entries) = fs::read_dir(scratchpad_dir(ws)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let stem = match name.to_string_lossy().strip_suffix(".md") {
+                Some(stem) => stem.to_string(),
+                None => continue,
+            };
+            if let Ok(id) = stem.parse::<u64>() {
+                if !live.contains(&id) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite `.panopt/roster.md` from the current roster.

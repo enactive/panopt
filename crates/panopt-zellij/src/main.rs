@@ -771,9 +771,11 @@ impl PanoptSidebar {
             // `new-todo` tells the viewer to construct a blank Form rather
             // than load a `.panopt/todos/<id>.md`. `e` is a focused alias of
             // pressing Enter on a todo: route the same way but force focus
-            // into the form so the user can type immediately.
+            // into the form so the user can type immediately. `n` is the
+            // scratchpad counterpart of `c`.
             BareKey::Char('c') => self.open_document("new-todo", None, true),
             BareKey::Char('e') => self.edit_focused_todo(),
+            BareKey::Char('n') => self.open_document("new-scratchpad", None, true),
             _ => return false,
         }
         true

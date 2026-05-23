@@ -19,8 +19,8 @@ use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
 use crate::model::{
-    Agent, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad, Todo,
-    TodoComment, TodoPatch, TodoStatus,
+    Agent, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad,
+    ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 use crate::projection;
 use crate::registry::Registry;
@@ -320,6 +320,48 @@ impl Store {
     /// Read the full body of a scratchpad.
     pub fn scratchpad_read(&self, project: ProjectId, id: u64) -> Result<String, CoreError> {
         self.scratchpad_body(project, id)
+    }
+
+    /// Fetch one scratchpad in full - title, body, and timestamps.
+    pub fn scratchpad_get(&self, project: ProjectId, id: u64) -> Result<Scratchpad, CoreError> {
+        self.fetch_scratchpad(project, id)
+    }
+
+    /// Apply `patch` to scratchpad `id`. Each `None` field is left untouched.
+    /// Re-projects both the per-scratchpad file and the index.
+    pub fn scratchpad_update(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        patch: ScratchpadPatch,
+    ) -> Result<(), CoreError> {
+        let mut pad = self.fetch_scratchpad(project, id)?;
+        if let Some(v) = patch.title {
+            pad.title = v;
+        }
+        if let Some(v) = patch.body {
+            pad.body = v;
+        }
+        self.conn.execute(
+            "UPDATE scratchpads
+                SET title = ?1, body = ?2, updated_at = datetime('now')
+              WHERE project_id = ?3 AND id = ?4",
+            params![pad.title, pad.body, project.0, id as i64],
+        )?;
+        self.reproject_scratchpad_full(project, id)
+    }
+
+    /// Delete a scratchpad and sweep its per-scratchpad projection file.
+    pub fn scratchpad_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        let changed = self.conn.execute(
+            "DELETE FROM scratchpads WHERE project_id = ?1 AND id = ?2",
+            params![project.0, id as i64],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::ScratchpadNotFound(id));
+        }
+        // reproject_scratchpads_index sweeps the now-orphaned per-pad file.
+        self.reproject_scratchpads_index(project)
     }
 
     fn scratchpad_body(&self, project: ProjectId, id: u64) -> Result<String, CoreError> {
@@ -1087,6 +1129,100 @@ mod tests {
             index.contains(&format!("updated {after}")),
             "index reflects the bumped updated_at\n{index}",
         );
+    }
+
+    #[test]
+    fn scratchpad_update_writes_only_the_some_fields() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.scratchpad_create(p, "first-title".into()).unwrap();
+        fx.store.scratchpad_append(p, id, "first-body").unwrap();
+
+        // Patching only title leaves the body alone.
+        fx.store
+            .scratchpad_update(
+                p,
+                id,
+                ScratchpadPatch { title: Some("renamed".into()), body: None },
+            )
+            .unwrap();
+        let pad = fx.store.scratchpad_get(p, id).unwrap();
+        assert_eq!(pad.title, "renamed");
+        assert_eq!(pad.body, "first-body");
+
+        // Patching only body leaves the title alone.
+        fx.store
+            .scratchpad_update(
+                p,
+                id,
+                ScratchpadPatch { title: None, body: Some("rewritten".into()) },
+            )
+            .unwrap();
+        let pad = fx.store.scratchpad_get(p, id).unwrap();
+        assert_eq!(pad.title, "renamed");
+        assert_eq!(pad.body, "rewritten");
+    }
+
+    #[test]
+    fn scratchpad_update_bumps_updated_at_and_reprojects() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
+        let before = fx.store.scratchpad_get(p, id).unwrap().updated_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fx.store
+            .scratchpad_update(
+                p,
+                id,
+                ScratchpadPatch { title: None, body: Some("new body".into()) },
+            )
+            .unwrap();
+
+        let after = fx.store.scratchpad_get(p, id).unwrap().updated_at;
+        assert!(after > before, "updated_at must advance on update");
+
+        let pad_file = std::fs::read_to_string(root.join(".panopt/scratchpad/1.md")).unwrap();
+        assert!(pad_file.contains("new body"), "per-pad projection refreshed");
+    }
+
+    #[test]
+    fn scratchpad_update_errors_when_missing() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let err = fx
+            .store
+            .scratchpad_update(p, 999, ScratchpadPatch::default())
+            .unwrap_err();
+        assert!(matches!(err, CoreError::ScratchpadNotFound(999)));
+    }
+
+    #[test]
+    fn scratchpad_delete_removes_row_and_per_pad_file() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
+        let pad_path = root.join(".panopt/scratchpad/1.md");
+        assert!(pad_path.exists(), "per-pad file projected on create");
+
+        fx.store.scratchpad_delete(p, id).unwrap();
+
+        assert!(!pad_path.exists(), "per-pad file swept on delete");
+        assert!(
+            fx.store.scratchpad_list(p).unwrap().is_empty(),
+            "row gone from the listing",
+        );
+
+        let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
+        assert!(!index.contains("notes"), "index no longer lists the pad\n{index}");
+    }
+
+    #[test]
+    fn scratchpad_delete_errors_when_missing() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let err = fx.store.scratchpad_delete(p, 999).unwrap_err();
+        assert!(matches!(err, CoreError::ScratchpadNotFound(999)));
     }
 
     #[test]

@@ -1,17 +1,17 @@
 //! `panopt _viewer` - a long-lived cockpit content pane.
 //!
-//! Renders one item from the project's `.panopt/` projection - a scratchpad,
-//! a list of items - or, for the todo kinds, hosts the shared editable form
-//! defined in [`crate::form`]. The sidebar plugin re-points the pane at a
-//! different item by writing a routing file the viewer polls; switching item
-//! saves the outgoing item's scroll position and restores the incoming one's
-//! (see [`crate::viewstate`]).
+//! Renders one item from the project's `.panopt/` projection - a list of
+//! items - or, for the todo and scratchpad kinds, hosts the matching shared
+//! editable form ([`crate::todo_form`] / [`crate::scratchpad_form`]). The
+//! sidebar plugin re-points the pane at a different item by writing a routing
+//! file the viewer polls; switching item saves the outgoing item's scroll
+//! position and restores the incoming one's (see [`crate::viewstate`]).
 //!
-//! Most content comes from the projected `.panopt/*.md` files, which the
-//! daemon keeps current. Todos are special: the viewer opens an MCP session
-//! and renders the form against live `todo_get` data, autosaving on a
-//! debounce. The pane is long-lived: it closes only when the user presses
-//! Ctrl-C, never on its own.
+//! Index views come from the projected `.panopt/*.md` files, which the daemon
+//! keeps current. Todos and scratchpads are special: the viewer opens an MCP
+//! session and renders the matching form against live `todo_get` /
+//! `scratchpad_get` data, autosaving on a debounce. The pane is long-lived:
+//! it closes only when the user presses Ctrl-C, never on its own.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -25,9 +25,10 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
-use crate::form::Form;
 use crate::mcpclient::Client;
+use crate::scratchpad_form::ScratchpadForm;
 use crate::todo::observer_url;
+use crate::todo_form::TodoForm;
 use crate::viewstate::{self, ViewState};
 
 /// How often the viewer wakes to poll the routing file and refresh content.
@@ -46,6 +47,10 @@ enum Target {
     /// like a `Todo(id)`.
     NewTodo,
     Scratchpad(u64),
+    /// A brand-new scratchpad, not yet persisted. The form sends
+    /// `scratchpad_create` on the first autosave with a non-empty title; from
+    /// then on it behaves like a `Scratchpad(id)`.
+    NewScratchpad,
     TodoList,
     ScratchpadList,
     Empty,
@@ -54,12 +59,13 @@ enum Target {
 impl Target {
     /// Parse a routing payload's `kind`/`id` pair into a target. The `empty`
     /// kind lets the sidebar clear the viewer when nothing is selected; the
-    /// `new-todo` kind opens a blank form.
+    /// `new-todo` / `new-scratchpad` kinds open blank forms.
     fn parse(kind: &str, id: Option<u64>) -> Option<Target> {
         match (kind, id) {
             ("todo", Some(id)) => Some(Target::Todo(id)),
             ("new-todo", _) => Some(Target::NewTodo),
             ("scratchpad", Some(id)) => Some(Target::Scratchpad(id)),
+            ("new-scratchpad", _) => Some(Target::NewScratchpad),
             ("todo-list", _) => Some(Target::TodoList),
             ("scratchpad-list", _) => Some(Target::ScratchpadList),
             ("empty", _) => Some(Target::Empty),
@@ -75,6 +81,7 @@ impl Target {
             Target::Todo(id) => format!("todo:{id}"),
             Target::NewTodo => "todo:new".to_string(),
             Target::Scratchpad(id) => format!("scratchpad:{id}"),
+            Target::NewScratchpad => "scratchpad:new".to_string(),
             Target::TodoList => "list:todos".to_string(),
             Target::ScratchpadList => "list:scratchpads".to_string(),
             Target::Empty => "empty".to_string(),
@@ -86,17 +93,22 @@ impl Target {
     }
 
     fn is_form(&self) -> bool {
-        matches!(self, Target::Todo(_) | Target::NewTodo)
+        matches!(
+            self,
+            Target::Todo(_) | Target::NewTodo | Target::Scratchpad(_) | Target::NewScratchpad,
+        )
     }
 
     /// The projected `.panopt/` file backing this target, relative to the
-    /// project root. The todo targets render through the form and don't read
-    /// the projection, so they return `None`.
+    /// project root. The form-backed targets render through their forms and
+    /// don't read the projection, so they return `None`.
     fn content_path(&self, ws: &Path) -> Option<PathBuf> {
         let panopt = ws.join(".panopt");
         match self {
-            Target::Todo(_) | Target::NewTodo => None,
-            Target::Scratchpad(id) => Some(panopt.join("scratchpad").join(format!("{id}.md"))),
+            Target::Todo(_)
+            | Target::NewTodo
+            | Target::Scratchpad(_)
+            | Target::NewScratchpad => None,
             Target::TodoList => Some(panopt.join("todos.md")),
             Target::ScratchpadList => Some(panopt.join("scratchpads.md")),
             Target::Empty => None,
@@ -106,7 +118,11 @@ impl Target {
 
 /// The loaded, render-ready content for the current target.
 enum Content {
-    /// A scrollable document: the lines of a projected `.md` file.
+    /// A scrollable document: the lines of a projected `.md` file. No target
+    /// currently renders as a `Doc` - both todos and scratchpads now go
+    /// through their form views - but the variant remains so the legacy
+    /// scroll/render path is one step away if a plain-doc target is added.
+    #[allow(dead_code)]
     Doc(Vec<String>),
     /// A navigable list of items.
     List(Vec<ListEntry>),
@@ -114,7 +130,10 @@ enum Content {
     Message(String),
     /// The editable todo form. The viewer owns the form state but delegates
     /// rendering and key handling to it.
-    Form(Form),
+    TodoForm(TodoForm),
+    /// The editable scratchpad form. Sibling of [`Content::TodoForm`]; see
+    /// [`crate::scratchpad_form`].
+    ScratchpadForm(ScratchpadForm),
 }
 
 /// One row of a list view: where selecting it routes, and its display label.
@@ -240,18 +259,34 @@ impl Viewer {
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match &mut self.content {
-            Content::Form(form) => {
+            Content::TodoForm(form) => {
                 if ctrl && matches!(key.code, KeyCode::Char('c')) {
                     // Flush any unsaved edits before the pane goes away.
                     let _ = form.flush();
                     return true;
                 }
                 match form.handle_key(key) {
-                    crate::form::FormAction::Close => {
+                    crate::todo_form::TodoFormAction::Close => {
                         let _ = form.flush();
                         return true;
                     }
-                    crate::form::FormAction::Dirty | crate::form::FormAction::Idle => {}
+                    crate::todo_form::TodoFormAction::Dirty | crate::todo_form::TodoFormAction::Idle => {}
+                }
+                self.needs_draw = true;
+                false
+            }
+            Content::ScratchpadForm(form) => {
+                if ctrl && matches!(key.code, KeyCode::Char('c')) {
+                    let _ = form.flush();
+                    return true;
+                }
+                match form.handle_key(key) {
+                    crate::scratchpad_form::ScratchpadFormAction::Close => {
+                        let _ = form.flush();
+                        return true;
+                    }
+                    crate::scratchpad_form::ScratchpadFormAction::Dirty
+                    | crate::scratchpad_form::ScratchpadFormAction::Idle => {}
                 }
                 self.needs_draw = true;
                 false
@@ -289,7 +324,7 @@ impl Viewer {
                 let max = (lines.len() as i64 - self.viewport as i64).max(0);
                 self.scroll = (self.scroll as i64 + delta).clamp(0, max) as u16;
             }
-            Content::Message(_) | Content::Form(_) => {}
+            Content::Message(_) | Content::TodoForm(_) | Content::ScratchpadForm(_) => {}
         }
     }
 
@@ -311,8 +346,14 @@ impl Viewer {
             return;
         }
         // Flush a pending form edit before it disappears.
-        if let Content::Form(form) = &mut self.content {
-            let _ = form.flush();
+        match &mut self.content {
+            Content::TodoForm(form) => {
+                let _ = form.flush();
+            }
+            Content::ScratchpadForm(form) => {
+                let _ = form.flush();
+            }
+            _ => {}
         }
         viewstate::set(
             &self.ws,
@@ -365,44 +406,59 @@ impl Viewer {
     /// If a form edit has been pending for at least [`DEBOUNCE`], flush it.
     /// Errors are surfaced in the form's message line by the form itself.
     fn maybe_autosave(&mut self) {
-        let Content::Form(form) = &mut self.content else {
-            return;
-        };
-        if form.dirty_since.map_or(false, |t| t.elapsed() >= DEBOUNCE) {
-            if let Err(e) = form.flush() {
-                form.message = format!("autosave failed: {e:#}");
+        match &mut self.content {
+            Content::TodoForm(form) => {
+                if form.dirty_since.map_or(false, |t| t.elapsed() >= DEBOUNCE) {
+                    if let Err(e) = form.flush() {
+                        form.message = format!("autosave failed: {e:#}");
+                    }
+                    self.needs_draw = true;
+                }
             }
-            self.needs_draw = true;
+            Content::ScratchpadForm(form) => {
+                if form.dirty_since.map_or(false, |t| t.elapsed() >= DEBOUNCE) {
+                    if let Err(e) = form.flush() {
+                        form.message = format!("autosave failed: {e:#}");
+                    }
+                    self.needs_draw = true;
+                }
+            }
+            _ => {}
         }
     }
 
     /// Load the current target's content. For form targets this calls the
-    /// daemon's `todo_get` (or constructs a blank form) and builds a
-    /// [`Form`]; for everything else it reads the `.panopt/` projection.
+    /// daemon (`todo_get`, `scratchpad_get`) or constructs a blank form; for
+    /// everything else it reads the `.panopt/` projection.
     fn reload_content(&mut self) {
         let path = self.target.content_path(&self.ws);
         self.content_mtime = path.as_deref().and_then(mtime);
         self.content = match &self.target {
             Target::Empty => Content::Message("Select an item in the sidebar.".to_string()),
-            Target::NewTodo => Content::Form(Form::blank(&self.url)),
+            Target::NewTodo => Content::TodoForm(TodoForm::blank(&self.url)),
             Target::Todo(id) => match load_todo(&self.url, *id) {
                 Ok(todo) => {
                     let url = self.url.clone();
                     let blocker_titles = |bid: u64| resolve_blocker_title(&url, bid);
-                    match Form::from_todo(&self.url, &todo, &blocker_titles) {
-                        Ok(form) => Content::Form(form),
+                    match TodoForm::from_todo(&self.url, &todo, &blocker_titles) {
+                        Ok(form) => Content::TodoForm(form),
                         Err(e) => Content::Message(format!("could not parse todo #{id}: {e:#}")),
                     }
                 }
                 Err(e) => Content::Message(format!("could not load todo #{id}: {e:#}")),
             },
-            Target::Scratchpad(id) => {
-                let id = *id;
-                match path.and_then(|p| std::fs::read_to_string(p).ok()) {
-                    Some(text) => Content::Doc(text.lines().map(str::to_string).collect()),
-                    None => Content::Message(format!("#{id} is no longer present.")),
-                }
-            }
+            Target::NewScratchpad => Content::ScratchpadForm(ScratchpadForm::blank(&self.url)),
+            Target::Scratchpad(id) => match load_scratchpad(&self.url, *id) {
+                Ok(pad) => Content::ScratchpadForm(ScratchpadForm::from_parts(
+                    &self.url,
+                    *id,
+                    pad["title"].as_str().unwrap_or(""),
+                    pad["body"].as_str().unwrap_or(""),
+                    pad["created_at"].as_str().unwrap_or(""),
+                    pad["updated_at"].as_str().unwrap_or(""),
+                )),
+                Err(e) => Content::Message(format!("could not load scratchpad #{id}: {e:#}")),
+            },
             Target::TodoList => Content::List(read_index(path.as_deref(), |id| Target::Todo(id))),
             Target::ScratchpadList => {
                 Content::List(read_index(path.as_deref(), |id| Target::Scratchpad(id)))
@@ -426,15 +482,19 @@ impl Viewer {
                     self.scroll = max;
                 }
             }
-            Content::Message(_) | Content::Form(_) => {}
+            Content::Message(_) | Content::TodoForm(_) | Content::ScratchpadForm(_) => {}
         }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        // Form mode owns the entire pane - its draw renders header, fields,
-        // sections, and footer itself. Other modes use the legacy 3-row layout
-        // (header / content / footer).
-        if let Content::Form(form) = &mut self.content {
+        // Form modes own the entire pane - their draw renders header, fields,
+        // sections, and footer themselves. Other modes use the legacy 3-row
+        // layout (header / content / footer).
+        if let Content::TodoForm(form) = &mut self.content {
+            form.draw(frame, frame.area());
+            return;
+        }
+        if let Content::ScratchpadForm(form) = &mut self.content {
             form.draw(frame, frame.area());
             return;
         }
@@ -503,7 +563,9 @@ impl Viewer {
                     area,
                 );
             }
-            Content::Form(_) => unreachable!("form mode short-circuits draw"),
+            Content::TodoForm(_) | Content::ScratchpadForm(_) => {
+                unreachable!("form modes short-circuit draw")
+            }
         }
     }
 
@@ -512,6 +574,7 @@ impl Viewer {
             Target::Todo(id) => format!(" Todo #{id}"),
             Target::NewTodo => " New todo".to_string(),
             Target::Scratchpad(id) => format!(" Scratchpad #{id}"),
+            Target::NewScratchpad => " New scratchpad".to_string(),
             Target::TodoList => " Todos".to_string(),
             Target::ScratchpadList => " Scratchpads".to_string(),
             Target::Empty => " PANopt viewer".to_string(),
@@ -535,6 +598,15 @@ impl Viewer {
 fn load_todo(url: &str, id: u64) -> Result<Value> {
     let client = Client::connect(url)?;
     let outcome = client.call("todo_get", json!({ "todo_id": id }));
+    client.close();
+    outcome
+}
+
+/// One-shot `scratchpad_get` against the daemon. Returns the JSON object
+/// `{id, title, body, created_at, updated_at}`.
+fn load_scratchpad(url: &str, id: u64) -> Result<Value> {
+    let client = Client::connect(url)?;
+    let outcome = client.call("scratchpad_get", json!({ "scratchpad_id": id }));
     client.close();
     outcome
 }
@@ -652,11 +724,13 @@ mod tests {
     }
 
     #[test]
-    fn target_form_check_covers_todo_and_new_todo() {
+    fn target_form_check_covers_todos_and_scratchpads() {
         assert!(Target::Todo(1).is_form());
         assert!(Target::NewTodo.is_form());
-        assert!(!Target::Scratchpad(1).is_form());
+        assert!(Target::Scratchpad(1).is_form());
+        assert!(Target::NewScratchpad.is_form());
         assert!(!Target::TodoList.is_form());
+        assert!(!Target::ScratchpadList.is_form());
     }
 
     #[test]
@@ -664,6 +738,15 @@ mod tests {
         let ws = Path::new("/tmp/x");
         assert!(Target::Todo(1).content_path(ws).is_none());
         assert!(Target::NewTodo.content_path(ws).is_none());
+        assert!(Target::Scratchpad(1).content_path(ws).is_none());
+        assert!(Target::NewScratchpad.content_path(ws).is_none());
         assert!(Target::TodoList.content_path(ws).is_some());
+        assert!(Target::ScratchpadList.content_path(ws).is_some());
+    }
+
+    #[test]
+    fn parse_recognizes_new_scratchpad() {
+        assert_eq!(Target::parse("new-scratchpad", None), Some(Target::NewScratchpad));
+        assert_eq!(Target::parse("scratchpad", Some(7)), Some(Target::Scratchpad(7)));
     }
 }

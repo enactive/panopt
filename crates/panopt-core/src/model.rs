@@ -27,6 +27,16 @@ pub struct Scratchpad {
     pub updated_at: String,
 }
 
+/// A set of optional edits to a [`Scratchpad`], applied by
+/// [`crate::Store::scratchpad_update`].
+///
+/// Each `None` field leaves that attribute untouched; each `Some` replaces it.
+#[derive(Debug, Default, Clone)]
+pub struct ScratchpadPatch {
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
+
 /// Lifecycle state of a [`Todo`].
 ///
 /// The four variants mirror Solo's `todos.status` column (DESIGN.md Section

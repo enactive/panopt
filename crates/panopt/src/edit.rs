@@ -1,6 +1,6 @@
 //! `panopt todo edit` - the standalone CLI shell over the shared todo form.
 //!
-//! Loads a todo through the daemon, hands the form (in [`crate::form`]) a
+//! Loads a todo through the daemon, hands the form (in [`crate::todo_form`]) a
 //! `ratatui` event loop, and writes back through the MCP client. The same
 //! form is hosted in-pane by the cockpit's `_viewer`; this binary is the
 //! shell that lets a user run it outside the cockpit.
@@ -18,7 +18,7 @@ use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
 use crate::daemon;
-use crate::form::{Form, FormAction};
+use crate::todo_form::{TodoForm, TodoFormAction};
 use crate::mcpclient::Client;
 use crate::todo::observer_url;
 
@@ -36,9 +36,9 @@ pub fn run(ws: Option<PathBuf>, id: Option<u64>, new: bool, port: u16) -> Result
             let todo = load(&url, id).with_context(|| format!("loading todo #{id}"))?;
             // The standalone CLI does not bother resolving blocker titles -
             // the in-pane host that needs them passes its own resolver.
-            Form::from_todo(&url, &todo, &|_| None)?
+            TodoForm::from_todo(&url, &todo, &|_| None)?
         }
-        None => Form::blank(&url),
+        None => TodoForm::blank(&url),
     };
 
     let mut terminal = ratatui::init();
@@ -66,7 +66,7 @@ fn load(url: &str, id: u64) -> Result<Value> {
 }
 
 /// Draw, read a key, repeat, until the user asks to close.
-fn event_loop(terminal: &mut DefaultTerminal, form: &mut Form) -> Result<()> {
+fn event_loop(terminal: &mut DefaultTerminal, form: &mut TodoForm) -> Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, form))?;
         if let Event::Key(key) = event::read()? {
@@ -94,15 +94,15 @@ fn event_loop(terminal: &mut DefaultTerminal, form: &mut Form) -> Result<()> {
                 _ => {}
             }
             match form.handle_key(key) {
-                FormAction::Close => return Ok(()),
-                FormAction::Dirty | FormAction::Idle => {}
+                TodoFormAction::Close => return Ok(()),
+                TodoFormAction::Dirty | TodoFormAction::Idle => {}
             }
         }
     }
 }
 
 /// Render the form into the full frame area.
-fn draw(frame: &mut Frame, form: &mut Form) {
+fn draw(frame: &mut Frame, form: &mut TodoForm) {
     let area = frame.area();
     form.draw(frame, area);
 }

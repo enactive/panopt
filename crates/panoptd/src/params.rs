@@ -29,6 +29,31 @@ pub struct ScratchpadReadArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScratchpadGetArgs {
+    /// Numeric id of the scratchpad to fetch in full.
+    pub scratchpad_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScratchpadUpdateArgs {
+    /// Numeric id of the scratchpad to edit.
+    pub scratchpad_id: u64,
+    /// New title. Omit to leave unchanged.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Replacement body. Replaces the existing body in full. Omit to leave
+    /// unchanged.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScratchpadDeleteArgs {
+    /// Numeric id of the scratchpad to delete.
+    pub scratchpad_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TodoCreateArgs {
     /// Short description of the todo.
     pub title: String,

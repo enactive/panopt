@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use http::request::Parts;
 use panopt_core::{
-    Agent, CoreError, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Store, Todo,
-    TodoPatch, TodoStatus,
+    Agent, CoreError, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad,
+    ScratchpadPatch, Store, Todo, TodoPatch, TodoStatus,
 };
 use rmcp::{
     handler::server::{common::Extension, router::tool::ToolRouter, wrapper::Parameters},
@@ -24,7 +24,8 @@ use serde::Serialize;
 
 use crate::params::{
     IdentifyArgs, LockAcquireArgs, LockReleaseArgs, RosterCreateArgs, RosterDeleteArgs,
-    RosterGetArgs, RosterUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs, ScratchpadReadArgs,
+    RosterGetArgs, RosterUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
+    ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs,
     TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs,
     TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs,
     TodoSetBlockersArgs, TodoUnlockArgs, TodoUpdateArgs,
@@ -51,6 +52,28 @@ pub struct Handler {
 struct ScratchpadDto {
     id: u64,
     title: String,
+}
+
+/// Wire shape for `scratchpad_get`: title, body, and timestamps.
+#[derive(Serialize)]
+struct ScratchpadDetailDto {
+    id: u64,
+    title: String,
+    body: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl ScratchpadDetailDto {
+    fn from_scratchpad(pad: &Scratchpad) -> Self {
+        ScratchpadDetailDto {
+            id: pad.id,
+            title: pad.title.clone(),
+            body: pad.body.clone(),
+            created_at: pad.created_at.clone(),
+            updated_at: pad.updated_at.clone(),
+        }
+    }
 }
 
 /// Wire shape for a todo in `todo_list` output: every field but the body and
@@ -581,6 +604,64 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
+    #[tool(
+        description = "Fetch one scratchpad in full - id, title, body, and timestamps - \
+                       addressed by numeric id."
+    )]
+    async fn scratchpad_get(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ScratchpadGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            let pad = st
+                .scratchpad_get(project, args.scratchpad_id)
+                .map_err(map_core_err)?;
+            ScratchpadDetailDto::from_scratchpad(&pad)
+        };
+        json_result(&dto)
+    }
+
+    #[tool(
+        description = "Edit a scratchpad's title and/or body. Each omitted field is left \
+                       unchanged; body replaces the existing body in full (use \
+                       scratchpad_append to add instead of replace)."
+    )]
+    async fn scratchpad_update(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ScratchpadUpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            let patch = ScratchpadPatch { title: args.title, body: args.body };
+            st.scratchpad_update(project, args.scratchpad_id, patch)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(
+        description = "Delete a scratchpad. Removes both the database row and the per-pad \
+                       projection file."
+    )]
+    async fn scratchpad_delete(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ScratchpadDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.scratchpad_delete(project, args.scratchpad_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
     #[tool(description = "Create a new todo with a title. Returns its numeric id.")]
     async fn todo_create(
         &self,
@@ -992,7 +1073,10 @@ impl ServerHandler for Handler {
                  locked_by on todo_get). Each todo also projects to \
                  .panopt/todos/<id>.md.\n\
                  - Scratchpads: scratchpad_create (returns an id), scratchpad_list, \
-                 scratchpad_append, scratchpad_read. Reference scratchpads by numeric id.\n\
+                 scratchpad_get (one scratchpad in full), scratchpad_append (add to body), \
+                 scratchpad_read (body only), scratchpad_update (replace title and/or body), \
+                 scratchpad_delete. Each scratchpad also projects to \
+                 .panopt/scratchpad/<id>.md.\n\
                  - Roster: roster_create (kind agent/command/terminal, returns an id), \
                  roster_list, roster_get, roster_update, roster_delete. The roster is the \
                  project's persistent agents, commands, and terminals; the cockpit launches \

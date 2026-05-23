@@ -5,7 +5,7 @@
 //! body), the comment thread and blocker list it loaded with the todo, and the
 //! input rows that append a new comment or blocker. Its `draw` takes a `Rect`
 //! so a host with its own surrounding chrome can place it where it likes;
-//! `handle_key` returns a [`FormAction`] so the host decides whether to
+//! `handle_key` returns a [`TodoFormAction`] so the host decides whether to
 //! debounce a save or to close.
 //!
 //! Saves go through the MCP client: scalar field edits via `todo_update`,
@@ -75,12 +75,12 @@ struct BlockerEntry {
     title: String,
 }
 
-/// What [`Form::handle_key`] is telling the host to do next.
+/// What [`TodoForm::handle_key`] is telling the host to do next.
 ///
 /// The CLI shell uses `Dirty` only to redraw; it relies on `Ctrl-S` for saves.
 /// The viewer uses it to start a debounce window and flush a short time later.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FormAction {
+pub enum TodoFormAction {
     /// Nothing changed that the host needs to act on.
     Idle,
     /// A field changed: the host should consider this a pending save.
@@ -90,7 +90,7 @@ pub enum FormAction {
 }
 
 /// The editable state of the form.
-pub struct Form {
+pub struct TodoForm {
     /// The daemon MCP URL with `?ws=...&observer=1`.
     pub(crate) url: String,
     /// The todo's id, or `None` until a new todo is first saved.
@@ -144,10 +144,10 @@ pub struct Form {
     pub(crate) message: String,
 }
 
-impl Form {
+impl TodoForm {
     /// A blank form for a not-yet-created todo.
-    pub fn blank(url: &str) -> Form {
-        Form {
+    pub fn blank(url: &str) -> TodoForm {
+        TodoForm {
             url: url.to_string(),
             id: None,
             title: text_area(""),
@@ -183,7 +183,7 @@ impl Form {
         url: &str,
         todo: &Value,
         blocker_titles: &dyn Fn(u64) -> Option<String>,
-    ) -> Result<Form> {
+    ) -> Result<TodoForm> {
         let id = todo["id"].as_u64().ok_or_else(|| anyhow!("todo response has no id"))?;
         let tags = string_list(&todo["tags"]).join(", ");
         let blocker_ids: Vec<u64> = todo["blockers"]
@@ -212,7 +212,7 @@ impl Form {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Form {
+        Ok(TodoForm {
             url: url.to_string(),
             id: Some(id),
             title: text_area(todo["title"].as_str().unwrap_or("")),
@@ -239,11 +239,11 @@ impl Form {
         })
     }
 
-    /// Handle one key press. The returned [`FormAction`] tells the host whether
+    /// Handle one key press. The returned [`TodoFormAction`] tells the host whether
     /// to mark the form dirty (and start its autosave debounce) or to close.
-    pub fn handle_key(&mut self, key: KeyEvent) -> FormAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> TodoFormAction {
         if key.kind != KeyEventKind::Press {
-            return FormAction::Idle;
+            return TodoFormAction::Idle;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -254,37 +254,37 @@ impl Form {
         }
 
         match key.code {
-            KeyCode::Char('c') if ctrl => return FormAction::Close,
+            KeyCode::Char('c') if ctrl => return TodoFormAction::Close,
             KeyCode::Tab => {
                 self.focus = (self.focus + 1) % FIELDS.len();
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             KeyCode::BackTab => {
                 self.focus = (self.focus + FIELDS.len() - 1) % FIELDS.len();
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             _ => self.field_key(key),
         }
     }
 
     /// Route a key to whatever field currently has focus.
-    fn field_key(&mut self, key: KeyEvent) -> FormAction {
+    fn field_key(&mut self, key: KeyEvent) -> TodoFormAction {
         match FIELDS[self.focus] {
             Field::Status => {
                 if let Some(dir) = cycle_dir(key.code) {
                     self.status = wrap(self.status, dir, STATUSES.len());
                     self.mark_dirty();
-                    return FormAction::Dirty;
+                    return TodoFormAction::Dirty;
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             Field::Priority => {
                 if let Some(dir) = cycle_dir(key.code) {
                     self.priority = wrap(self.priority, dir, PRIORITIES.len());
                     self.mark_dirty();
-                    return FormAction::Dirty;
+                    return TodoFormAction::Dirty;
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             Field::Title => self.scalar_input_key(key, ScalarField::Title),
             Field::Assignee => self.scalar_input_key(key, ScalarField::Assignee),
@@ -295,7 +295,7 @@ impl Form {
         }
     }
 
-    fn scalar_input_key(&mut self, key: KeyEvent, which: ScalarField) -> FormAction {
+    fn scalar_input_key(&mut self, key: KeyEvent, which: ScalarField) -> TodoFormAction {
         let changed = match which {
             ScalarField::Title => single_line_input(&mut self.title, key),
             ScalarField::Assignee => single_line_input(&mut self.assignee, key),
@@ -304,9 +304,9 @@ impl Form {
         };
         if changed {
             self.mark_dirty();
-            FormAction::Dirty
+            TodoFormAction::Dirty
         } else {
-            FormAction::Idle
+            TodoFormAction::Idle
         }
     }
 
@@ -315,7 +315,7 @@ impl Form {
     /// comment or, if the focus is on an existing comment, starts editing it
     /// in place; `d` deletes the highlighted comment. Any other printable key
     /// types into the bottom input row.
-    fn comments_section_key(&mut self, key: KeyEvent) -> FormAction {
+    fn comments_section_key(&mut self, key: KeyEvent) -> TodoFormAction {
         // Rows in the comment section, top to bottom: each existing comment is
         // a row; the trailing input row is `comments.len()`.
         let total_rows = self.comments.len() + 1;
@@ -324,20 +324,20 @@ impl Form {
                 if self.comment_cursor > 0 {
                     self.comment_cursor -= 1;
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.comment_cursor + 1 < total_rows {
                     self.comment_cursor += 1;
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             KeyCode::Enter => {
                 if self.comment_cursor == self.comments.len() {
                     // Append: ship the new comment, clear the input.
                     let body = self.new_comment.lines().join("\n");
                     if body.trim().is_empty() {
-                        return FormAction::Idle;
+                        return TodoFormAction::Idle;
                     }
                     match self.append_comment(&body) {
                         Ok(()) => {
@@ -347,12 +347,12 @@ impl Form {
                         }
                         Err(e) => self.message = format!("comment failed: {e:#}"),
                     }
-                    FormAction::Idle
+                    TodoFormAction::Idle
                 } else {
                     // Begin in-place edit of the highlighted comment.
                     let existing = self.comments[self.comment_cursor].body.clone();
                     self.editing_comment = Some((self.comment_cursor, text_area(&existing)));
-                    FormAction::Idle
+                    TodoFormAction::Idle
                 }
             }
             KeyCode::Char('d') => {
@@ -363,21 +363,21 @@ impl Form {
                         Err(e) => self.message = format!("delete failed: {e:#}"),
                     }
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             _ => {
                 // Anything else types into the new-comment input row.
                 if self.comment_cursor == self.comments.len() {
                     let _ = self.new_comment.input(key);
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
         }
     }
 
     /// While editing a comment: Ctrl-S commits, Esc cancels, everything else
     /// flows into the in-progress TextArea.
-    fn handle_comment_edit_key(&mut self, key: KeyEvent) -> FormAction {
+    fn handle_comment_edit_key(&mut self, key: KeyEvent) -> TodoFormAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('s') if ctrl => {
@@ -393,38 +393,38 @@ impl Form {
                         }
                     }
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             KeyCode::Esc => {
                 self.editing_comment = None;
                 self.message = "edit canceled".to_string();
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             _ => {
                 if let Some((_, area)) = self.editing_comment.as_mut() {
                     area.input(key);
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
         }
     }
 
     /// Keys handled when the blockers section has focus. `Enter` on the input
     /// row adds a blocker by id; `d` removes the highlighted one.
-    fn blockers_section_key(&mut self, key: KeyEvent) -> FormAction {
+    fn blockers_section_key(&mut self, key: KeyEvent) -> TodoFormAction {
         let total_rows = self.blockers.len() + 1;
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.blocker_cursor > 0 {
                     self.blocker_cursor -= 1;
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.blocker_cursor + 1 < total_rows {
                     self.blocker_cursor += 1;
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             KeyCode::Enter => {
                 if self.blocker_cursor == self.blockers.len() {
@@ -432,7 +432,7 @@ impl Form {
                     let trimmed = typed.trim_start_matches('#').trim();
                     let Some(id) = trimmed.parse::<u64>().ok() else {
                         self.message = format!("blocker id '{trimmed}' is not a number");
-                        return FormAction::Idle;
+                        return TodoFormAction::Idle;
                     };
                     match self.add_blocker(id) {
                         Ok(()) => {
@@ -443,7 +443,7 @@ impl Form {
                         Err(e) => self.message = format!("add blocker failed: {e:#}"),
                     }
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             KeyCode::Char('d') => {
                 if self.blocker_cursor < self.blockers.len() {
@@ -453,13 +453,13 @@ impl Form {
                         Err(e) => self.message = format!("remove failed: {e:#}"),
                     }
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
             _ => {
                 if self.blocker_cursor == self.blockers.len() {
                     let _ = self.new_blocker.input(key);
                 }
-                FormAction::Idle
+                TodoFormAction::Idle
             }
         }
     }
@@ -887,7 +887,7 @@ fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
 
 /// Feed a key to a single-line field, swallowing Enter so it stays one line.
 /// Returns whether the field's content changed.
-fn single_line_input(area: &mut TextArea, key: KeyEvent) -> bool {
+pub(crate) fn single_line_input(area: &mut TextArea, key: KeyEvent) -> bool {
     if key.code == KeyCode::Enter {
         return false;
     }
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn blank_form_has_default_focus_and_no_id() {
-        let form = Form::blank("http://localhost/?ws=/x");
+        let form = TodoForm::blank("http://localhost/?ws=/x");
         assert_eq!(form.id, None);
         assert_eq!(form.focus, 0);
         assert!(form.title_is_empty());
