@@ -125,6 +125,27 @@ impl Registry {
         });
         agents
     }
+
+    /// Total number of agents in the registry across every project. Used by
+    /// the daemon's SIGTERM guard to know whether shutting down would drop
+    /// live MCP connections.
+    pub(crate) fn total(&self) -> usize {
+        self.by_project.values().map(|m| m.len()).sum()
+    }
+
+    /// One `(project_id, agent_count)` entry per project that has at least
+    /// one connected agent. The daemon prints this on SIGTERM so the
+    /// operator can see what would be dropped.
+    pub(crate) fn counts_by_project(&self) -> Vec<(i64, usize)> {
+        let mut counts: Vec<(i64, usize)> = self
+            .by_project
+            .iter()
+            .filter(|(_, m)| !m.is_empty())
+            .map(|(pid, m)| (*pid, m.len()))
+            .collect();
+        counts.sort_by_key(|(pid, _)| *pid);
+        counts
+    }
 }
 
 #[cfg(test)]

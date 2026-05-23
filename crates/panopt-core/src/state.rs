@@ -134,6 +134,26 @@ impl Store {
         Ok(self.registry.list(project.0))
     }
 
+    /// Total number of agents currently connected, across every project. The
+    /// daemon's SIGTERM guard uses this to decide whether shutting down
+    /// would drop live MCP clients. Does not prune - the caller is the
+    /// signal handler and a stale count is preferable to running prune
+    /// logic in the signal path.
+    pub fn connected_agent_count(&self) -> usize {
+        self.registry.total()
+    }
+
+    /// `(project_id, agent_count)` for every project with at least one
+    /// connected agent. The daemon logs this on SIGTERM so the operator can
+    /// see what a second SIGTERM would drop.
+    pub fn connected_agents_by_project(&self) -> Vec<(ProjectId, usize)> {
+        self.registry
+            .counts_by_project()
+            .into_iter()
+            .map(|(pid, n)| (ProjectId(pid), n))
+            .collect()
+    }
+
     /// Prune silent agents across *every* project, release their locks, and
     /// re-project what changed. Returns the keys removed.
     ///

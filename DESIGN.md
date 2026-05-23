@@ -311,8 +311,21 @@ Zellij-native:
    cursor previews the selected item in the slot without taking focus off the
    sidebar; Enter or a click swaps it in and focuses it. If the user splits the
    content pane, a selection swaps into whichever pane was focused last before
-   the sidebar took focus. The plugin never closes a pane - agents, commands,
-   terminals, and viewers alike are the user's to keep.
+   the sidebar took focus.
+
+   The plugin is also the policy gate for every destructive Zellij action. The
+   cockpit's generated Zellij config rewrites the keybinds for `CloseFocus`,
+   `CloseTab`, and `Quit` to `Run "zellij" "action" "pipe"` invocations that
+   reach the sidebar plugin instead of acting directly. The plugin then decides:
+   the sidebar itself is absolutely un-closeable - the gate has no override
+   there - and any other action that would lose active work (a roster agent or
+   command with a live pane, a roster terminal or ad-hoc shell whose
+   foreground command is not the user's shell) opens a floating `panopt
+   _close-gate` confirmation dialog that lists the affected items and offers a
+   `close anyway` override. On override the plugin invokes the matching
+   zellij-tile API call directly, which bypasses the rewritten keybinds so the
+   gate is not re-triggered. Outside that, the plugin still does not close a
+   pane the user did not explicitly confirm.
 
    It is still the cockpit's launcher, not an editor: creating and quick-editing
    a todo open `panopt todo edit`, a `ratatui` form, in a floating pane. A WASM
@@ -508,7 +521,10 @@ bidirectional editing and the remaining scratchpad and process tools remain.
   system integration, so the daemon behaves identically on macOS and Linux. The
   `panopt` launcher performs that start-if-absent check, starting `panoptd`
   detached in its own session so it outlives the launching terminal and every
-  Zellij session.
+  Zellij session. The daemon also runs a two-strike SIGTERM guard: the first
+  shutdown signal is refused if any MCP client is still connected (the daemon
+  logs the per-project agent count and keeps serving); a second signal within
+  a short confirmation window exits. SIGKILL bypasses this by design.
 - Agent identification: solved. Project selection is explicit (the `ws` URL
   parameter, Section 5.3). The MCP session id alone is unreliable as an agent
   key - a Streamable HTTP session is connection-episode-scoped and rotates when

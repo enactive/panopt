@@ -107,13 +107,67 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind 127.0.0.1:{}", cli.port))?;
 
+    let shutdown_state = shared.clone();
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutdown signal received");
-        })
+        .with_graceful_shutdown(shutdown_when_safe(shutdown_state))
         .await
         .context("server error")?;
 
     Ok(())
+}
+
+/// Two-strike shutdown: the first SIGTERM (or Ctrl-C) refuses to exit if
+/// MCP clients are still connected and logs a per-project count so the
+/// operator can see what they would drop. A second SIGTERM within the
+/// confirmation window exits regardless. SIGKILL bypasses this by design.
+///
+/// When no clients are connected the very first signal exits cleanly,
+/// matching the prior behaviour - the guard only engages when there is
+/// something to protect. Keeping the second-signal window short means a
+/// determined operator can still exit in roughly the time it takes to
+/// hit Ctrl-C twice.
+async fn shutdown_when_safe(state: Arc<Mutex<Store>>) {
+    use tokio::time::{timeout, Duration};
+
+    /// How long the daemon waits for a second SIGTERM after refusing the
+    /// first. Long enough for a deliberate "ok, I really mean it" repeat,
+    /// short enough that a forgotten daemon does not stay refusing forever.
+    const CONFIRM_WINDOW: Duration = Duration::from_secs(10);
+
+    loop {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        let counts = {
+            let st = state.lock().expect("state mutex poisoned");
+            (st.connected_agent_count(), st.connected_agents_by_project())
+        };
+        if counts.0 == 0 {
+            tracing::info!("shutdown signal received");
+            return;
+        }
+        for (project, n) in &counts.1 {
+            tracing::warn!(
+                project = ?project,
+                agents = *n,
+                "SIGTERM refused: MCP clients still connected"
+            );
+        }
+        tracing::warn!(
+            total = counts.0,
+            window_secs = CONFIRM_WINDOW.as_secs(),
+            "send another SIGTERM within {}s to force shutdown",
+            CONFIRM_WINDOW.as_secs()
+        );
+        match timeout(CONFIRM_WINDOW, tokio::signal::ctrl_c()).await {
+            Ok(_) => {
+                tracing::warn!("second shutdown signal received - exiting");
+                return;
+            }
+            Err(_) => {
+                tracing::info!("shutdown window elapsed; continuing to serve");
+                // Loop and wait for the next signal afresh.
+            }
+        }
+    }
 }

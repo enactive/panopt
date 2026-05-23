@@ -17,8 +17,12 @@
 //! If the user splits the content pane, a selection swaps into whichever pane
 //! was focused last before the sidebar took focus - the designated slot.
 //!
-//! The plugin never closes a pane: agents, terminals, and viewers alike are the
-//! user's to keep or close.
+//! The plugin gates destructive Zellij actions - CloseFocus, CloseTab, Quit -
+//! routed in through named pipes (see `up::render_config`). When an active
+//! agent, command, or terminal would be lost, the plugin refuses by showing a
+//! floating dialog with a `close anyway` override; the sidebar itself has no
+//! such override. Outside the gate, the plugin closes only panes the user
+//! explicitly confirmed via `close anyway`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -125,6 +129,25 @@ struct PanoptSidebar {
     /// never derive from it: agent rows are ordered by pane id (creation
     /// order), so the label is free to change without reshuffling the sidebar.
     agent_labels: BTreeMap<u32, String>,
+
+    /// Whether the sidebar plugin pane is currently the focused pane in its
+    /// tab. Updated by [`ingest_panes`](PanoptSidebar::ingest_panes), but only
+    /// from a non-transient manifest: a transient `zellij action pipe` pane
+    /// briefly steals focus while the close-gate pipes fly, and we must not
+    /// let that flicker make the gate think the user is not on the sidebar.
+    /// Used by [`gate_close_focus`](PanoptSidebar::gate_close_focus) to refuse
+    /// closing the sidebar absolutely.
+    sidebar_focused: bool,
+    /// The tab position with a focused pane, derived from the same manifest
+    /// snapshot that drives `sidebar_focused`. Scopes the CloseTab gate. None
+    /// when no pane was focused in the latest meaningful update.
+    focused_tab: Option<usize>,
+    /// The last gate refusal: what was refused (a label), set when the gate
+    /// blocks an action because active items would be lost. Rendered in the
+    /// sidebar header so the user knows their keypress was intercepted.
+    /// Cleared on the next successful navigation. A placeholder until the
+    /// floating-pane dialog (task 5) lands.
+    last_gate_refusal: Option<String>,
 }
 
 /// A parsed `.panopt/roster.md` line.
@@ -151,6 +174,9 @@ struct PaneRow {
     /// launch command, used as the routing file name
     /// `.panopt/.cockpit/viewer-<slot>.json`. `None` on any other role.
     viewer_slot: Option<String>,
+    /// Tab position from the `PaneManifest`. Used by the CloseTab gate to
+    /// scope active-item aggregation to a single tab.
+    tab: usize,
 }
 
 /// What a content pane is, derived from the command it was launched with.
@@ -270,6 +296,14 @@ impl ZellijPlugin for PanoptSidebar {
     /// `panopt:spawn-agent` opens a new agent pane; `panopt:spawn-blank-pane`
     /// opens a fresh empty viewer in a brand-new tiled pane - Alt-N's cockpit
     /// behaviour, dispatched from the keybind via `MessagePlugin`.
+    ///
+    /// `panopt:close-focus-request`, `panopt:close-tab-request`, and
+    /// `panopt:quit-request` are the three destructive actions, retargeted by
+    /// `up::render_config` from Zellij's stock CloseFocus/CloseTab/Quit
+    /// keybinds. The plugin gates each: it refuses the action when an active
+    /// agent, command, or terminal would be lost, and otherwise force-closes
+    /// via the zellij-tile API (which bypasses the rewritten keybind, so the
+    /// gate is not re-triggered).
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         match pipe_message.name.as_str() {
             "panopt:spawn-agent" => {
@@ -278,6 +312,22 @@ impl ZellijPlugin for PanoptSidebar {
             }
             "panopt:spawn-blank-pane" => {
                 self.spawn_blank_pane();
+                true
+            }
+            "panopt:close-focus-request" => {
+                self.gate_close_focus();
+                true
+            }
+            "panopt:close-tab-request" => {
+                self.gate_close_tab();
+                true
+            }
+            "panopt:quit-request" => {
+                self.gate_quit();
+                true
+            }
+            "panopt:close-gate-decision" => {
+                self.handle_gate_decision(pipe_message.payload.as_deref());
                 true
             }
             _ => false,
@@ -290,10 +340,16 @@ impl ZellijPlugin for PanoptSidebar {
         // row map and the printed lines stay in lockstep.
         let mut lines: Vec<(String, RowKind, Style)> = Vec::new();
 
-        let title = if self.permitted {
-            "PANopt  [a]gent [c]todo".to_string()
-        } else {
+        let title = if !self.permitted {
             "PANopt - grant permissions in the Zellij prompt".to_string()
+        } else if let Some(refusal) = &self.last_gate_refusal {
+            // Surface the most recent gate refusal so the user understands
+            // why their close keypress did nothing. A short stand-in for the
+            // floating-pane dialog: the next iteration replaces this with a
+            // prompt that has a `close anyway` option.
+            format!("PANopt  blocked: {refusal}")
+        } else {
+            "PANopt  [a]gent [c]todo".to_string()
         };
         lines.push((title, RowKind::Inert, Style::HEADER));
 
@@ -358,8 +414,30 @@ impl PanoptSidebar {
         tabs.sort();
         let mut rows = Vec::new();
         let mut focused_non_plugin: Option<PaneId> = None;
+        let mut sidebar_focused_this_update = false;
+        let mut saw_focused_pane = false;
+        let mut focused_tab_this_update: Option<usize> = None;
         for tab in tabs {
             for p in &manifest.panes[tab] {
+                // The transient `zellij action pipe` pane briefly steals focus
+                // while a close-request pipe is in flight. We skip it from
+                // focus tracking and from the pane list - it has no role in
+                // the cockpit and would otherwise become the slot pane or
+                // make the gate think the user has moved off the sidebar.
+                if is_transient_pipe_pane(p) {
+                    continue;
+                }
+                if p.is_focused {
+                    saw_focused_pane = true;
+                    focused_tab_this_update = Some(*tab);
+                    if p.is_plugin {
+                        if let Some(PaneId::Plugin(pid)) = self.plugin_pane {
+                            if p.id == pid {
+                                sidebar_focused_this_update = true;
+                            }
+                        }
+                    }
+                }
                 if p.is_plugin || !p.is_selectable {
                     continue;
                 }
@@ -381,6 +459,7 @@ impl PanoptSidebar {
                     exited: p.exited,
                     role,
                     viewer_slot,
+                    tab: *tab,
                 });
             }
         }
@@ -396,6 +475,14 @@ impl PanoptSidebar {
         // only overwrite it when a non-plugin pane is focused.
         if let Some(pane) = focused_non_plugin {
             self.slot_pane = Some(pane);
+        }
+        // `sidebar_focused` only flips when this update actually carried focus
+        // information - a manifest with no focused pane (e.g. between focus
+        // transitions) preserves the prior value so the gate keeps the right
+        // answer across the transient-pipe interlude.
+        if saw_focused_pane {
+            self.sidebar_focused = sidebar_focused_this_update;
+            self.focused_tab = focused_tab_this_update;
         }
         // Drop the slot pane if it has since closed.
         if let Some(slot) = self.slot_pane {
@@ -662,6 +749,9 @@ impl PanoptSidebar {
     // --- input ---
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
+        // Any acknowledged keypress dismisses the gate-refusal banner so it
+        // does not linger across unrelated input.
+        self.clear_gate_refusal();
         match key.bare_key {
             BareKey::Up => {
                 if self.move_focus(-1) {
@@ -1040,6 +1130,323 @@ impl PanoptSidebar {
         }
         self.ws.as_ref().map(PathBuf::from)
     }
+
+    // --- close gate ---
+    //
+    // The plugin is the policy point for every destructive Zellij action.
+    // `up::render_config` rewrites CloseFocus, CloseTab, and Quit keybinds to
+    // pipe a request here; we either refuse (recording the refusal so the
+    // sidebar header can show it; a richer floating-pane dialog is the next
+    // iteration) or force-close via the zellij-tile API, which bypasses the
+    // rewritten keybinds and so does not re-trigger the gate.
+
+    /// CloseFocus came in. Refuse if the sidebar is focused (absolutely - no
+    /// override). When the target pane is an active item, open the
+    /// close-gate dialog so the user can confirm with `close anyway`.
+    /// Otherwise close the target via the plugin API (which does not
+    /// re-trigger the gate).
+    fn gate_close_focus(&mut self) {
+        if !self.permitted {
+            return;
+        }
+        if self.sidebar_focused {
+            // Sidebar is part of the cockpit, not a closeable artifact. No
+            // dialog is offered - the gate is absolute here.
+            self.refuse_gate("cannot close the sidebar");
+            return;
+        }
+        let Some(target) = self.slot_pane else {
+            return;
+        };
+        if let Some(item) = self.pane_active(target) {
+            self.spawn_close_gate_dialog("focus", Some(target), &[item]);
+            return;
+        }
+        close_pane_with_id(target);
+    }
+
+    /// CloseTab came in. Open the dialog when any pane in the focused tab is
+    /// active; otherwise close the tab.
+    fn gate_close_tab(&mut self) {
+        if !self.permitted {
+            return;
+        }
+        let Some(tab) = self.focused_tab else {
+            return;
+        };
+        let active = self.active_in_tab(tab);
+        if !active.is_empty() {
+            self.spawn_close_gate_dialog("tab", None, &active);
+            return;
+        }
+        close_focused_tab();
+    }
+
+    /// Quit came in. Open the dialog when any pane across the session is
+    /// active; otherwise quit Zellij.
+    fn gate_quit(&mut self) {
+        if !self.permitted {
+            return;
+        }
+        let active = self.active_anywhere();
+        if !active.is_empty() {
+            self.spawn_close_gate_dialog("quit", None, &active);
+            return;
+        }
+        quit_zellij();
+    }
+
+    /// Spawn the close-gate dialog as a floating `panopt _close-gate` pane.
+    /// Encodes the active items as `kind:label;kind:label;...`, replacing
+    /// `:` and `;` in labels so the CLI parser can split unambiguously.
+    /// When the dialog can't be spawned (no project root yet) we fall back
+    /// to the sidebar header banner so the user still sees the refusal.
+    fn spawn_close_gate_dialog(
+        &mut self,
+        scope: &str,
+        target: Option<PaneId>,
+        active: &[ActiveItem],
+    ) {
+        let Some(ws) = self.launch_cwd() else {
+            self.refuse_gate(&format!(
+                "{} active - permissions not yet granted",
+                active.len()
+            ));
+            return;
+        };
+        let items_arg = active
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}:{}",
+                    a.kind.label(),
+                    a.label.replace(';', ",").replace(':', "-")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        let mut args = vec![
+            "_close-gate".to_string(),
+            "--scope".to_string(),
+            scope.to_string(),
+            "--items".to_string(),
+            items_arg,
+            "--port".to_string(),
+            self.port.clone(),
+        ];
+        if let Some(PaneId::Terminal(tid)) = target {
+            args.push("--target-pane".to_string());
+            args.push(tid.to_string());
+        }
+        open_command_pane_floating(
+            CommandToRun {
+                path: PathBuf::from(&self.panopt_bin),
+                args,
+                cwd: Some(ws),
+            },
+            None,
+            BTreeMap::new(),
+        );
+    }
+
+    /// Handle the user's decision piped back from the close-gate dialog.
+    /// The payload is `scope=...;target_pane=...;decision=close` - only the
+    /// `decision=close` case acts; anything else (parse failure, cancel) is
+    /// a no-op. Calls the matching zellij-tile API directly, which bypasses
+    /// the rewritten keybinds, so the gate is not re-triggered.
+    fn handle_gate_decision(&mut self, payload: Option<&str>) {
+        let Some(payload) = payload else { return };
+        let mut scope: Option<&str> = None;
+        let mut target_pane: Option<u32> = None;
+        let mut decision: Option<&str> = None;
+        for kv in payload.split(';') {
+            let (k, v) = match kv.split_once('=') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            match k {
+                "scope" => scope = Some(v),
+                "target_pane" => target_pane = v.parse().ok(),
+                "decision" => decision = Some(v),
+                _ => {}
+            }
+        }
+        if decision != Some("close") {
+            return;
+        }
+        self.clear_gate_refusal();
+        match scope {
+            Some("focus") => {
+                if let Some(tid) = target_pane {
+                    close_pane_with_id(PaneId::Terminal(tid));
+                }
+            }
+            Some("tab") => close_focused_tab(),
+            Some("quit") => quit_zellij(),
+            _ => {}
+        }
+    }
+
+    /// Whether `pane` is an active item the gate must protect. Returns the
+    /// item with its display label and kind, or `None` if not active.
+    ///
+    /// Rules (locked by the design grilling):
+    /// - A roster agent's live pane is always active (the agent is the work).
+    /// - A roster command's live pane is always active (until it exits).
+    /// - A roster terminal, an ad-hoc agent, and a plain shell are active
+    ///   only when their foreground command differs from the user's shell -
+    ///   read via [`get_pane_running_command`], compared against a whitelist
+    ///   of common shells (plugins cannot read `$SHELL` from the WASM
+    ///   sandbox, so the whitelist is the source of truth for now).
+    /// - A viewer pane is never active.
+    /// - An exited pane is never active.
+    fn pane_active(&self, pane: PaneId) -> Option<ActiveItem> {
+        let p = self.panes.iter().find(|p| p.id == pane)?;
+        if p.exited {
+            return None;
+        }
+        if matches!(p.role, PaneRole::Viewer) {
+            return None;
+        }
+        if let PaneRole::Roster(rid) = p.role {
+            if let Some(r) = self.roster.iter().find(|r| r.id == rid) {
+                return match r.kind.as_str() {
+                    "agent" => Some(ActiveItem {
+                        label: r.label.clone(),
+                        kind: ActiveKind::Agent,
+                        pane,
+                    }),
+                    "command" => Some(ActiveItem {
+                        label: r.label.clone(),
+                        kind: ActiveKind::Command,
+                        pane,
+                    }),
+                    "terminal" => self.pane_active_terminal(pane, &r.label),
+                    _ => None,
+                };
+            }
+        }
+        // Ad-hoc Agent panes and plain Shell panes both gate on the shell
+        // rule - a Claude Code instance the user spawned via `a` runs as
+        // `panopt _agent`, which is not a shell name, so it is correctly
+        // treated as active.
+        let label = if matches!(p.role, PaneRole::Agent) {
+            self.agent_label(p)
+        } else {
+            pane_label(p)
+        };
+        self.pane_active_terminal(pane, &label)
+    }
+
+    /// The shell-child rule: a terminal pane is active when its current
+    /// foreground command is not one of the known shell binaries. Errors
+    /// from the host (the pane is a plugin, exited, or the OS query failed)
+    /// produce `None` - we prefer false negatives to false positives so a
+    /// confused inspection does not trap the user.
+    fn pane_active_terminal(&self, pane: PaneId, label: &str) -> Option<ActiveItem> {
+        let argv = get_pane_running_command(pane).ok()?;
+        let exe = argv.first()?;
+        let basename = std::path::Path::new(exe)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(exe.as_str());
+        if is_user_shell(basename) {
+            None
+        } else {
+            Some(ActiveItem {
+                label: label.to_string(),
+                kind: ActiveKind::Terminal,
+                pane,
+            })
+        }
+    }
+
+    /// Active items inside the given tab. Used by the CloseTab gate.
+    fn active_in_tab(&self, tab: usize) -> Vec<ActiveItem> {
+        self.panes
+            .iter()
+            .filter(|p| p.tab == tab)
+            .filter_map(|p| self.pane_active(p.id))
+            .collect()
+    }
+
+    /// Active items across every tab. Used by the Quit gate.
+    fn active_anywhere(&self) -> Vec<ActiveItem> {
+        self.panes
+            .iter()
+            .filter_map(|p| self.pane_active(p.id))
+            .collect()
+    }
+
+    /// Record a gate refusal so the next render shows it in the sidebar
+    /// header. A placeholder for the floating-pane dialog: the user gets a
+    /// terse explanation rather than a richer list + "close anyway" prompt.
+    fn refuse_gate(&mut self, reason: &str) {
+        self.last_gate_refusal = Some(reason.to_string());
+    }
+
+    /// Clear any pending refusal banner - called on every navigation so the
+    /// banner is short-lived and does not linger across unrelated input.
+    fn clear_gate_refusal(&mut self) {
+        self.last_gate_refusal = None;
+    }
+}
+
+/// One item the gate has classified as active. Carries the user-visible
+/// label so the refusal message can name what is blocking close.
+#[derive(Clone, Debug)]
+struct ActiveItem {
+    label: String,
+    kind: ActiveKind,
+    /// The pane that holds the active work - used by the (future) dialog to
+    /// pass force-close back to the gate.
+    #[allow(dead_code)]
+    pane: PaneId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveKind {
+    Agent,
+    Command,
+    Terminal,
+}
+
+impl ActiveKind {
+    fn label(self) -> &'static str {
+        match self {
+            ActiveKind::Agent => "agent",
+            ActiveKind::Command => "command",
+            ActiveKind::Terminal => "terminal",
+        }
+    }
+}
+
+/// Known shell binary basenames. The WASM sandbox blocks `$SHELL` so we
+/// cannot read the user's exact login shell; the whitelist covers the
+/// common cases. A roster terminal running its shell at a prompt reads as
+/// idle; one running `cargo test` or `vim` reads as active.
+fn is_user_shell(basename: &str) -> bool {
+    matches!(
+        basename,
+        "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "nu" | "ash" | "elvish"
+    )
+}
+
+/// Whether a pane is a transient `zellij action pipe` pane the close-gate
+/// keybinds spawn. We filter these out of focus tracking so the gate's
+/// "previous focus" pointer keeps the user's actual pane, and out of the
+/// pane list so they never show up in the sidebar even for one frame.
+///
+/// The match is intentionally narrow: a stray `zellij action ...` the user
+/// runs by hand won't trip this; only invocations with a `panopt:` pipe name
+/// do.
+fn is_transient_pipe_pane(p: &PaneInfo) -> bool {
+    p.terminal_command.as_deref().map_or(false, |c| {
+        c.contains("zellij")
+            && c.contains("action")
+            && c.contains("pipe")
+            && c.contains("panopt:")
+    })
 }
 
 /// Classify a content pane by the command it was launched with. A plain

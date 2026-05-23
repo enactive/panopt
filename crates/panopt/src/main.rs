@@ -4,6 +4,7 @@
 //! opens agent panes - each with a stable per-agent identity (DESIGN.md §9).
 
 mod agent;
+mod close_gate;
 mod daemon;
 mod edit;
 mod mcp;
@@ -92,6 +93,20 @@ enum Cmd {
         #[arg(long)]
         id: Option<u64>,
     },
+    /// Internal: the floating close-gate dialog the sidebar plugin spawns
+    /// when a destructive action would lose active items.
+    #[command(name = "_close-gate", hide = true)]
+    CloseGateExec {
+        /// What the user tried to do: focus, tab, or quit.
+        #[arg(long)]
+        scope: String,
+        /// Active items the dialog shows: `kind:label;kind:label;...`.
+        #[arg(long, default_value = "")]
+        items: String,
+        /// Terminal pane id to close when scope is `focus`.
+        #[arg(long)]
+        target_pane: Option<u32>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -104,5 +119,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
         Cmd::RosterRun { ws, id } => roster::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
+        Cmd::CloseGateExec { scope, items, target_pane } => {
+            close_gate::run(&scope, &items, target_pane, cli.port)
+        }
     }
 }
