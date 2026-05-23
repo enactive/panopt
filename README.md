@@ -1,67 +1,113 @@
 # PANopt
 
-A personal coordination daemon for multi-agent workflows. One long-lived
-process holds shared todos and scratchpads for every project, tracks which
-agents are connected and the advisory locks they hold, persists the todos and
-scratchpads in SQLite, exposes everything as an MCP server, and mirrors each
-project's state into `.panopt/*.md` files that an editor renders live.
+PANopt is the shared brain for a desk of terminal-based coding agents.
 
-See `DESIGN.md` for the full design rationale. This repository contains the
-proof of concept (`DESIGN.md` section 7) plus the persistence, multi-project,
-and agent-registry build-out (sections 5.3, 6.4, and 6.3).
+One long-running daemon holds the todos, scratchpads, advisory locks, and agent
+roster for every project you work in, and surfaces them as a sidebar inside a
+[Zellij](https://zellij.dev) cockpit. Agents (Claude Code, Codex, anything that
+speaks MCP) connect to the daemon as ordinary MCP clients. They see the same
+todos you see in the sidebar, can hand work off to each other through locks
+and comments, and write notes into scratchpads that you can read live.
 
-## Layout
+![The PANopt cockpit: sidebar on the left, a scratchpad edit form in the middle, a Claude agent pane on the right](docs/cockpit.png)
 
-- `crates/panopt-core` - persistent state (SQLite) and filesystem projection. No
-  MCP, async, or HTTP dependency; `cargo tree -p panopt-core` contains none of
-  rmcp / axum / tokio.
-- `crates/panoptd` - the daemon: an MCP server over Streamable HTTP that wraps
-  `panopt-core` in a shared `Arc<Mutex<_>>`.
-- `crates/panopt` - the launcher CLI: boots the cockpit and opens agent panes,
-  each with a stable per-agent identity.
-- `crates/panopt-zellij` - the Zellij sidebar plugin (Rust to WASM): the
-  in-cockpit agent/todo list, and the spawner for new agent panes.
+The cockpit above is one Zellij session. The leftmost pane is the PANopt
+sidebar plugin listing the project's todos, agents, terminals, commands, and
+scratchpads. The middle pane is the in-cockpit form for editing a scratchpad.
+The right pane is a Claude agent already wired to PANopt.
 
-## Build and test
+## Why you might want it
+
+- You run more than one agent at a time and you want them to coordinate
+  instead of stepping on each other.
+- You want a single place to see what every agent is doing, what it is stuck
+  on, and what it has written down, without alt-tabbing through windows.
+- You want your todos and notes to live in plain markdown files inside the
+  project, not in someone else's cloud.
+
+## Prerequisites
+
+- [Zellij](https://zellij.dev) on your `PATH` (the cockpit is a Zellij
+  session).
+- An MCP-capable agent CLI you want to drive. The `panopt up` launcher spawns
+  [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) panes by
+  default; any MCP client works for connecting by hand.
+- Rust toolchain to build from source (no prebuilt binaries yet).
+
+Linux is the primary target. macOS works; the screenshot above is macOS.
+
+## Install
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+git clone https://github.com/<your-fork>/panopt
+cd panopt
+cargo install --path crates/panopt
+cargo install --path crates/panoptd
 ```
 
-## The cockpit
+The first command installs the `panopt` launcher and CLI; the second installs
+the `panoptd` daemon. Both end up in `~/.cargo/bin`.
 
-Boot the whole cockpit - the daemon, a Zellij session, the sidebar plugin, and
-a first agent - with one command, from the project directory:
+## Quick start
+
+From any project directory:
 
 ```sh
 panopt up
 ```
 
-Re-running `panopt up` in a project whose cockpit already exists just attaches.
-The sidebar lists the agents and the todos with one cursor (Up/Down) over both:
+That single command starts the daemon if it is not already running, opens a
+Zellij cockpit session for the project, mounts the sidebar plugin, and spawns
+a first Claude agent pane wired to PANopt. Re-running `panopt up` in a
+project whose cockpit already exists just re-attaches.
 
-- `a` - spawn a new agent pane.
-- `c` - create a todo: opens the form on a blank one.
-- `Enter` - on an agent, focuses its pane; on a todo, opens the **todo form**.
+Inside the cockpit, the sidebar is the keyboard control surface:
 
-The todo form (`panopt todo edit`) opens in a *floating* pane over the cockpit -
-a real, roomy editing surface, not the cramped sidebar - and closes when you
-quit it. Agents can also be added with `panopt agent [name]`.
+| Key | What it does |
+|---|---|
+| `Up` / `Down` | Move the cursor over agents, todos, and scratchpads. |
+| `Enter` | On an agent: focus its pane. On a todo or scratchpad: open it in the viewer pane. |
+| `a` | Spawn a new agent pane. |
+| `c` | Create a new todo and open the form on it. |
+| `Tab` | Switch the sidebar focus between sections. |
+| `Ctrl-C` | Close the current form / viewer. |
+| `Ctrl-Q` | Quit the cockpit (blocked while items are open or in progress). |
 
-The layout is fixed: the sidebar stays pinned full-height on the left, and agent
-panes fill the right. New agents stack on the right by default (the focused one
-full-size, the rest collapsed to title bars); `Alt-]` / `Alt-[` toggle between
-the stacked arrangement and an even tiled grid.
+Todos and scratchpads open in a viewer pane on the right; pressing `Enter`
+again or `e` switches the viewer into edit mode (the middle pane in the
+screenshot). `Tab` walks between fields, `Ctrl-S` saves, `Ctrl-C` closes.
 
-Each agent is a Claude pane wired to PANopt with a stable per-agent identity.
-The two sections below are what `panopt up` automates - run them by hand to
-understand the pieces, or to use PANopt without the launcher.
+## What lives where
 
-## Editing todos from the CLI
+PANopt keeps two kinds of state:
 
-`panopt todo` is a small client of the daemon for a project's shared todos from
-a shell - it is also what the cockpit's todo form shells out to.
+- A single SQLite database, shared across every project you use PANopt with.
+  Default location: `~/.local/share/panopt/panopt.db` on Linux, the equivalent
+  Application Support path on macOS. Override with `--db` on `panoptd`.
+- A markdown projection inside each project, written to `.panopt/` under the
+  project root. The directory contains a `.gitignore` of `*`, so it never
+  enters your commits unless you ask it to.
+
+The projection mirrors the live state and is rewritten atomically on every
+change:
+
+- `.panopt/todos.md` - a checklist index of every todo.
+- `.panopt/todos/<id>.md` - one file per todo, with a frontmatter block of
+  structured fields, the body, and the comment thread.
+- `.panopt/scratchpad/<id>.md` - one file per scratchpad.
+- `.panopt/agents.md` - the agents currently connected.
+- `.panopt/locks.md` - the advisory locks currently held.
+- `.panopt/roster.md` - the project's persistent agents, commands, and
+  terminals (what the cockpit launches and tracks).
+
+The projection is read-only today; edits go through the cockpit forms, the
+MCP tools, or the CLI below.
+
+## Driving PANopt from the shell
+
+`panopt` is a small client of the daemon. Everything the cockpit does is also
+available as a subcommand, so you can script it or use PANopt without
+launching the cockpit at all.
 
 ```sh
 panopt todo list                    # every todo, one per line
@@ -73,97 +119,52 @@ panopt todo done 3                  # mark complete
 panopt todo rm 3                    # delete
 panopt todo block 4 --by 3          # todo 4 is blocked by todo 3
 panopt todo comment 3 "started" --as greg
-panopt todo edit 3                  # open the interactive form on todo 3
-panopt todo edit --new              # the form on a fresh todo
+panopt todo edit 3                  # interactive form on todo 3
+panopt todo edit --new              # form on a fresh todo
+
+panopt roster list                  # agents/commands/terminals
+panopt agent [name]                 # spawn another agent pane in the cockpit
 ```
 
-The project is the current directory, or `--ws <path>`. Each invocation
-auto-starts the daemon if needed and connects as an observer, so it never lands
-in the agent roster.
+Each invocation targets the current project (override with `--ws <path>`) and
+auto-starts the daemon if needed.
 
-`panopt todo edit` is the form the cockpit launches - a TUI with labeled
-fields: Tab moves between them, Left/Right cycle `status` and `priority`, typing
-edits `title`/`assignee`/`tags`/`body`, Ctrl-S saves, Esc quits. It runs the
-same from a plain shell as it does in the cockpit's floating pane.
+## Connecting your own agents
 
-## Run the daemon
-
-```sh
-cargo run -p panoptd -- --port 7600
-```
-
-- `--db` (default: `panopt/panopt.db` under the per-user data directory) - the
-  single SQLite database holding every project's state. Its parent directory is
-  created if missing.
-- `--port` (default `7600`) - localhost TCP port. The MCP endpoint is
-  `http://127.0.0.1:<port>/mcp`.
-
-One daemon serves every project at once; there is no per-project daemon and no
-`--workspace`. The project is chosen per connection (see below).
-
-The daemon is portable Rust and builds anywhere. The Zed live-reload
-integration works wherever Zed runs; it was verified on macOS.
-
-## Connect an agent
-
-Run this inside the project directory:
+The daemon speaks the standard Model Context Protocol over Streamable HTTP.
+To connect an agent yourself, from inside the project directory:
 
 ```sh
 claude mcp add --transport http panopt "http://127.0.0.1:7600/mcp?ws=$PWD"
 ```
 
-The `ws` query parameter is the absolute project path; it scopes the connection
-to that project, and the daemon writes that project's `.panopt/` projection
-(including a `.panopt/.gitignore` of `*`) under it. Any MCP-capable client
-works. State is shared live across every agent connected with the same `ws`.
+The `ws` query parameter is the absolute project path; it scopes the
+connection to that project. Any MCP-capable client works the same way - point
+it at `http://127.0.0.1:7600/mcp?ws=<absolute-project-path>`. State is shared
+live across every agent connected with the same `ws`.
 
-## Tools
+The MCP surface includes `todo_*`, `scratchpad_*`, `lock_*`, `roster_*`, and
+the agent registry (`identify`, `whoami`, `agent_list`). The full tool list
+is in [DESIGN.md](DESIGN.md).
 
-| Tool | Arguments | Returns |
-|---|---|---|
-| `identify` | `name`, optional `status` | `ok` |
-| `whoami` | - | own entry `{name, status, idle_seconds, is_self}` |
-| `agent_list` | - | JSON array of agent entries |
-| `lock_acquire` | `name`, optional `note` | `{acquired, held_by?}` |
-| `lock_release` | `name` | `{released, held_by?}` |
-| `lock_status` | - | JSON array of lock entries |
-| `scratchpad_create` | `title` | new numeric id |
-| `scratchpad_list` | - | JSON array of `{id, title}` |
-| `scratchpad_append` | `scratchpad_id`, `content` | `ok` |
-| `scratchpad_read` | `scratchpad_id` | scratchpad body |
-| `todo_create` | `title` | new numeric id |
-| `todo_list` | - | JSON array of todo summaries |
-| `todo_get` | `todo_id` | one todo in full - body, comments, blockers |
-| `todo_update` | `todo_id`, optional `title`/`body`/`status`/`priority`/`assignee`/`tags` | `ok` |
-| `todo_complete` | `todo_id` | `ok` |
-| `todo_delete` | `todo_id` | `ok` |
-| `todo_add_blocker` | `todo_id`, `blocker_id` | `ok` |
-| `todo_remove_blocker` | `todo_id`, `blocker_id` | `ok` |
-| `todo_comment_add` | `todo_id`, `body` | new comment id |
+## Running the daemon by hand
 
-Connecting already registers an agent; `identify` just adds a name and status.
-The registry key is the `agent=` URL parameter (the `panopt` launcher gives each
-pane a unique one), or the MCP session id as a fallback when it is absent.
+`panopt up` and `panopt todo` both auto-start the daemon. If you would rather
+run it yourself:
 
-## Projection
+```sh
+panoptd --port 7600
+```
 
-Every state mutation atomically rewrites the affected file:
+One daemon serves every project at once. The MCP endpoint is
+`http://127.0.0.1:<port>/mcp`. Useful flags:
 
-- `.panopt/todos.md` - an index of every todo as a markdown checklist, each
-  entry linking to that todo's own file.
-- `.panopt/todos/<id>.md` - one file per todo: a `---` frontmatter block of
-  structured fields (status, priority, assignee, tags, blockers, timestamps),
-  the title and body, then the comment thread.
-- `.panopt/scratchpad/<id>.md` - one file per scratchpad, id in the filename.
-- `.panopt/agents.md` - the roster of currently connected agents.
-- `.panopt/locks.md` - the advisory locks currently held.
+- `--db <path>` - override the SQLite database location.
+- `--port <n>` - localhost TCP port (default 7600).
 
-Writes go to a temp file in the same directory, then `rename` over the target,
-so a reader never observes a half-written file.
+## Going deeper
 
-## Not yet implemented
-
-Bidirectional editing - parsing a hand-edit of a projected `.panopt/` file back
-into the daemon (toggling a checkbox in `.panopt/todos.md`, say). Today the
-projection is write-only; edits go through the form, the MCP tools, or
-`panopt todo`. See `DESIGN.md` sections 6.5 and 9.
+[DESIGN.md](DESIGN.md) is the full design document: why PANopt is a daemon
+rather than a fork of a terminal emulator, how the cockpit composes with
+Zellij, the crate layout, and the MCP tool reference. Read it if you want to
+understand the architecture or contribute.
