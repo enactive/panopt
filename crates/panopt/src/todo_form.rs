@@ -190,7 +190,9 @@ impl TodoForm {
         todo: &Value,
         blocker_titles: &dyn Fn(u64) -> Option<String>,
     ) -> Result<TodoForm> {
-        let id = todo["id"].as_u64().ok_or_else(|| anyhow!("todo response has no id"))?;
+        let id = todo["id"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("todo response has no id"))?;
         let tags = string_list(&todo["tags"]).join(", ");
         let blocker_ids: Vec<u64> = todo["blockers"]
             .as_array()
@@ -692,7 +694,10 @@ impl TodoForm {
         client.close();
         outcome?;
         if !self.blockers.iter().any(|b| b.id == blocker_id) {
-            self.blockers.push(BlockerEntry { id: blocker_id, title });
+            self.blockers.push(BlockerEntry {
+                id: blocker_id,
+                title,
+            });
         }
         Ok(())
     }
@@ -731,17 +736,18 @@ impl TodoForm {
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         // Rows: header / title / status+priority / assignee / tags / body /
         // comments / blockers / context / message.
+        // Body is 3x the size of comments and blockers (which are equal).
         let rows = Layout::vertical([
-            Constraint::Length(1), // header (incl. locked-by banner)
-            Constraint::Length(3), // title
-            Constraint::Length(1), // status + priority
-            Constraint::Length(3), // assignee
-            Constraint::Length(3), // tags
-            Constraint::Min(3),    // body
-            Constraint::Min(3),    // comments
-            Constraint::Min(2),    // blockers
-            Constraint::Length(1), // context (created/updated)
-            Constraint::Length(1), // message + help
+            Constraint::Length(1),   // header (incl. locked-by banner)
+            Constraint::Length(3),   // title
+            Constraint::Length(1),   // status + priority
+            Constraint::Length(3),   // assignee
+            Constraint::Length(3),   // tags
+            Constraint::Ratio(3, 5), // body (3/5 of flexible space)
+            Constraint::Ratio(1, 5), // comments (1/5 of flexible space)
+            Constraint::Ratio(1, 5), // blockers (1/5 of flexible space)
+            Constraint::Length(1),   // context (created/updated)
+            Constraint::Length(1),   // message + help
         ])
         .split(area);
 
@@ -768,7 +774,11 @@ impl TodoForm {
             cols[0],
         );
         frame.render_widget(
-            enum_line("Priority", PRIORITIES[self.priority], focus == Field::Priority),
+            enum_line(
+                "Priority",
+                PRIORITIES[self.priority],
+                focus == Field::Priority,
+            ),
             cols[1],
         );
 
@@ -811,7 +821,11 @@ impl TodoForm {
     /// visual representation is ours.
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         let focused = FIELDS[self.focus] == Field::Body;
-        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let border = if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
         let block = Block::bordered()
             .title("Body")
             .border_style(Style::default().fg(border));
@@ -849,11 +863,7 @@ impl TodoForm {
             .collect();
         frame.render_widget(Paragraph::new(visible), inner);
 
-        if focused
-            && cvr >= self.body_scroll
-            && cvr < self.body_scroll + height
-            && cvc < width
-        {
+        if focused && cvr >= self.body_scroll && cvr < self.body_scroll + height && cvc < width {
             let cy = inner.y + (cvr - self.body_scroll) as u16;
             let cx = inner.x + cvc as u16;
             frame.set_cursor_position((cx, cy));
@@ -862,7 +872,11 @@ impl TodoForm {
 
     fn draw_comments(&mut self, frame: &mut Frame, area: Rect) {
         let focused = FIELDS[self.focus] == Field::Comments;
-        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let border = if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
         let block = Block::bordered()
             .title(format!("Comments ({})", self.comments.len()))
             .border_style(Style::default().fg(border));
@@ -877,11 +891,17 @@ impl TodoForm {
             for (i, c) in self.comments.iter().enumerate() {
                 if i == *idx {
                     lines.push(Line::styled(
-                        format!(" #{} {} - editing (Ctrl-S save, Esc cancel)", c.id, c.author),
+                        format!(
+                            " #{} {} - editing (Ctrl-S save, Esc cancel)",
+                            c.id, c.author
+                        ),
                         Style::default().fg(Color::Yellow),
                     ));
                 } else {
-                    lines.push(Line::from(format!(" #{} {} {} - {}", c.id, c.author, c.created_at, c.body)));
+                    lines.push(Line::from(format!(
+                        " #{} {} {} - {}",
+                        c.id, c.author, c.created_at, c.body
+                    )));
                 }
             }
             frame.render_widget(Paragraph::new(lines), inner_rows[0]);
@@ -905,8 +925,7 @@ impl TodoForm {
             })
             .collect();
         let body = if lines.is_empty() {
-            Paragraph::new(" (no comments)")
-                .style(Style::default().fg(Color::DarkGray))
+            Paragraph::new(" (no comments)").style(Style::default().fg(Color::DarkGray))
         } else {
             Paragraph::new(lines)
         };
@@ -915,18 +934,25 @@ impl TodoForm {
         // The add-row: a `+ ` prefix plus the textarea so it reads as an input.
         let add_focused = focused && self.comment_cursor == self.comments.len();
         let prefix_style = if add_focused {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let prefix_cols = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner_rows[1]);
+        let prefix_cols =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner_rows[1]);
         frame.render_widget(Paragraph::new("+ ").style(prefix_style), prefix_cols[0]);
         frame.render_widget(&self.new_comment, prefix_cols[1]);
     }
 
     fn draw_blockers(&mut self, frame: &mut Frame, area: Rect) {
         let focused = FIELDS[self.focus] == Field::Blockers;
-        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let border = if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
         let block = Block::bordered()
             .title(format!("Blockers ({})", self.blockers.len()))
             .border_style(Style::default().fg(border));
@@ -953,8 +979,7 @@ impl TodoForm {
             })
             .collect();
         let body = if lines.is_empty() {
-            Paragraph::new(" (no blockers)")
-                .style(Style::default().fg(Color::DarkGray))
+            Paragraph::new(" (no blockers)").style(Style::default().fg(Color::DarkGray))
         } else {
             Paragraph::new(lines)
         };
@@ -962,11 +987,14 @@ impl TodoForm {
 
         let add_focused = focused && self.blocker_cursor == self.blockers.len();
         let prefix_style = if add_focused {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let prefix_cols = Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).split(inner_rows[1]);
+        let prefix_cols =
+            Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).split(inner_rows[1]);
         frame.render_widget(Paragraph::new("+ id: ").style(prefix_style), prefix_cols[0]);
         frame.render_widget(&self.new_blocker, prefix_cols[1]);
     }
@@ -979,13 +1007,15 @@ impl TodoForm {
             Field::Title => &mut self.title,
             Field::Assignee => &mut self.assignee,
             Field::Tags => &mut self.tags,
-            Field::Status
-            | Field::Priority
-            | Field::Body
-            | Field::Comments
-            | Field::Blockers => return,
+            Field::Status | Field::Priority | Field::Body | Field::Comments | Field::Blockers => {
+                return
+            }
         };
-        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let border = if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
         area.set_block(
             Block::bordered()
                 .title(label)
@@ -1022,7 +1052,9 @@ pub(crate) fn text_area(initial: &str) -> TextArea<'static> {
 /// Render a cyclable enum field as a one-line `Label: < value >`.
 fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
     let style = if focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
     };
@@ -1123,7 +1155,12 @@ pub(crate) fn index_of(options: &[&str], value: &str) -> usize {
 /// The non-empty strings of a JSON array value.
 pub(crate) fn string_list(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 

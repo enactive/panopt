@@ -20,8 +20,8 @@ use std::io::stdout;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -111,10 +111,9 @@ impl Target {
     fn content_path(&self, ws: &Path) -> Option<PathBuf> {
         let panopt = ws.join(".panopt");
         match self {
-            Target::Todo(_)
-            | Target::NewTodo
-            | Target::Scratchpad(_)
-            | Target::NewScratchpad => None,
+            Target::Todo(_) | Target::NewTodo | Target::Scratchpad(_) | Target::NewScratchpad => {
+                None
+            }
             Target::TodoList => Some(panopt.join("todos.md")),
             Target::ScratchpadList => Some(panopt.join("scratchpads.md")),
             Target::Empty => None,
@@ -177,9 +176,13 @@ pub fn run(
     // mode), which `tui_textarea` interprets as `delete_line_by_head` - the
     // pasted text scrubs itself across the field as each line break fires the
     // shortcut. Failing to enable is non-fatal: typed input still works.
-    let _ = execute!(stdout(), EnableBracketedPaste);
+    // Mouse capture lets the viewer receive clicks on list rows so the user
+    // can open todos and scratchpads by clicking, matching the sidebar's
+    // click-to-activate behaviour. Failing to enable is non-fatal: keyboard
+    // navigation still works.
+    let _ = execute!(stdout(), EnableBracketedPaste, EnableMouseCapture);
     let outcome = viewer.event_loop(&mut terminal);
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
 
     // The viewer is long-lived, but an explicit close is the user closing it;
@@ -258,6 +261,7 @@ impl Viewer {
                         }
                     }
                     Event::Paste(s) => self.handle_paste(&s),
+                    Event::Mouse(m) => self.handle_mouse(m),
                     Event::Resize(_, _) => self.needs_draw = true,
                     _ => {}
                 }
@@ -285,7 +289,8 @@ impl Viewer {
                         let _ = form.flush();
                         return true;
                     }
-                    crate::todo_form::TodoFormAction::Dirty | crate::todo_form::TodoFormAction::Idle => {}
+                    crate::todo_form::TodoFormAction::Dirty
+                    | crate::todo_form::TodoFormAction::Idle => {}
                 }
                 self.needs_draw = true;
                 false
@@ -343,6 +348,52 @@ impl Viewer {
         }
     }
 
+    /// Handle a mouse event. In list mode a left-click on a row both selects
+    /// and opens it, matching the sidebar's click-to-activate behaviour;
+    /// scroll wheel moves the cursor or scroll offset by one. Form modes
+    /// ignore mouse input for now - their fields are keyboard-driven.
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = self.list_row_at(m.row) {
+                    self.cursor = idx;
+                    self.open_selected();
+                    self.needs_draw = true;
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if matches!(self.content, Content::List(_) | Content::Doc(_)) {
+                    self.move_by(-1);
+                    self.needs_draw = true;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if matches!(self.content, Content::List(_) | Content::Doc(_)) {
+                    self.move_by(1);
+                    self.needs_draw = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The list entry index at terminal row `row`, or `None` when the row
+    /// falls on the header, the footer, or past the last entry. The body
+    /// always starts at row 1 (right after the 1-row header) and is
+    /// `viewport` rows tall.
+    fn list_row_at(&self, row: u16) -> Option<usize> {
+        let Content::List(entries) = &self.content else {
+            return None;
+        };
+        if row == 0 || row > self.viewport {
+            return None;
+        }
+        let body_row = (row - 1) as usize;
+        let start = list_scroll(self.cursor, self.viewport as usize, entries.len());
+        let idx = start + body_row;
+        (idx < entries.len()).then_some(idx)
+    }
+
     /// Move the cursor (list mode) or the scroll offset (document mode) by
     /// `delta` rows, clamped to the content.
     fn move_by(&mut self, delta: i64) {
@@ -389,7 +440,10 @@ impl Viewer {
         viewstate::set(
             &self.ws,
             &self.target.key(),
-            ViewState { scroll: self.scroll, cursor: self.cursor },
+            ViewState {
+                scroll: self.scroll,
+                cursor: self.cursor,
+            },
         );
         self.target = target;
         let vs = viewstate::get(&self.ws, &self.target.key());
@@ -554,8 +608,12 @@ impl Viewer {
     fn draw_body(&self, frame: &mut Frame, area: Rect) {
         match &self.content {
             Content::Doc(lines) => {
-                let text =
-                    Text::from(lines.iter().map(|l| Line::from(l.clone())).collect::<Vec<_>>());
+                let text = Text::from(
+                    lines
+                        .iter()
+                        .map(|l| Line::from(l.clone()))
+                        .collect::<Vec<_>>(),
+                );
                 frame.render_widget(
                     Paragraph::new(text)
                         .wrap(Wrap { trim: false })
@@ -589,8 +647,7 @@ impl Viewer {
             }
             Content::Message(msg) => {
                 frame.render_widget(
-                    Paragraph::new(format!(" {msg}"))
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Paragraph::new(format!(" {msg}")).style(Style::default().fg(Color::DarkGray)),
                     area,
                 );
             }
@@ -721,10 +778,9 @@ mod tests {
     fn parses_a_scratchpad_index_line_with_updated_timestamp() {
         // The post-V4 index line ends in `- updated <ts>`; the parser keeps
         // that suffix as the label, which the viewer's list mode displays.
-        let (id, label) = parse_index_line(
-            "- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21",
-        )
-        .unwrap();
+        let (id, label) =
+            parse_index_line("- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21")
+                .unwrap();
         assert_eq!(id, 1);
         assert_eq!(label, "Sample Notes - updated 2026-05-23 18:05:21");
     }
@@ -739,7 +795,10 @@ mod tests {
     fn target_parse_and_key_round_trip() {
         assert_eq!(Target::parse("todo", Some(4)), Some(Target::Todo(4)));
         assert_eq!(Target::parse("new-todo", None), Some(Target::NewTodo));
-        assert_eq!(Target::parse("scratchpad-list", None), Some(Target::ScratchpadList));
+        assert_eq!(
+            Target::parse("scratchpad-list", None),
+            Some(Target::ScratchpadList)
+        );
         assert_eq!(Target::parse("empty", None), Some(Target::Empty));
         assert_eq!(Target::parse("todo", None), None);
         assert_eq!(Target::Todo(4).key(), "todo:4");
@@ -777,7 +836,78 @@ mod tests {
 
     #[test]
     fn parse_recognizes_new_scratchpad() {
-        assert_eq!(Target::parse("new-scratchpad", None), Some(Target::NewScratchpad));
-        assert_eq!(Target::parse("scratchpad", Some(7)), Some(Target::Scratchpad(7)));
+        assert_eq!(
+            Target::parse("new-scratchpad", None),
+            Some(Target::NewScratchpad)
+        );
+        assert_eq!(
+            Target::parse("scratchpad", Some(7)),
+            Some(Target::Scratchpad(7))
+        );
+    }
+
+    /// A viewer with `n` list entries and the given viewport height, used to
+    /// exercise the click-to-row mapping without touching the filesystem or
+    /// the daemon.
+    fn viewer_with_list(n: usize, viewport: u16, cursor: usize) -> Viewer {
+        let entries = (0..n)
+            .map(|i| ListEntry {
+                target: Target::Todo(i as u64),
+                label: format!("#{i}"),
+            })
+            .collect();
+        Viewer {
+            ws: PathBuf::from("/tmp"),
+            url: String::new(),
+            routing_path: PathBuf::from("/tmp/route.json"),
+            routing_mtime: None,
+            target: Target::TodoList,
+            content: Content::List(entries),
+            content_mtime: None,
+            scroll: 0,
+            cursor,
+            viewport,
+            last_refresh: Instant::now(),
+            needs_draw: false,
+        }
+    }
+
+    #[test]
+    fn list_row_at_maps_terminal_row_to_entry() {
+        // Body rows 1..=viewport map to entries; row 0 is the header, anything
+        // past `viewport` is the footer or below.
+        let viewer = viewer_with_list(5, 5, 0);
+        assert_eq!(viewer.list_row_at(0), None);
+        assert_eq!(viewer.list_row_at(1), Some(0));
+        assert_eq!(viewer.list_row_at(5), Some(4));
+        assert_eq!(viewer.list_row_at(6), None);
+    }
+
+    #[test]
+    fn list_row_at_respects_scroll_offset() {
+        // With more entries than viewport rows, the cursor near the bottom
+        // scrolls the visible window; a click at body row 0 then resolves to
+        // the first visible entry, not entry 0.
+        let viewer = viewer_with_list(20, 5, 19);
+        let start = list_scroll(viewer.cursor, viewer.viewport as usize, 20);
+        assert_eq!(viewer.list_row_at(1), Some(start));
+        assert_eq!(viewer.list_row_at(5), Some(start + 4));
+    }
+
+    #[test]
+    fn list_row_at_returns_none_past_the_last_entry() {
+        // A 2-entry list in a 5-row viewport: rows 1 and 2 are entries; rows
+        // 3..=5 are empty body space and resolve to None.
+        let viewer = viewer_with_list(2, 5, 0);
+        assert_eq!(viewer.list_row_at(1), Some(0));
+        assert_eq!(viewer.list_row_at(2), Some(1));
+        assert_eq!(viewer.list_row_at(3), None);
+    }
+
+    #[test]
+    fn list_row_at_is_none_outside_list_mode() {
+        let mut viewer = viewer_with_list(5, 5, 0);
+        viewer.content = Content::Message("hello".to_string());
+        assert_eq!(viewer.list_row_at(1), None);
     }
 }
