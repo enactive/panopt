@@ -408,9 +408,11 @@ with no server.
 
 Four tables: `projects`, `todos`, `scratchpads`, and `roster` (Section 6.6).
 The `todos`, `scratchpads`, and `roster` rows are keyed by `(project_id, id)`,
-so ids restart at 1 in each project and read naturally in the projected files. Per-project id counters live
-on the `projects` row and are bumped in the same transaction as the insert, so
-an id is never handed out twice and never reused after a deletion. Each mutation
+so ids restart at 1 in each project and read naturally in the projected files.
+A single per-project `next_id` counter on the `projects` row is shared across
+all three resource types and bumped in the same transaction as the insert, so
+an id is never handed out twice, never reused after a deletion, and a `#N`
+reference points to exactly one resource. Each mutation
 commits its transaction and then re-projects the affected `.panopt/` file; the
 first time a project is touched in a daemon run, every file is re-projected from
 the database, which both initializes a new project and self-heals a restarted

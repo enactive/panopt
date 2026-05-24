@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -123,12 +123,47 @@ CREATE TABLE roster (
 /// `user_version` bump landed - upgrades cleanly instead of failing on
 /// "duplicate column name". The backfill is unconditionally safe.
 fn apply_v4(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(conn, "scratchpads", "created_at", "TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(conn, "scratchpads", "updated_at", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(
+        conn,
+        "scratchpads",
+        "created_at",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "scratchpads",
+        "updated_at",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     conn.execute_batch(
         "UPDATE scratchpads
             SET created_at = datetime('now'), updated_at = datetime('now')
           WHERE created_at = '';",
+    )
+}
+
+/// Version 5: unify per-resource id counters into one global `next_id` (todo #16).
+///
+/// Before V5 every project row carried three independent counters -
+/// `next_todo_id`, `next_scratchpad_id`, `next_roster_id` - so the same number
+/// could be handed out as a todo *and* a scratchpad *and* a roster entry. V5
+/// replaces them with a single `next_id` so a `#N` reference points to exactly
+/// one resource type forever. Existing rows are left in place: SQLite's
+/// `(project_id, id)` primary keys are per-table, so any collision in the
+/// pre-V5 data persists as-is and only the fresh allocations after the
+/// migration are guaranteed unique.
+///
+/// The seed for `next_id` is `max(old three counters)`, which is the lowest
+/// value safe against every pre-existing id in any of the three tables. The
+/// three old columns are then dropped.
+fn apply_v5(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "ALTER TABLE projects ADD COLUMN next_id INTEGER NOT NULL DEFAULT 1;
+         UPDATE projects
+            SET next_id = MAX(next_todo_id, next_scratchpad_id, next_roster_id);
+         ALTER TABLE projects DROP COLUMN next_todo_id;
+         ALTER TABLE projects DROP COLUMN next_scratchpad_id;
+         ALTER TABLE projects DROP COLUMN next_roster_id;",
     )
 }
 
@@ -176,6 +211,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
     if version < 4 {
         apply_v4(conn)?;
+    }
+    if version < 5 {
+        apply_v5(conn)?;
     }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -241,7 +279,9 @@ mod tests {
             .unwrap();
         assert_eq!(priority, "medium");
         let created: String = conn
-            .query_row("SELECT created_at FROM todos WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT created_at FROM todos WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(!created.is_empty(), "created_at should be backfilled");
     }
@@ -257,7 +297,9 @@ mod tests {
         )
         .unwrap();
         let next: i64 = conn
-            .query_row("SELECT next_roster_id FROM projects WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT next_id FROM projects WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(next, 1);
     }
@@ -347,9 +389,14 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         // The backfill still runs, so the empty timestamps land at real ones.
         let updated: String = conn
-            .query_row("SELECT updated_at FROM scratchpads WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT updated_at FROM scratchpads WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert!(!updated.is_empty(), "updated_at backfilled even in the drift case");
+        assert!(
+            !updated.is_empty(),
+            "updated_at backfilled even in the drift case"
+        );
     }
 
     #[test]
@@ -376,8 +423,64 @@ mod tests {
         )
         .unwrap();
         let next: i64 = conn
-            .query_row("SELECT next_roster_id FROM projects WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT next_id FROM projects WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn v4_database_upgrades_to_v5_in_place() {
+        // Stand up a V4 database by hand: V1+V2+V3 schema, V4 column adds, then
+        // pin user_version=4. Three resources at id 4 in three tables - the
+        // collision V5 forever prevents going forward - and the three counters
+        // disagree so we can prove V5 takes the max.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, next_todo_id, next_scratchpad_id, next_roster_id)
+                 VALUES (1, '/x', 5, 3, 7);
+             INSERT INTO todos (project_id, id, title, status, priority, created_at, updated_at)
+                 VALUES (1, 4, 't', 'open', 'high', '', '');
+             INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+                 VALUES (1, 4, 's', '', datetime('now'), datetime('now'));
+             INSERT INTO roster (project_id, id, kind, name, created_at)
+                 VALUES (1, 4, 'agent', 'r', '');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The unified counter is the max of the three old ones.
+        let next: i64 = conn
+            .query_row("SELECT next_id FROM projects WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(next, 7);
+
+        // The three old columns are gone.
+        for col in ["next_todo_id", "next_scratchpad_id", "next_roster_id"] {
+            let mut stmt = conn.prepare("PRAGMA table_info(projects)").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            let mut present = false;
+            while let Some(row) = rows.next().unwrap() {
+                let name: String = row.get(1).unwrap();
+                if name == col {
+                    present = true;
+                }
+            }
+            assert!(!present, "{col} should have been dropped");
+        }
     }
 }

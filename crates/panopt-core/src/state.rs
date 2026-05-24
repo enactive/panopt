@@ -70,13 +70,17 @@ impl Store {
     /// process bootstraps its `.panopt/` tree and re-projects every file from
     /// current state.
     pub fn ensure_project(&mut self, root: &Path) -> Result<ProjectId, CoreError> {
-        let canonical = std::fs::canonicalize(root)
-            .map_err(|_| CoreError::Workspace(root.to_path_buf()))?;
+        let canonical =
+            std::fs::canonicalize(root).map_err(|_| CoreError::Workspace(root.to_path_buf()))?;
         let root_str = canonical.to_string_lossy().into_owned();
 
         let existing: Option<i64> = self
             .conn
-            .query_row("SELECT id FROM projects WHERE root = ?1", [&root_str], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM projects WHERE root = ?1",
+                [&root_str],
+                |r| r.get(0),
+            )
             .optional()?;
         let id = match existing {
             Some(id) => id,
@@ -267,14 +271,14 @@ impl Store {
         let pid = project.0;
         let id = {
             let tx = self.conn.transaction()?;
-            let next = next_id(&tx, pid, "next_scratchpad_id")?;
+            let next = next_id(&tx, pid)?;
             tx.execute(
                 "INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
                  VALUES (?1, ?2, ?3, '', datetime('now'), datetime('now'))",
                 params![pid, next, title],
             )?;
             tx.execute(
-                "UPDATE projects SET next_scratchpad_id = ?1 WHERE id = ?2",
+                "UPDATE projects SET next_id = ?1 WHERE id = ?2",
                 params![next + 1, pid],
             )?;
             tx.commit()?;
@@ -411,15 +415,24 @@ impl Store {
         let pid = project.0;
         let id = {
             let tx = self.conn.transaction()?;
-            let next = next_id(&tx, pid, "next_roster_id")?;
+            let next = next_id(&tx, pid)?;
             tx.execute(
                 "INSERT INTO roster
                     (project_id, id, kind, name, display_name, command, cwd, position, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
-                params![pid, next, kind.as_str(), name, display_name, command, cwd, next],
+                params![
+                    pid,
+                    next,
+                    kind.as_str(),
+                    name,
+                    display_name,
+                    command,
+                    cwd,
+                    next
+                ],
             )?;
             tx.execute(
-                "UPDATE projects SET next_roster_id = ?1 WHERE id = ?2",
+                "UPDATE projects SET next_id = ?1 WHERE id = ?2",
                 params![next + 1, pid],
             )?;
             tx.commit()?;
@@ -541,14 +554,14 @@ impl Store {
         let pid = project.0;
         let id = {
             let tx = self.conn.transaction()?;
-            let next = next_id(&tx, pid, "next_todo_id")?;
+            let next = next_id(&tx, pid)?;
             tx.execute(
                 "INSERT INTO todos (project_id, id, title, status, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'open', datetime('now'), datetime('now'))",
                 params![pid, next, title],
             )?;
             tx.execute(
-                "UPDATE projects SET next_todo_id = ?1 WHERE id = ?2",
+                "UPDATE projects SET next_id = ?1 WHERE id = ?2",
                 params![next + 1, pid],
             )?;
             tx.commit()?;
@@ -568,7 +581,9 @@ impl Store {
             let rows = stmt.query_map([project.0], |r| Ok(r.get::<_, i64>(0)? as u64))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        ids.into_iter().map(|id| self.fetch_todo(project, id)).collect()
+        ids.into_iter()
+            .map(|id| self.fetch_todo(project, id))
+            .collect()
     }
 
     /// Fetch one todo in full, or [`CoreError::TodoNotFound`] if it is absent.
@@ -747,7 +762,10 @@ impl Store {
         if changed == 0 {
             // The comment row is missing; surface whichever id is at fault.
             self.fetch_todo(project, todo_id)?;
-            return Err(CoreError::TodoCommentNotFound { todo_id, comment_id });
+            return Err(CoreError::TodoCommentNotFound {
+                todo_id,
+                comment_id,
+            });
         }
         self.touch_todo(project, todo_id)?;
         self.reproject_todos(project)
@@ -769,7 +787,10 @@ impl Store {
         )?;
         if changed == 0 {
             self.fetch_todo(project, todo_id)?;
-            return Err(CoreError::TodoCommentNotFound { todo_id, comment_id });
+            return Err(CoreError::TodoCommentNotFound {
+                todo_id,
+                comment_id,
+            });
         }
         self.touch_todo(project, todo_id)?;
         self.reproject_todos(project)
@@ -909,8 +930,9 @@ impl Store {
             "SELECT blocker_id FROM todo_blockers
               WHERE project_id = ?1 AND todo_id = ?2 ORDER BY blocker_id",
         )?;
-        let rows = stmt
-            .query_map(params![project.0, id as i64], |r| Ok(r.get::<_, i64>(0)? as u64))?;
+        let rows = stmt.query_map(params![project.0, id as i64], |r| {
+            Ok(r.get::<_, i64>(0)? as u64)
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -936,7 +958,11 @@ impl Store {
     fn project_root(&self, project: ProjectId) -> Result<PathBuf, CoreError> {
         let root: String = self
             .conn
-            .query_row("SELECT root FROM projects WHERE id = ?1", [project.0], |r| r.get(0))
+            .query_row(
+                "SELECT root FROM projects WHERE id = ?1",
+                [project.0],
+                |r| r.get(0),
+            )
             .optional()?
             .ok_or(CoreError::ProjectNotFound(project.0))?;
         Ok(PathBuf::from(root))
@@ -964,11 +990,7 @@ impl Store {
     /// mutation that touches a scratchpad refreshes the projection completely.
     /// The single helper makes the index step impossible for a caller to skip,
     /// matching the all-or-nothing shape `reproject_todos` already has.
-    fn reproject_scratchpad_full(
-        &self,
-        project: ProjectId,
-        id: u64,
-    ) -> Result<(), CoreError> {
+    fn reproject_scratchpad_full(&self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         self.reproject_scratchpad(project, id)?;
         self.reproject_scratchpads_index(project)
     }
@@ -1028,15 +1050,13 @@ impl Store {
     }
 }
 
-/// Read a project's next-id counter, mapping a missing project row to
-/// [`CoreError::ProjectNotFound`]. `column` is a fixed in-crate identifier, not
-/// caller input, so interpolating it into the SQL is safe.
-fn next_id(conn: &Connection, pid: i64, column: &str) -> Result<i64, CoreError> {
-    conn.query_row(
-        &format!("SELECT {column} FROM projects WHERE id = ?1"),
-        [pid],
-        |r| r.get(0),
-    )
+/// Read a project's global `next_id` counter, mapping a missing project row to
+/// [`CoreError::ProjectNotFound`]. The counter is shared across todos,
+/// scratchpads, and roster entries, so a `#N` reference is unambiguous.
+fn next_id(conn: &Connection, pid: i64) -> Result<i64, CoreError> {
+    conn.query_row("SELECT next_id FROM projects WHERE id = ?1", [pid], |r| {
+        r.get(0)
+    })
     .optional()?
     .ok_or(CoreError::ProjectNotFound(pid))
 }
@@ -1079,12 +1099,29 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_ids_are_independent_of_todos() {
+    fn ids_are_globally_unique_across_resource_types() {
+        // Todo #16: one shared sequence so `#N` resolves to exactly one
+        // resource. A todo, then a scratchpad, then a roster entry must all
+        // get distinct ids in creation order.
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
-        fx.store.todo_create(p, "a".into()).unwrap();
-        assert_eq!(fx.store.scratchpad_create(p, "pad".into()).unwrap(), 1);
-        assert_eq!(fx.store.scratchpad_create(p, "pad2".into()).unwrap(), 2);
+        assert_eq!(fx.store.todo_create(p, "a".into()).unwrap(), 1);
+        assert_eq!(fx.store.scratchpad_create(p, "pad".into()).unwrap(), 2);
+        assert_eq!(
+            fx.store
+                .roster_create(
+                    p,
+                    RosterKind::Command,
+                    "r".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(fx.store.todo_create(p, "b".into()).unwrap(), 4);
+        assert_eq!(fx.store.scratchpad_create(p, "pad2".into()).unwrap(), 5);
     }
 
     #[test]
@@ -1143,7 +1180,10 @@ mod tests {
             .scratchpad_update(
                 p,
                 id,
-                ScratchpadPatch { title: Some("renamed".into()), body: None },
+                ScratchpadPatch {
+                    title: Some("renamed".into()),
+                    body: None,
+                },
             )
             .unwrap();
         let pad = fx.store.scratchpad_get(p, id).unwrap();
@@ -1155,7 +1195,10 @@ mod tests {
             .scratchpad_update(
                 p,
                 id,
-                ScratchpadPatch { title: None, body: Some("rewritten".into()) },
+                ScratchpadPatch {
+                    title: None,
+                    body: Some("rewritten".into()),
+                },
             )
             .unwrap();
         let pad = fx.store.scratchpad_get(p, id).unwrap();
@@ -1175,7 +1218,10 @@ mod tests {
             .scratchpad_update(
                 p,
                 id,
-                ScratchpadPatch { title: None, body: Some("new body".into()) },
+                ScratchpadPatch {
+                    title: None,
+                    body: Some("new body".into()),
+                },
             )
             .unwrap();
 
@@ -1183,7 +1229,10 @@ mod tests {
         assert!(after > before, "updated_at must advance on update");
 
         let pad_file = std::fs::read_to_string(root.join(".panopt/scratchpad/1.md")).unwrap();
-        assert!(pad_file.contains("new body"), "per-pad projection refreshed");
+        assert!(
+            pad_file.contains("new body"),
+            "per-pad projection refreshed"
+        );
     }
 
     #[test]
@@ -1214,7 +1263,10 @@ mod tests {
         );
 
         let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
-        assert!(!index.contains("notes"), "index no longer lists the pad\n{index}");
+        assert!(
+            !index.contains("notes"),
+            "index no longer lists the pad\n{index}"
+        );
     }
 
     #[test]
@@ -1249,7 +1301,10 @@ mod tests {
         assert_eq!(done.status, TodoStatus::Completed);
         assert!(done.completed_at.is_some());
         fx.store.todo_complete(p, id).unwrap(); // idempotent
-        assert_eq!(fx.store.todo_get(p, id).unwrap().status, TodoStatus::Completed);
+        assert_eq!(
+            fx.store.todo_get(p, id).unwrap().status,
+            TodoStatus::Completed
+        );
     }
 
     #[test]
@@ -1283,10 +1338,17 @@ mod tests {
         let id = fx.store.todo_create(p, "task".into()).unwrap();
         assert!(fx.store.todo_get(p, id).unwrap().completed_at.is_none());
 
-        let to = |s| TodoPatch { status: Some(s), ..Default::default() };
-        fx.store.todo_update(p, id, to(TodoStatus::Completed)).unwrap();
+        let to = |s| TodoPatch {
+            status: Some(s),
+            ..Default::default()
+        };
+        fx.store
+            .todo_update(p, id, to(TodoStatus::Completed))
+            .unwrap();
         assert!(fx.store.todo_get(p, id).unwrap().completed_at.is_some());
-        fx.store.todo_update(p, id, to(TodoStatus::InProgress)).unwrap();
+        fx.store
+            .todo_update(p, id, to(TodoStatus::InProgress))
+            .unwrap();
         assert!(fx.store.todo_get(p, id).unwrap().completed_at.is_none());
     }
 
@@ -1322,12 +1384,17 @@ mod tests {
         let a = fx.store.todo_create(p, "a".into()).unwrap();
         let b = fx.store.todo_create(p, "b".into()).unwrap();
         fx.store.todo_add_blocker(p, b, a).unwrap();
-        fx.store.todo_comment_add(p, a, "me".into(), "note".into()).unwrap();
+        fx.store
+            .todo_comment_add(p, a, "me".into(), "note".into())
+            .unwrap();
 
         // Deleting a (the blocker) cascades away the (b blocked-by a) row.
         fx.store.todo_delete(p, a).unwrap();
         assert!(fx.store.todo_get(p, b).unwrap().blockers.is_empty());
-        assert!(matches!(fx.store.todo_get(p, a), Err(CoreError::TodoNotFound(_))));
+        assert!(matches!(
+            fx.store.todo_get(p, a),
+            Err(CoreError::TodoNotFound(_))
+        ));
     }
 
     #[test]
@@ -1341,7 +1408,9 @@ mod tests {
             .unwrap();
         let original = fx.store.todo_get(p, id).unwrap().comments[0].clone();
 
-        fx.store.todo_comment_update(p, id, cid, "polished".into()).unwrap();
+        fx.store
+            .todo_comment_update(p, id, cid, "polished".into())
+            .unwrap();
         let after = fx.store.todo_get(p, id).unwrap().comments[0].clone();
         assert_eq!(after.body, "polished");
         assert_eq!(after.author, original.author);
@@ -1353,8 +1422,14 @@ mod tests {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
         let id = fx.store.todo_create(p, "task".into()).unwrap();
-        let c1 = fx.store.todo_comment_add(p, id, "a".into(), "1".into()).unwrap();
-        let _c2 = fx.store.todo_comment_add(p, id, "a".into(), "2".into()).unwrap();
+        let c1 = fx
+            .store
+            .todo_comment_add(p, id, "a".into(), "1".into())
+            .unwrap();
+        let _c2 = fx
+            .store
+            .todo_comment_add(p, id, "a".into(), "2".into())
+            .unwrap();
 
         fx.store.todo_comment_delete(p, id, c1).unwrap();
         let comments = fx.store.todo_get(p, id).unwrap().comments;
@@ -1362,7 +1437,10 @@ mod tests {
         assert_eq!(comments[0].body, "2");
 
         // The next add lands at 3, not 1: ids never recycle.
-        let c3 = fx.store.todo_comment_add(p, id, "a".into(), "3".into()).unwrap();
+        let c3 = fx
+            .store
+            .todo_comment_add(p, id, "a".into(), "3".into())
+            .unwrap();
         assert_eq!(c3, 3);
     }
 
@@ -1424,12 +1502,29 @@ mod tests {
         let a = fx.store.todo_create(p, "a".into()).unwrap();
         let b = fx.store.todo_create(p, "b".into()).unwrap();
         fx.store
-            .todo_update(p, a, TodoPatch { tags: Some(vec!["zeta".into(), "alpha".into()]), ..Default::default() })
+            .todo_update(
+                p,
+                a,
+                TodoPatch {
+                    tags: Some(vec!["zeta".into(), "alpha".into()]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         fx.store
-            .todo_update(p, b, TodoPatch { tags: Some(vec!["beta".into(), "alpha".into()]), ..Default::default() })
+            .todo_update(
+                p,
+                b,
+                TodoPatch {
+                    tags: Some(vec!["beta".into(), "alpha".into()]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        assert_eq!(fx.store.todo_tags_list(p).unwrap(), vec!["alpha", "beta", "zeta"]);
+        assert_eq!(
+            fx.store.todo_tags_list(p).unwrap(),
+            vec!["alpha", "beta", "zeta"]
+        );
     }
 
     #[test]
@@ -1438,9 +1533,24 @@ mod tests {
         let (p, _) = fx.project("proj");
         let a = fx.store.todo_create(p, "a".into()).unwrap();
         let b = fx.store.todo_create(p, "b".into()).unwrap();
-        assert_eq!(fx.store.todo_comment_add(p, a, "x".into(), "1".into()).unwrap(), 1);
-        assert_eq!(fx.store.todo_comment_add(p, a, "x".into(), "2".into()).unwrap(), 2);
-        assert_eq!(fx.store.todo_comment_add(p, b, "y".into(), "1".into()).unwrap(), 1);
+        assert_eq!(
+            fx.store
+                .todo_comment_add(p, a, "x".into(), "1".into())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fx.store
+                .todo_comment_add(p, a, "x".into(), "2".into())
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            fx.store
+                .todo_comment_add(p, b, "y".into(), "1".into())
+                .unwrap(),
+            1
+        );
         let comments = fx.store.todo_get(p, a).unwrap().comments;
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].body, "1");
@@ -1472,7 +1582,13 @@ mod tests {
         for t in ["a", "b", "c"] {
             fx.store.todo_create(p, t.into()).unwrap();
         }
-        let ids: Vec<u64> = fx.store.todo_list(p).unwrap().iter().map(|t| t.id).collect();
+        let ids: Vec<u64> = fx
+            .store
+            .todo_list(p)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
         assert_eq!(ids, vec![1, 2, 3]);
     }
 
@@ -1501,14 +1617,20 @@ mod tests {
 
         let tid = fx.store.todo_create(p, "wire up auth".into()).unwrap();
         let index = std::fs::read_to_string(root.join(".panopt/todos.md")).unwrap();
-        assert!(index.contains("- [ ] [#1](todos/1.md) wire up auth"), "{index}");
+        assert!(
+            index.contains("- [ ] [#1](todos/1.md) wire up auth"),
+            "{index}"
+        );
         let todo_md = std::fs::read_to_string(root.join(".panopt/todos/1.md")).unwrap();
         assert!(todo_md.contains("status: open"), "{todo_md}");
         assert!(todo_md.contains("# wire up auth"), "{todo_md}");
 
         fx.store.todo_complete(p, tid).unwrap();
         let index = std::fs::read_to_string(root.join(".panopt/todos.md")).unwrap();
-        assert!(index.contains("- [x] [#1](todos/1.md) wire up auth"), "{index}");
+        assert!(
+            index.contains("- [x] [#1](todos/1.md) wire up auth"),
+            "{index}"
+        );
         let todo_md = std::fs::read_to_string(root.join(".panopt/todos/1.md")).unwrap();
         assert!(todo_md.contains("status: completed"), "{todo_md}");
 
@@ -1545,8 +1667,9 @@ mod tests {
             let todos = store.todo_list(p).unwrap();
             assert_eq!(todos.len(), 1);
             assert_eq!(todos[0].title, "persist me");
-            // The id counter resumes past the persisted row.
-            assert_eq!(store.todo_create(p, "another".into()).unwrap(), 2);
+            // The shared id counter resumes past the persisted todo (id 1)
+            // and persisted scratchpad (id 2), so the next id is 3.
+            assert_eq!(store.todo_create(p, "another".into()).unwrap(), 3);
         }
     }
 
@@ -1611,7 +1734,9 @@ mod tests {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
         fx.store.agent_touch(p, "a").unwrap();
-        fx.store.agent_identify(p, "a", "backend".into(), None).unwrap();
+        fx.store
+            .agent_identify(p, "a", "backend".into(), None)
+            .unwrap();
         fx.store.agent_touch(p, "b").unwrap();
 
         // `a` acquires; `b` is denied and sees the holder's resolved name.
@@ -1634,7 +1759,10 @@ mod tests {
 
         // `a` releases; `b` can then take it.
         assert_eq!(fx.store.lock_release(p, "a", "auth").unwrap(), None);
-        assert_eq!(fx.store.lock_acquire(p, "b", "auth".into(), None).unwrap(), None);
+        assert_eq!(
+            fx.store.lock_acquire(p, "b", "auth".into(), None).unwrap(),
+            None
+        );
 
         let locks = fx.store.lock_list(p);
         assert_eq!(locks.len(), 1);
@@ -1647,9 +1775,15 @@ mod tests {
         let (a, _) = fx.project("alpha");
         let (b, _) = fx.project("beta");
 
-        assert_eq!(fx.store.lock_acquire(a, "x", "build".into(), None).unwrap(), None);
+        assert_eq!(
+            fx.store.lock_acquire(a, "x", "build".into(), None).unwrap(),
+            None
+        );
         // The same name in another project is unaffected.
-        assert_eq!(fx.store.lock_acquire(b, "y", "build".into(), None).unwrap(), None);
+        assert_eq!(
+            fx.store.lock_acquire(b, "y", "build".into(), None).unwrap(),
+            None
+        );
         assert_eq!(fx.store.lock_list(a).len(), 1);
         assert_eq!(fx.store.lock_list(b).len(), 1);
     }
@@ -1685,7 +1819,10 @@ mod tests {
             .roster_update(
                 p,
                 id,
-                RosterPatch { command: Some("claude".into()), ..Default::default() },
+                RosterPatch {
+                    command: Some("claude".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert_eq!(fx.store.roster_get(p, id).unwrap().command, "claude");
@@ -1699,28 +1836,18 @@ mod tests {
     }
 
     #[test]
-    fn roster_ids_are_independent_of_todos_and_scratchpads() {
-        let mut fx = Fixture::new();
-        let (p, _) = fx.project("proj");
-        fx.store.todo_create(p, "a".into()).unwrap();
-        fx.store.scratchpad_create(p, "pad".into()).unwrap();
-        let kind = RosterKind::Command;
-        assert_eq!(
-            fx.store
-                .roster_create(p, kind, "run".into(), String::new(), "make".into(), String::new())
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
     fn scratchpad_create_projects_the_index() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        fx.store.scratchpad_create(p, "design notes".into()).unwrap();
+        fx.store
+            .scratchpad_create(p, "design notes".into())
+            .unwrap();
         fx.store.scratchpad_create(p, "scratch".into()).unwrap();
         let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
-        assert!(index.contains("- [#1](scratchpad/1.md) design notes"), "{index}");
+        assert!(
+            index.contains("- [#1](scratchpad/1.md) design notes"),
+            "{index}"
+        );
         assert!(index.contains("- [#2](scratchpad/2.md) scratch"), "{index}");
     }
 }
