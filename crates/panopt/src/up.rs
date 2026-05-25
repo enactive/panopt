@@ -172,8 +172,11 @@ pub fn run(plugin: Option<PathBuf>, port: u16) -> Result<()> {
     Err(err).context("could not exec `zellij`")
 }
 
-/// The cockpit session name for a project: `panopt-<basename>`, with the
-/// basename reduced to characters Zellij accepts in a session name.
+/// The cockpit session name for a project: `panopt-<basename>-<hash>`. The
+/// basename is reduced to characters Zellij accepts; the hash is a short
+/// fingerprint of the canonical project path, so two projects sharing a
+/// basename (`~/a/frontend`, `~/b/frontend`) land on distinct sessions
+/// instead of one silently attaching to the other's cockpit.
 fn session_name(project: &Path) -> String {
     let base = project
         .file_name()
@@ -183,7 +186,18 @@ fn session_name(project: &Path) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    format!("panopt-{safe}")
+    let hash = short_path_hash(project);
+    format!("panopt-{safe}-{hash}")
+}
+
+/// Stable 7-hex-char fingerprint of the canonical project path. Used as the
+/// disambiguating suffix on the cockpit session name; see [`session_name`].
+fn short_path_hash(project: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    project.hash(&mut hasher);
+    let h = hasher.finish();
+    format!("{h:016x}").chars().take(7).collect()
 }
 
 /// Whether a Zellij session named `name` exists, and if so whether it is live
@@ -235,8 +249,7 @@ fn strip_ansi(s: &str) -> String {
 fn default_plugin_wasm() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let repo = exe.ancestors().nth(3)?;
-    let wasm =
-        repo.join("crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm");
+    let wasm = repo.join("crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm");
     wasm.is_file().then_some(wasm)
 }
 
@@ -289,7 +302,12 @@ fn retarget_close_bindings(base: &str) -> (String, bool, bool, bool) {
     let close_tab_changed = after_close_tab != after_close_focus;
     let after_quit = after_close_tab.replace(QUIT_BIND_FROM, QUIT_BIND_TO);
     let quit_changed = after_quit != after_close_tab;
-    (after_quit, close_focus_changed, close_tab_changed, quit_changed)
+    (
+        after_quit,
+        close_focus_changed,
+        close_tab_changed,
+        quit_changed,
+    )
 }
 
 /// Locate the Zellij config file Zellij itself would load, following its own
@@ -403,18 +421,26 @@ fn render_config() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        retarget_close_bindings, retarget_new_pane_binding, retarget_scroll_binding,
-        session_name, strip_ansi, LAYOUT_TEMPLATE,
+        retarget_close_bindings, retarget_new_pane_binding, retarget_scroll_binding, session_name,
+        strip_ansi, LAYOUT_TEMPLATE,
     };
     use std::path::Path;
 
     #[test]
     fn session_name_sanitizes_the_basename() {
-        assert_eq!(
-            session_name(Path::new("/Users/x/p/panopt-demo")),
-            "panopt-panopt-demo"
-        );
-        assert_eq!(session_name(Path::new("/a/b/My Proj.v2")), "panopt-My-Proj-v2");
+        let n = session_name(Path::new("/Users/x/p/panopt-demo"));
+        assert!(n.starts_with("panopt-panopt-demo-"), "got {n}");
+        let n2 = session_name(Path::new("/a/b/My Proj.v2"));
+        assert!(n2.starts_with("panopt-My-Proj-v2-"), "got {n2}");
+    }
+
+    #[test]
+    fn session_name_disambiguates_same_basename() {
+        let a = session_name(Path::new("/home/u/a/frontend"));
+        let b = session_name(Path::new("/home/u/b/frontend"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("panopt-frontend-"));
+        assert!(b.starts_with("panopt-frontend-"));
     }
 
     #[test]
@@ -427,7 +453,10 @@ mod tests {
         let base = "    bind \"Ctrl s\" { SwitchToMode \"scroll\"; }\n";
         let (tweaked, changed) = retarget_scroll_binding(base);
         assert!(changed);
-        assert_eq!(tweaked, "    bind \"Ctrl Shift s\" { SwitchToMode \"scroll\"; }\n");
+        assert_eq!(
+            tweaked,
+            "    bind \"Ctrl Shift s\" { SwitchToMode \"scroll\"; }\n"
+        );
         // The scroll-mode exit binding (`Ctrl s` -> normal) is a different
         // string and must be left untouched.
         let exit = "bind \"Ctrl s\" { SwitchToMode \"normal\"; }";
