@@ -1454,7 +1454,7 @@ fn is_user_shell(basename: &str) -> bool {
 /// runs by hand won't trip this; only invocations with a `panopt:` pipe name
 /// do.
 fn is_transient_pipe_pane(p: &PaneInfo) -> bool {
-    p.terminal_command.as_deref().map_or(false, |c| {
+    p.terminal_command.as_deref().is_some_and(|c| {
         c.contains("zellij") && c.contains("action") && c.contains("pipe") && c.contains("panopt:")
     })
 }
@@ -1472,7 +1472,7 @@ fn classify_pane(command: Option<&str>) -> PaneRole {
         match cmd
             .split_whitespace()
             .filter_map(|t| t.parse::<u64>().ok())
-            .last()
+            .next_back()
         {
             Some(id) => PaneRole::Roster(id),
             None => PaneRole::Shell,

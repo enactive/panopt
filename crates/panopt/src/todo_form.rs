@@ -263,7 +263,7 @@ impl TodoForm {
         }
 
         match key.code {
-            KeyCode::Char('c') if ctrl => return TodoFormAction::Close,
+            KeyCode::Char('c') if ctrl => TodoFormAction::Close,
             KeyCode::Tab => {
                 self.focus = (self.focus + 1) % FIELDS.len();
                 TodoFormAction::Idle

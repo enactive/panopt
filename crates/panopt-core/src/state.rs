@@ -806,7 +806,7 @@ impl Store {
         blockers: Vec<u64>,
     ) -> Result<(), CoreError> {
         // Reject self-blocking up front so the diff loop does not silently skip it.
-        if blockers.iter().any(|b| *b == id) {
+        if blockers.contains(&id) {
             return Err(CoreError::BadRequest("a todo cannot block itself".into()));
         }
         // Make sure the blocked todo and every requested blocker exists before

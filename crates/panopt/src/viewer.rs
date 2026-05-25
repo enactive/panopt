@@ -134,11 +134,12 @@ enum Content {
     /// A status line: an empty target or a missing file.
     Message(String),
     /// The editable todo form. The viewer owns the form state but delegates
-    /// rendering and key handling to it.
-    TodoForm(TodoForm),
+    /// rendering and key handling to it. Boxed because `TodoForm` is large
+    /// (~3.7 KB) and otherwise dominates the enum's size.
+    TodoForm(Box<TodoForm>),
     /// The editable scratchpad form. Sibling of [`Content::TodoForm`]; see
-    /// [`crate::scratchpad_form`].
-    ScratchpadForm(ScratchpadForm),
+    /// [`crate::scratchpad_form`]. Boxed for the same reason.
+    ScratchpadForm(Box<ScratchpadForm>),
 }
 
 /// One row of a list view: where selecting it routes, and its display label.
@@ -255,10 +256,8 @@ impl Viewer {
             }
             if event::poll(TICK).context("polling for input")? {
                 match event::read().context("reading an input event")? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if self.handle_key(key) {
-                            return Ok(());
-                        }
+                    Event::Key(key) if key.kind == KeyEventKind::Press && self.handle_key(key) => {
+                        return Ok(());
                     }
                     Event::Paste(s) => self.handle_paste(&s),
                     Event::Mouse(m) => self.handle_mouse(m),
@@ -492,21 +491,21 @@ impl Viewer {
     /// Errors are surfaced in the form's message line by the form itself.
     fn maybe_autosave(&mut self) {
         match &mut self.content {
-            Content::TodoForm(form) => {
-                if form.dirty_since.map_or(false, |t| t.elapsed() >= DEBOUNCE) {
-                    if let Err(e) = form.flush() {
-                        form.message = format!("autosave failed: {e:#}");
-                    }
-                    self.needs_draw = true;
+            Content::TodoForm(form)
+                if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
+            {
+                if let Err(e) = form.flush() {
+                    form.message = format!("autosave failed: {e:#}");
                 }
+                self.needs_draw = true;
             }
-            Content::ScratchpadForm(form) => {
-                if form.dirty_since.map_or(false, |t| t.elapsed() >= DEBOUNCE) {
-                    if let Err(e) = form.flush() {
-                        form.message = format!("autosave failed: {e:#}");
-                    }
-                    self.needs_draw = true;
+            Content::ScratchpadForm(form)
+                if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
+            {
+                if let Err(e) = form.flush() {
+                    form.message = format!("autosave failed: {e:#}");
                 }
+                self.needs_draw = true;
             }
             _ => {}
         }
@@ -520,33 +519,35 @@ impl Viewer {
         self.content_mtime = path.as_deref().and_then(mtime);
         self.content = match &self.target {
             Target::Empty => Content::Message("Select an item in the sidebar.".to_string()),
-            Target::NewTodo => Content::TodoForm(TodoForm::blank(&self.url)),
+            Target::NewTodo => Content::TodoForm(Box::new(TodoForm::blank(&self.url))),
             Target::Todo(id) => match load_todo(&self.url, *id) {
                 Ok(todo) => {
                     let url = self.url.clone();
                     let blocker_titles = |bid: u64| resolve_blocker_title(&url, bid);
                     match TodoForm::from_todo(&self.url, &todo, &blocker_titles) {
-                        Ok(form) => Content::TodoForm(form),
+                        Ok(form) => Content::TodoForm(Box::new(form)),
                         Err(e) => Content::Message(format!("could not parse todo #{id}: {e:#}")),
                     }
                 }
                 Err(e) => Content::Message(format!("could not load todo #{id}: {e:#}")),
             },
-            Target::NewScratchpad => Content::ScratchpadForm(ScratchpadForm::blank(&self.url)),
+            Target::NewScratchpad => {
+                Content::ScratchpadForm(Box::new(ScratchpadForm::blank(&self.url)))
+            }
             Target::Scratchpad(id) => match load_scratchpad(&self.url, *id) {
-                Ok(pad) => Content::ScratchpadForm(ScratchpadForm::from_parts(
+                Ok(pad) => Content::ScratchpadForm(Box::new(ScratchpadForm::from_parts(
                     &self.url,
                     *id,
                     pad["title"].as_str().unwrap_or(""),
                     pad["body"].as_str().unwrap_or(""),
                     pad["created_at"].as_str().unwrap_or(""),
                     pad["updated_at"].as_str().unwrap_or(""),
-                )),
+                ))),
                 Err(e) => Content::Message(format!("could not load scratchpad #{id}: {e:#}")),
             },
-            Target::TodoList => Content::List(read_index(path.as_deref(), |id| Target::Todo(id))),
+            Target::TodoList => Content::List(read_index(path.as_deref(), Target::Todo)),
             Target::ScratchpadList => {
-                Content::List(read_index(path.as_deref(), |id| Target::Scratchpad(id)))
+                Content::List(read_index(path.as_deref(), Target::Scratchpad))
             }
         };
         self.clamp();
