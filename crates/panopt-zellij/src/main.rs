@@ -299,6 +299,11 @@ struct PanoptPane {
     /// the title actually changes (gate refusal appears/clears, scroll
     /// position shifts, ...) rather than on every render tick.
     last_frame_title: String,
+    /// Last terminal-pane title we pushed via [`rename_terminal_pane`],
+    /// keyed by Zellij terminal pane id. Lets the Todos pane (the only one
+    /// that titles right-pane terminals) re-issue the host call only when
+    /// the title actually changes, rather than on every manifest tick.
+    last_pane_titles: BTreeMap<u32, String>,
     /// Whether the initial preview has been shown on startup. Only the Todos
     /// pane drives the initial preview; the others remain idle until the
     /// user navigates them.
@@ -613,6 +618,84 @@ impl PanoptPane {
         self.last_frame_title = title;
     }
 
+    /// Title every right-pane terminal so the cockpit shows what a pane is
+    /// (e.g. `Todo #30 - fixup pane titles`, `Agent: panopt-bot`,
+    /// `Command: just check`) instead of the raw launch command. Only the
+    /// Todos pane runs this - it is the cockpit gatekeeper and the only
+    /// instance that loads every projection a title can reference; the
+    /// other four plugin panes leaving terminal panes alone avoids duplicate
+    /// host calls and racy clobbers.
+    fn sync_pane_titles(&mut self) {
+        if self.mode != Mode::Todos {
+            return;
+        }
+        let mut alive: BTreeMap<u32, String> = BTreeMap::new();
+        for p in &self.panes {
+            let PaneId::Terminal(tid) = p.id else {
+                continue;
+            };
+            let Some(title) = self.compose_pane_title(p) else {
+                continue;
+            };
+            if self.last_pane_titles.get(&tid).map(String::as_str) != Some(title.as_str()) {
+                rename_terminal_pane(tid, &title);
+            }
+            alive.insert(tid, title);
+        }
+        // Drop entries for panes that have gone away so the cache cannot
+        // grow without bound across long sessions.
+        self.last_pane_titles = alive;
+    }
+
+    /// Build the right-pane terminal title for one pane, or `None` to leave
+    /// Zellij's default in place (plain shells: the running command is a
+    /// fine title; we have nothing to add).
+    fn compose_pane_title(&self, p: &PaneRow) -> Option<String> {
+        match p.role {
+            PaneRole::Viewer => Some(self.viewer_pane_title(p)),
+            PaneRole::Agent => Some(self.agent_pane_title(p)),
+            PaneRole::Process(id) => Some(self.process_pane_title(id)),
+            PaneRole::Shell => None,
+        }
+    }
+
+    /// Title for a viewer pane, derived from its routing file. Falls back to
+    /// `Viewer` when the routing has not been written yet (the boot viewer
+    /// before the first navigation) or the kind is unrecognized.
+    fn viewer_pane_title(&self, p: &PaneRow) -> String {
+        let Some(slot) = &p.viewer_slot else {
+            return "Viewer".to_string();
+        };
+        let path = format!("/host/.panopt/.cockpit/viewer-{slot}.json");
+        let body = fs::read_to_string(&path).unwrap_or_default();
+        let (kind, id) = parse_viewer_routing(&body);
+        viewer_title_for(kind.as_deref(), id, &self.todos, &self.scratchpads)
+    }
+
+    /// Title for an ad-hoc agent pane (one spawned by the `a` key or the
+    /// `panopt:spawn-agent` pipe). Uses the user-supplied label - or the
+    /// `Agent N` fallback assigned by [`Self::sync_agent_labels`] - and
+    /// adds an `Agent:` prefix only when the label does not already carry it.
+    fn agent_pane_title(&self, p: &PaneRow) -> String {
+        let label = self.agent_label(p);
+        kind_prefixed_title("Agent", &label)
+    }
+
+    /// Title for a `panopt _process-run` pane. The process's kind in
+    /// `processes.md` (`agent`/`command`/`terminal`) drives the prefix.
+    fn process_pane_title(&self, id: u64) -> String {
+        let Some(row) = self.processes.iter().find(|r| r.id == id) else {
+            return format!("Process #{id}");
+        };
+        let prefix = match row.kind.as_str() {
+            "agent" => "Agent",
+            "command" => "Command",
+            "terminal" => "Terminal",
+            _ => return format!("Process #{id}: {}", row.label),
+        };
+        kind_prefixed_title(prefix, &row.label)
+    }
+
     // --- data ---
 
     /// Re-read whichever projected index files this mode needs. The Todos
@@ -622,6 +705,12 @@ impl PanoptPane {
         match self.mode {
             Mode::Todos => {
                 self.todos = read_index("/host/.panopt/todos.md");
+                // The Todos pane is the cockpit gatekeeper and titles every
+                // right-pane terminal in `sync_pane_titles`; it needs every
+                // projection a title can reference, not just its own list.
+                self.scratchpads = read_index("/host/.panopt/scratchpads.md");
+                self.processes = read_processes("/host/.panopt/processes.md");
+                self.read_agent_labels();
             }
             Mode::Scratchpads => {
                 self.scratchpads = read_index("/host/.panopt/scratchpads.md");
@@ -714,6 +803,7 @@ impl PanoptPane {
                 .or_else(|| self.panes.iter().find(|p| !p.suppressed))
                 .map(|p| p.id);
         }
+        self.sync_pane_titles();
     }
 
     fn pane_is_visible(&self, pane: PaneId) -> bool {
@@ -1682,6 +1772,102 @@ fn parse_viewer_slot(command: Option<&str>) -> Option<String> {
     None
 }
 
+/// Parse a viewer routing file body - the JSON-ish payload written by
+/// [`write_routing`] - back into `(kind, id)`. Tolerant of an empty or
+/// malformed body: returns `(None, None)` so callers fall back to the
+/// generic `Viewer` title.
+fn parse_viewer_routing(body: &str) -> (Option<String>, Option<u64>) {
+    let trimmed = body.trim();
+    let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+        return (None, None);
+    };
+    let mut kind: Option<String> = None;
+    let mut id: Option<u64> = None;
+    for entry in inner.split(',') {
+        let entry = entry.trim();
+        let Some(colon) = entry.find(':') else {
+            continue;
+        };
+        let key = entry[..colon].trim();
+        let value = entry[colon + 1..].trim();
+        let key = key.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
+        match key {
+            Some("kind") => {
+                kind = value
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .map(|s| s.to_string());
+            }
+            Some("id") => {
+                id = value.parse::<u64>().ok();
+            }
+            _ => {}
+        }
+    }
+    (kind, id)
+}
+
+/// Compose the viewer-pane title for a `(kind, id)` routing pair. The
+/// projection indexes are looked up so the title carries the resource's
+/// own name (e.g. `Todo #30 - fixup pane titles`) rather than just its id.
+fn viewer_title_for(
+    kind: Option<&str>,
+    id: Option<u64>,
+    todos: &[(u64, String)],
+    scratchpads: &[(u64, String)],
+) -> String {
+    match (kind, id) {
+        (None, _) | (Some("empty"), _) => "Viewer".to_string(),
+        (Some("todo"), Some(id)) => match lookup_title(todos, id) {
+            Some(t) => format!("Todo #{id} - {t}"),
+            None => format!("Todo #{id}"),
+        },
+        (Some("scratchpad"), Some(id)) => match lookup_title(scratchpads, id) {
+            Some(t) => format!("Scratchpad #{id} - {t}"),
+            None => format!("Scratchpad #{id}"),
+        },
+        (Some("todo-list"), _) => "Todos".to_string(),
+        (Some("scratchpad-list"), _) => "Scratchpads".to_string(),
+        (Some("new-todo"), _) => "New todo".to_string(),
+        (Some("new-scratchpad"), _) => "New scratchpad".to_string(),
+        _ => "Viewer".to_string(),
+    }
+}
+
+/// Look up an index entry's label by id, stripping the trailing
+/// `" - status, priority"` (todos) or `" - updated ..."` (scratchpads)
+/// suffix that the projection format appends. The result is the bare title
+/// the user typed.
+fn lookup_title(index: &[(u64, String)], id: u64) -> Option<String> {
+    let label = index.iter().find(|(i, _)| *i == id).map(|(_, l)| l)?;
+    let trimmed = match label.rfind(" - ") {
+        Some(dash) => label[..dash].trim(),
+        None => label.trim(),
+    };
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Prefix `label` with `kind: ` unless `label` already begins with that
+/// kind (case-insensitive). Avoids the silly `Agent: Agent 1` for the
+/// default ad-hoc-agent label while still tagging user-named ones like
+/// `Agent: panopt-bot`.
+fn kind_prefixed_title(kind: &str, label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() {
+        return kind.to_string();
+    }
+    let lk = label.to_lowercase();
+    if lk == kind.to_lowercase() || lk.starts_with(&format!("{} ", kind.to_lowercase())) {
+        label.to_string()
+    } else {
+        format!("{kind}: {label}")
+    }
+}
+
 fn read_index(path: &str) -> Vec<(u64, String)> {
     match fs::read_to_string(path) {
         Ok(body) => body.lines().filter_map(parse_index_line).collect(),
@@ -1845,6 +2031,97 @@ mod tests {
         );
         assert_eq!(classify_pane(Some("/bin/zsh -l")), PaneRole::Shell);
         assert_eq!(classify_pane(None), PaneRole::Shell);
+    }
+
+    #[test]
+    fn parse_viewer_routing_reads_kind_and_id() {
+        assert_eq!(
+            parse_viewer_routing(r#"{"kind":"todo","id":30}"#),
+            (Some("todo".to_string()), Some(30))
+        );
+        assert_eq!(
+            parse_viewer_routing(r#"{"kind":"empty"}"#),
+            (Some("empty".to_string()), None)
+        );
+        // Order is not constrained by the writer, but be tolerant anyway.
+        assert_eq!(
+            parse_viewer_routing(r#"{"id":7,"kind":"scratchpad"}"#),
+            (Some("scratchpad".to_string()), Some(7))
+        );
+    }
+
+    #[test]
+    fn parse_viewer_routing_tolerates_garbage() {
+        assert_eq!(parse_viewer_routing(""), (None, None));
+        assert_eq!(parse_viewer_routing("not json"), (None, None));
+        // Missing kind: returns just the id, the caller falls back to "Viewer".
+        assert_eq!(parse_viewer_routing(r#"{"id":3}"#), (None, Some(3)));
+    }
+
+    #[test]
+    fn viewer_title_for_each_known_kind() {
+        let todos = vec![(30u64, "fixup pane titles - open, high".to_string())];
+        let pads = vec![(5u64, "design notes - updated 2026-05-23".to_string())];
+        assert_eq!(viewer_title_for(None, None, &todos, &pads), "Viewer");
+        assert_eq!(
+            viewer_title_for(Some("empty"), None, &todos, &pads),
+            "Viewer"
+        );
+        assert_eq!(
+            viewer_title_for(Some("todo"), Some(30), &todos, &pads),
+            "Todo #30 - fixup pane titles"
+        );
+        // Unknown id: still useful, just no name.
+        assert_eq!(
+            viewer_title_for(Some("todo"), Some(99), &todos, &pads),
+            "Todo #99"
+        );
+        assert_eq!(
+            viewer_title_for(Some("scratchpad"), Some(5), &todos, &pads),
+            "Scratchpad #5 - design notes"
+        );
+        assert_eq!(
+            viewer_title_for(Some("todo-list"), None, &todos, &pads),
+            "Todos"
+        );
+        assert_eq!(
+            viewer_title_for(Some("scratchpad-list"), None, &todos, &pads),
+            "Scratchpads"
+        );
+        assert_eq!(
+            viewer_title_for(Some("new-todo"), None, &todos, &pads),
+            "New todo"
+        );
+        assert_eq!(
+            viewer_title_for(Some("new-scratchpad"), None, &todos, &pads),
+            "New scratchpad"
+        );
+        // Unknown kind: do not invent a name, just label generically.
+        assert_eq!(
+            viewer_title_for(Some("rumor"), None, &todos, &pads),
+            "Viewer"
+        );
+    }
+
+    #[test]
+    fn kind_prefixed_title_avoids_doubling_the_kind_word() {
+        // Default ad-hoc agent label already names itself "Agent N" - the
+        // prefix would duplicate, so use the label verbatim.
+        assert_eq!(kind_prefixed_title("Agent", "Agent 1"), "Agent 1");
+        // User-named: the prefix carries the kind, so the user sees both.
+        assert_eq!(
+            kind_prefixed_title("Agent", "panopt-bot"),
+            "Agent: panopt-bot"
+        );
+        // Process-row labels from `panopt process add` typically lack the
+        // kind word, so the prefix is what makes the role legible.
+        assert_eq!(
+            kind_prefixed_title("Command", "just check"),
+            "Command: just check"
+        );
+        // Case-insensitive match so user typing `agent foo` still gets
+        // collapsed onto the canonical "Agent foo".
+        assert_eq!(kind_prefixed_title("Agent", "agent foo"), "agent foo");
     }
 
     #[test]
