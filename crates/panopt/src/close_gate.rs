@@ -91,7 +91,9 @@ pub fn run(scope: &str, items: &str, target_pane: Option<u32>, port: u16) -> Res
     // `zellij action close-pane` CLI fires CloseFocus directly (not through
     // a keybind), so it bypasses the cockpit's gate and just closes us.
     if std::env::var_os("ZELLIJ").is_some() {
-        let _ = Command::new("zellij").args(["action", "close-pane"]).status();
+        let _ = Command::new("zellij")
+            .args(["action", "close-pane"])
+            .status();
     }
 
     outcome.map(|_| ())
@@ -157,12 +159,10 @@ fn handle_key(key: KeyEvent) -> Option<Confirmation> {
 
 fn draw(frame: &mut Frame, scope: Scope, items: &[Item]) {
     let area = frame.area();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" {} ", scope.title()),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        format!(" {} ", scope.title()),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -175,8 +175,7 @@ fn draw(frame: &mut Frame, scope: Scope, items: &[Item]) {
     .split(inner);
 
     let intro = match items.is_empty() {
-        true => Paragraph::new("No active items - confirm to proceed.")
-            .alignment(Alignment::Left),
+        true => Paragraph::new("No active items - confirm to proceed.").alignment(Alignment::Left),
         false => Paragraph::new("Active items would be lost:").alignment(Alignment::Left),
     };
     frame.render_widget(intro, layout[0]);
@@ -219,8 +218,20 @@ fn send_decision(scope: Scope, target_pane: Option<u32>, port: u16) -> Result<()
         Some(id) => format!("scope={};target_pane={};decision=close", scope.name(), id),
         None => format!("scope={};decision=close", scope.name()),
     };
+    // Narrow delivery to the Todos plugin pane: it is the cockpit gatekeeper
+    // and the only one of the five plugin instances that handles the
+    // decision. Belt-and-braces with the plugin's own `pipe()` mode guard.
     let status = Command::new("zellij")
-        .args(["action", "pipe", "--name", "panopt:close-gate-decision", "--", &payload])
+        .args([
+            "action",
+            "pipe",
+            "--name",
+            "panopt:close-gate-decision",
+            "--plugin-configuration",
+            "mode=todos",
+            "--",
+            &payload,
+        ])
         .status()
         .context("running `zellij action pipe` to send the close decision")?;
     if !status.success() {

@@ -1,8 +1,10 @@
 // PANopt cockpit layout for Zellij.
 //
-// Left: the PANopt coordination sidebar plugin (25% width), pinned full-height.
-// Right: agent / terminal panes - "stacked" by default, "tiled" as a toggle
-// (cycle with Zellij's swap-layout keys, Alt-] / Alt-[).
+// Left: five plugin panes stacked vertically (25% column), one per resource
+// kind - todos, agents, terminals, commands, scratchpads. Each is its own
+// Zellij plugin instance running the same wasm with a distinct `mode` value;
+// they are pinned full-height by the `ui` tab template.
+// Right: a single content pane the five plugin panes swap into.
 //
 // This is a static reference layout. `panopt up` generates its own equivalent;
 // see `crates/panopt/src/up.rs`.
@@ -10,12 +12,36 @@
 // Start Zellij from inside the workspace folder so the plugin's `/host` mount
 // resolves to it:  cd <workspace> && zellij --layout /Users/user/p/panopt/panopt.kdl
 layout {
-    // The fixed shell of every tab: sidebar pinned left, agents flow into the
-    // `children` slot on the right.
+    // The fixed shell of every tab: five plugin panes pinned left, content
+    // pane on the right flows into the `children` slot.
     tab_template name="ui" {
         pane split_direction="vertical" {
-            pane size="25%" {
-                plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm"
+            pane size="25%" split_direction="horizontal" {
+                pane size="30%" {
+                    plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm" {
+                        mode "todos"
+                    }
+                }
+                pane size="15%" {
+                    plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm" {
+                        mode "agents"
+                    }
+                }
+                pane size="15%" {
+                    plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm" {
+                        mode "terminals"
+                    }
+                }
+                pane size="15%" {
+                    plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm" {
+                        mode "commands"
+                    }
+                }
+                pane size="25%" {
+                    plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm" {
+                        mode "scratchpads"
+                    }
+                }
             }
             pane {
                 children
@@ -23,26 +49,8 @@ layout {
         }
     }
 
-    // Initial state: the sidebar plus one agent pane.
+    // Initial state: the five plugin panes plus one content pane.
     ui {
         pane focus=true
-    }
-
-    // Default arrangement: agents stacked on the right.
-    swap_tiled_layout name="stacked" {
-        ui min_panes=1 {
-            pane stacked=true {
-                children;
-            }
-        }
-    }
-
-    // Toggle arrangement: agents in an even tiled grid on the right.
-    swap_tiled_layout name="tiled" {
-        ui min_panes=1 {
-            pane {
-                children;
-            }
-        }
     }
 }
