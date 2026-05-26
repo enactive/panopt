@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use http::request::Parts;
 use panopt_core::{
-    Agent, CoreError, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad,
-    ScratchpadPatch, Store, Todo, TodoPatch, TodoStatus,
+    Agent, AgentTool, AgentToolPatch, CoreError, Lock, Priority, Process, ProcessKind,
+    ProcessPatch, ProjectId, Scratchpad, ScratchpadPatch, Store, Todo, TodoPatch, TodoStatus,
 };
 use rmcp::{
     handler::server::{common::Extension, router::tool::ToolRouter, wrapper::Parameters},
@@ -23,12 +23,13 @@ use rmcp::{
 use serde::Serialize;
 
 use crate::params::{
-    IdentifyArgs, LockAcquireArgs, LockReleaseArgs, RosterCreateArgs, RosterDeleteArgs,
-    RosterGetArgs, RosterUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
-    ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs,
-    TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs,
-    TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs,
-    TodoSetBlockersArgs, TodoUnlockArgs, TodoUpdateArgs,
+    AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdentifyArgs,
+    LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs, ProcessGetArgs,
+    ProcessUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs, ScratchpadDeleteArgs,
+    ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs, TodoBlockerArgs,
+    TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs, TodoCompleteArgs,
+    TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs, TodoSetBlockersArgs, TodoUnlockArgs,
+    TodoUpdateArgs,
 };
 
 /// Per-session MCP handler.
@@ -165,9 +166,41 @@ impl TodoDetailDto {
     }
 }
 
-/// Wire shape for a roster entry in `roster_list` and `roster_get` output.
+/// Wire shape for an agent tool (config layer) in `agent_tool_list` and
+/// `agent_tool_get` output.
 #[derive(Serialize)]
-struct RosterDto {
+struct AgentToolDto {
+    id: u64,
+    name: String,
+    display_name: String,
+    command: String,
+    cwd: String,
+    tool_type: String,
+    enabled: bool,
+    position: i64,
+    created_at: String,
+}
+
+impl AgentToolDto {
+    fn from_entry(t: AgentTool) -> Self {
+        AgentToolDto {
+            id: t.id,
+            name: t.name,
+            display_name: t.display_name,
+            command: t.command,
+            cwd: t.cwd,
+            tool_type: t.tool_type,
+            enabled: t.enabled,
+            position: t.position,
+            created_at: t.created_at,
+        }
+    }
+}
+
+/// Wire shape for a process (instance layer) in `process_list` and
+/// `process_get` output.
+#[derive(Serialize)]
+struct ProcessDto {
     id: u64,
     kind: &'static str,
     name: String,
@@ -175,20 +208,30 @@ struct RosterDto {
     command: String,
     cwd: String,
     position: i64,
+    agent_tool_id: Option<u64>,
+    pid: Option<i64>,
+    status: Option<String>,
+    agent_state: Option<String>,
+    last_seen: Option<String>,
     created_at: String,
 }
 
-impl RosterDto {
-    fn from_entry(e: RosterEntry) -> Self {
-        RosterDto {
-            id: e.id,
-            kind: e.kind.as_str(),
-            name: e.name,
-            display_name: e.display_name,
-            command: e.command,
-            cwd: e.cwd,
-            position: e.position,
-            created_at: e.created_at,
+impl ProcessDto {
+    fn from_entry(p: Process) -> Self {
+        ProcessDto {
+            id: p.id,
+            kind: p.kind.as_str(),
+            name: p.name,
+            display_name: p.display_name,
+            command: p.command,
+            cwd: p.cwd,
+            position: p.position,
+            agent_tool_id: p.agent_tool_id,
+            pid: p.pid,
+            status: p.status,
+            agent_state: p.agent_state,
+            last_seen: p.last_seen,
+            created_at: p.created_at,
         }
     }
 }
@@ -267,7 +310,8 @@ fn map_core_err(e: CoreError) -> McpError {
         CoreError::ScratchpadNotFound(_)
         | CoreError::TodoNotFound(_)
         | CoreError::TodoCommentNotFound { .. }
-        | CoreError::RosterNotFound(_)
+        | CoreError::AgentToolNotFound(_)
+        | CoreError::ProcessNotFound(_)
         | CoreError::BadRequest(_)
         | CoreError::Workspace(_) => McpError::invalid_params(e.to_string(), None),
         // Internal: a stale project handle, a database fault, or a failed write.
@@ -404,9 +448,9 @@ fn parse_priority(s: &str) -> Result<Priority, McpError> {
     })
 }
 
-/// Parse a roster-kind token from a tool argument, with a caller-facing error.
-fn parse_roster_kind(s: &str) -> Result<RosterKind, McpError> {
-    RosterKind::parse(s).ok_or_else(|| {
+/// Parse a process-kind token from a tool argument, with a caller-facing error.
+fn parse_process_kind(s: &str) -> Result<ProcessKind, McpError> {
+    ProcessKind::parse(s).ok_or_else(|| {
         McpError::invalid_params(
             format!("invalid kind '{s}': expected agent, command, or terminal"),
             None,
@@ -945,98 +989,203 @@ impl Handler {
         }
     }
 
-    #[tool(description = "Create a roster entry - a persistent agent, command, or terminal for \
-                          this project. kind is one of agent/command/terminal. Returns its \
-                          numeric id.")]
-    async fn roster_create(
+    #[tool(description = "Create an agent tool (config layer) - a durable agent configuration \
+                          this project can spawn processes from. Returns its numeric id.")]
+    async fn agent_tool_create(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<RosterCreateArgs>,
+        Parameters(args): Parameters<AgentToolCreateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let kind = parse_roster_kind(&args.kind)?;
         let id = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.roster_create(
+            st.agent_tool_create(
                 project,
-                kind,
                 args.name,
                 args.display_name.unwrap_or_default(),
                 args.command.unwrap_or_default(),
                 args.cwd.unwrap_or_default(),
+                args.tool_type.unwrap_or_else(|| "agent".to_string()),
+                args.enabled.unwrap_or(true),
             )
             .map_err(map_core_err)?
         };
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    #[tool(description = "List this project's roster as a JSON array of {id, kind, name, \
-                          display_name, command, cwd, position, created_at}.")]
-    async fn roster_list(
+    #[tool(description = "List this project's agent tools as a JSON array of {id, name, \
+                          display_name, command, cwd, tool_type, enabled, position, created_at}.")]
+    async fn agent_tool_list(
         &self,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let dtos: Vec<RosterDto> = {
+        let dtos: Vec<AgentToolDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.roster_list(project)
+            st.agent_tool_list(project)
                 .map_err(map_core_err)?
                 .into_iter()
-                .map(RosterDto::from_entry)
+                .map(AgentToolDto::from_entry)
                 .collect()
         };
         json_result(&dtos)
     }
 
-    #[tool(description = "Fetch one roster entry in full, addressed by numeric id.")]
-    async fn roster_get(
+    #[tool(description = "Fetch one agent tool in full, addressed by numeric id.")]
+    async fn agent_tool_get(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<RosterGetArgs>,
+        Parameters(args): Parameters<AgentToolGetArgs>,
     ) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            RosterDto::from_entry(
-                st.roster_get(project, args.roster_id).map_err(map_core_err)?,
+            AgentToolDto::from_entry(
+                st.agent_tool_get(project, args.agent_tool_id)
+                    .map_err(map_core_err)?,
             )
         };
         json_result(&dto)
     }
 
-    #[tool(description = "Edit a roster entry's fields. Every argument but roster_id is \
+    #[tool(description = "Edit an agent tool's fields. Every argument but agent_tool_id is \
                           optional; an omitted field is left unchanged.")]
-    async fn roster_update(
+    async fn agent_tool_update(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<RosterUpdateArgs>,
+        Parameters(args): Parameters<AgentToolUpdateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let patch = RosterPatch {
+        let patch = AgentToolPatch {
             name: args.name,
             display_name: args.display_name,
             command: args.command,
             cwd: args.cwd,
+            tool_type: args.tool_type,
+            enabled: args.enabled,
             position: args.position,
         };
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.roster_update(project, args.roster_id, patch)
+            st.agent_tool_update(project, args.agent_tool_id, patch)
                 .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Delete a roster entry, addressed by numeric id.")]
-    async fn roster_delete(
+    #[tool(description = "Delete an agent tool, addressed by numeric id. Any processes that \
+                          reference it keep running; their agent_tool_id back-reference is \
+                          set to NULL.")]
+    async fn agent_tool_delete(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<RosterDeleteArgs>,
+        Parameters(args): Parameters<AgentToolDeleteArgs>,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.roster_delete(project, args.roster_id)
+            st.agent_tool_delete(project, args.agent_tool_id)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Create a process (instance layer) - a per-project agent/command/ \
+                          terminal instance. Optionally links to a source agent_tool via \
+                          agent_tool_id. Returns its numeric id.")]
+    async fn process_create(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ProcessCreateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = parse_process_kind(&args.kind)?;
+        let id = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.process_create(
+                project,
+                kind,
+                args.name,
+                args.display_name.unwrap_or_default(),
+                args.command.unwrap_or_default(),
+                args.cwd.unwrap_or_default(),
+                args.agent_tool_id,
+            )
+            .map_err(map_core_err)?
+        };
+        Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
+    }
+
+    #[tool(description = "List this project's processes as a JSON array of {id, kind, name, \
+                          display_name, command, cwd, position, agent_tool_id, pid, status, \
+                          agent_state, last_seen, created_at}.")]
+    async fn process_list(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let dtos: Vec<ProcessDto> = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.process_list(project)
+                .map_err(map_core_err)?
+                .into_iter()
+                .map(ProcessDto::from_entry)
+                .collect()
+        };
+        json_result(&dtos)
+    }
+
+    #[tool(description = "Fetch one process in full, addressed by numeric id.")]
+    async fn process_get(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ProcessGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            ProcessDto::from_entry(
+                st.process_get(project, args.process_id)
+                    .map_err(map_core_err)?,
+            )
+        };
+        json_result(&dto)
+    }
+
+    #[tool(description = "Edit a process's fields. Every argument but process_id is \
+                          optional; an omitted field is left unchanged.")]
+    async fn process_update(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ProcessUpdateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let patch = ProcessPatch {
+            name: args.name,
+            display_name: args.display_name,
+            command: args.command,
+            cwd: args.cwd,
+            position: args.position,
+            ..Default::default()
+        };
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.process_update(project, args.process_id, patch)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Delete a process, addressed by numeric id.")]
+    async fn process_delete(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<ProcessDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.process_delete(project, args.process_id)
                 .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
@@ -1077,10 +1226,16 @@ impl ServerHandler for Handler {
                  scratchpad_read (body only), scratchpad_update (replace title and/or body), \
                  scratchpad_delete. Each scratchpad also projects to \
                  .panopt/scratchpad/<id>.md.\n\
-                 - Roster: roster_create (kind agent/command/terminal, returns an id), \
-                 roster_list, roster_get, roster_update, roster_delete. The roster is the \
-                 project's persistent agents, commands, and terminals; the cockpit launches \
-                 and tracks them. Projected to .panopt/roster.md.\n\
+                 - Agent tools (config layer): agent_tool_create (returns an id), \
+                 agent_tool_list, agent_tool_get, agent_tool_update, agent_tool_delete. \
+                 Durable per-project agent configurations the cockpit can spawn from. \
+                 Projected to .panopt/agent_tools.md.\n\
+                 - Processes (instance layer): process_create (kind agent/command/terminal, \
+                 optional agent_tool_id, returns an id), process_list, process_get, \
+                 process_update, process_delete. Per-project process instances - the \
+                 launchable agents, commands, and terminals the cockpit tracks. Deleting an \
+                 agent tool nulls the agent_tool_id back-reference of any processes that \
+                 referenced it. Projected to .panopt/processes.md.\n\
                  State is persisted, shared live across every agent on the same project, \
                  and mirrored into .panopt/*.md under the project root."
                     .to_string(),

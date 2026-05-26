@@ -165,32 +165,96 @@ pub struct TodoUnlockArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RosterCreateArgs {
-    /// Kind of entry: one of agent, command, terminal.
-    pub kind: String,
-    /// Identifier-style name for the entry.
+pub struct AgentToolCreateArgs {
+    /// Identifier-style name for the tool (e.g. "claude").
     pub name: String,
     /// Optional human label shown in the cockpit. Omit to use `name`.
     #[serde(default)]
     pub display_name: Option<String>,
-    /// Shell command the entry launches. Omit for a bare terminal.
+    /// Shell command this tool launches when a process is spawned from it.
     #[serde(default)]
     pub command: Option<String>,
-    /// Working directory for the launched command. Omit to use the project root.
+    /// Working directory passed to the launched command. Omit to use project root.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Free-form tag for future categorization. Defaults to "agent".
+    #[serde(default)]
+    pub tool_type: Option<String>,
+    /// Whether the tool is offered in spawn UIs. Defaults to true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RosterGetArgs {
-    /// Numeric id of the roster entry to fetch.
-    pub roster_id: u64,
+pub struct AgentToolGetArgs {
+    /// Numeric id of the agent tool to fetch.
+    pub agent_tool_id: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RosterUpdateArgs {
-    /// Numeric id of the roster entry to edit.
-    pub roster_id: u64,
+pub struct AgentToolUpdateArgs {
+    /// Numeric id of the agent tool to edit.
+    pub agent_tool_id: u64,
+    /// New name. Omit to leave unchanged.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New display label. Omit to leave unchanged.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// New launch command. Omit to leave unchanged.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// New working directory. Omit to leave unchanged.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// New tool_type tag. Omit to leave unchanged.
+    #[serde(default)]
+    pub tool_type: Option<String>,
+    /// New enabled flag. Omit to leave unchanged.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// New sort position. Omit to leave unchanged.
+    #[serde(default)]
+    pub position: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgentToolDeleteArgs {
+    /// Numeric id of the agent tool to delete.
+    pub agent_tool_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProcessCreateArgs {
+    /// Kind of process: one of agent, command, terminal.
+    pub kind: String,
+    /// Identifier-style name for the process.
+    pub name: String,
+    /// Optional human label shown in the cockpit. Omit to use `name`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Shell command the process executes. Omit for a bare terminal.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Working directory for the process. Omit to use project root.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Numeric id of the agent tool this process was spawned from. Omit for
+    /// command and terminal processes that have no backing config.
+    #[serde(default)]
+    pub agent_tool_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProcessGetArgs {
+    /// Numeric id of the process to fetch.
+    pub process_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProcessUpdateArgs {
+    /// Numeric id of the process to edit.
+    pub process_id: u64,
     /// New name. Omit to leave unchanged.
     #[serde(default)]
     pub name: Option<String>,
@@ -209,9 +273,9 @@ pub struct RosterUpdateArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RosterDeleteArgs {
-    /// Numeric id of the roster entry to delete.
-    pub roster_id: u64,
+pub struct ProcessDeleteArgs {
+    /// Numeric id of the process to delete.
+    pub process_id: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

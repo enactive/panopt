@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -167,6 +167,70 @@ fn apply_v5(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
+/// Version 6: split the hybrid `roster` table into a config layer
+/// (`agent_tools`) and an instance layer (`processes`) (todo #27).
+///
+/// A V5 roster row was both a config (name, command, cwd) and the implicit
+/// single instance of that config; liveness was derived from Zellij pane state,
+/// never stored. V6 mirrors Solo's two-layer model: `agent_tools` holds the
+/// durable configurations, `processes` holds per-project instances and carries
+/// a nullable FK back to its source tool plus nullable lifecycle columns
+/// (`pid`, `status`, `agent_state`, `last_seen`) so a follow-up that owns
+/// process spawn can populate them without another migration.
+///
+/// Both new tables keep drawing ids from the unified `projects.next_id`
+/// counter introduced by V5, so a `#N` reference still resolves to exactly one
+/// row across todos, scratchpads, agent_tools, and processes.
+///
+/// Migration of existing rows: `kind='agent'` becomes an `agent_tools` row
+/// (configuration), and `kind='command'` / `kind='terminal'` become
+/// `processes` rows (instances - the only thing the pre-split roster ever was
+/// for those kinds). Ids are preserved verbatim since both new tables share
+/// the same `next_id` sequence the originals were drawn from.
+fn apply_v6(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE agent_tools (
+             project_id   INTEGER NOT NULL REFERENCES projects(id),
+             id           INTEGER NOT NULL,
+             name         TEXT    NOT NULL,
+             display_name TEXT    NOT NULL DEFAULT '',
+             command      TEXT    NOT NULL DEFAULT '',
+             cwd          TEXT    NOT NULL DEFAULT '',
+             tool_type    TEXT    NOT NULL DEFAULT 'agent',
+             enabled      INTEGER NOT NULL DEFAULT 1,
+             position     INTEGER NOT NULL DEFAULT 0,
+             created_at   TEXT    NOT NULL,
+             PRIMARY KEY (project_id, id)
+         );
+         CREATE TABLE processes (
+             project_id    INTEGER NOT NULL REFERENCES projects(id),
+             id            INTEGER NOT NULL,
+             kind          TEXT    NOT NULL CHECK (kind IN ('agent','command','terminal')),
+             name          TEXT    NOT NULL DEFAULT '',
+             display_name  TEXT    NOT NULL DEFAULT '',
+             command       TEXT    NOT NULL DEFAULT '',
+             cwd           TEXT    NOT NULL DEFAULT '',
+             position      INTEGER NOT NULL DEFAULT 0,
+             agent_tool_id INTEGER,
+             pid           INTEGER,
+             status        TEXT,
+             agent_state   TEXT,
+             last_seen     TEXT,
+             created_at    TEXT    NOT NULL,
+             PRIMARY KEY (project_id, id)
+         );
+         INSERT INTO agent_tools
+             (project_id, id, name, display_name, command, cwd, tool_type, enabled, position, created_at)
+             SELECT project_id, id, name, display_name, command, cwd, 'agent', 1, position, created_at
+               FROM roster WHERE kind = 'agent';
+         INSERT INTO processes
+             (project_id, id, kind, name, display_name, command, cwd, position, created_at)
+             SELECT project_id, id, kind, name, display_name, command, cwd, position, created_at
+               FROM roster WHERE kind IN ('command','terminal');
+         DROP TABLE roster;",
+    )
+}
+
 /// Add `column` to `table` only if it is not already there. Used by migrations
 /// that may collide with a transitional dev-database state where the column
 /// landed before its `user_version` bump did. `decl` is the type+constraint
@@ -214,6 +278,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
     if version < 5 {
         apply_v5(conn)?;
+    }
+    if version < 6 {
+        apply_v6(conn)?;
     }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -287,13 +354,15 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_the_v3_roster_table() {
+    fn fresh_database_has_the_v6_agent_tools_and_processes_tables() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO projects (id, root) VALUES (1, '/x');
-             INSERT INTO roster (project_id, id, kind, name, created_at)
-                 VALUES (1, 1, 'agent', 'Claude', '');",
+             INSERT INTO agent_tools (project_id, id, name, created_at)
+                 VALUES (1, 1, 'Claude', '');
+             INSERT INTO processes (project_id, id, kind, name, agent_tool_id, created_at)
+                 VALUES (1, 2, 'agent', 'claude-1', 1, '');",
         )
         .unwrap();
         let next: i64 = conn
@@ -400,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_database_upgrades_to_v3_in_place() {
+    fn v2_database_upgrades_through_v6_in_place() {
         let conn = Connection::open_in_memory().unwrap();
         // Stand up a v2 database by hand: the v1+v2 schema, version pinned to 2.
         conn.execute_batch(SCHEMA_V1).unwrap();
@@ -416,12 +485,17 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
-        // The roster table and the new per-project counter both exist.
+        // The post-V6 tables and the unified counter all exist; the old
+        // `roster` table is gone.
         conn.execute_batch(
-            "INSERT INTO roster (project_id, id, kind, name, created_at)
-                 VALUES (1, 1, 'command', 'Run', '');",
+            "INSERT INTO agent_tools (project_id, id, name, created_at)
+                 VALUES (1, 1, 'Run', '');
+             INSERT INTO processes (project_id, id, kind, name, created_at)
+                 VALUES (1, 2, 'command', 'Run', '');",
         )
         .unwrap();
+        conn.execute_batch("INSERT INTO roster (project_id, id, kind, name, created_at) VALUES (1, 3, 'agent', 'x', '');")
+            .unwrap_err();
         let next: i64 = conn
             .query_row("SELECT next_id FROM projects WHERE id = 1", [], |r| {
                 r.get(0)
@@ -431,11 +505,12 @@ mod tests {
     }
 
     #[test]
-    fn v4_database_upgrades_to_v5_in_place() {
+    fn v4_database_upgrades_through_v6_in_place() {
         // Stand up a V4 database by hand: V1+V2+V3 schema, V4 column adds, then
         // pin user_version=4. Three resources at id 4 in three tables - the
         // collision V5 forever prevents going forward - and the three counters
-        // disagree so we can prove V5 takes the max.
+        // disagree so we can prove V5 takes the max. The single agent roster
+        // row then lands in `agent_tools` after V6, not in `processes`.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
@@ -482,5 +557,128 @@ mod tests {
             }
             assert!(!present, "{col} should have been dropped");
         }
+
+        // V6: the agent row landed in agent_tools, nothing in processes, and
+        // the roster table is gone.
+        let (tool_id, tool_name): (i64, String) = conn
+            .query_row(
+                "SELECT id, name FROM agent_tools WHERE project_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tool_id, 4);
+        assert_eq!(tool_name, "r");
+        let process_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM processes WHERE project_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(process_count, 0);
+        let roster_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'roster'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(roster_present, 0, "roster table should have been dropped");
+    }
+
+    #[test]
+    fn v5_database_upgrades_to_v6_in_place() {
+        // Stand up a V5 database by hand: V1..V3 schema + V4/V5 functions, pin
+        // user_version=5. Three roster rows of mixed kinds at ids 1/2/3, and a
+        // next_id of 4 to prove the unified counter is preserved across V6.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, next_id) VALUES (1, '/x', 4);
+             INSERT INTO roster (project_id, id, kind, name, display_name, command, cwd, position, created_at)
+                 VALUES (1, 1, 'agent', 'claude', 'Claude', 'claude', '', 1, '2026-01-01');
+             INSERT INTO roster (project_id, id, kind, name, display_name, command, cwd, position, created_at)
+                 VALUES (1, 2, 'command', 'build', '', 'cargo build', '/tmp', 2, '2026-01-02');
+             INSERT INTO roster (project_id, id, kind, name, display_name, command, cwd, position, created_at)
+                 VALUES (1, 3, 'terminal', 'shell', '', '', '', 3, '2026-01-03');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The agent row landed in agent_tools at its original id.
+        let (tool_id, tool_name, tool_type, enabled): (i64, String, String, i64) = conn
+            .query_row(
+                "SELECT id, name, tool_type, enabled FROM agent_tools WHERE project_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(tool_id, 1);
+        assert_eq!(tool_name, "claude");
+        assert_eq!(tool_type, "agent");
+        assert_eq!(enabled, 1, "migrated agent tools default to enabled");
+
+        // The command + terminal rows landed in processes at their original
+        // ids, with nullable agent_tool_id left NULL since pre-V6 had no link.
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, name, agent_tool_id FROM processes
+                  WHERE project_id = 1 ORDER BY id",
+            )
+            .unwrap();
+        let rows: Vec<(i64, String, String, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (2, "command".into(), "build".into(), None));
+        assert_eq!(rows[1], (3, "terminal".into(), "shell".into(), None));
+
+        // next_id is preserved, so the next allocation lands at 4 just like
+        // pre-migration.
+        let next: i64 = conn
+            .query_row("SELECT next_id FROM projects WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(next, 4);
+
+        // The old roster table is gone.
+        let roster_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'roster'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(roster_present, 0);
+    }
+
+    #[test]
+    fn v6_processes_kind_check_rejects_invalid_values() {
+        // The CHECK constraint guards against typos in clients writing
+        // directly to the table without going through `state::process_create`.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("INSERT INTO projects (id, root) VALUES (1, '/x');")
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO processes (project_id, id, kind, name, created_at)
+                 VALUES (1, 1, 'bogus', 'x', '');",
+        )
+        .unwrap_err();
     }
 }

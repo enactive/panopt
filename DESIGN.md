@@ -406,18 +406,18 @@ A single SQLite database holds every project. One database file is simpler to
 operate than a file per project, and SQLite gives durability and queryability
 with no server.
 
-Four tables: `projects`, `todos`, `scratchpads`, and `roster` (Section 6.6).
-The `todos`, `scratchpads`, and `roster` rows are keyed by `(project_id, id)`,
-so ids restart at 1 in each project and read naturally in the projected files.
-A single per-project `next_id` counter on the `projects` row is shared across
-all three resource types and bumped in the same transaction as the insert, so
-an id is never handed out twice, never reused after a deletion, and a `#N`
-reference points to exactly one resource. Each mutation
-commits its transaction and then re-projects the affected `.panopt/` file; the
-first time a project is touched in a daemon run, every file is re-projected from
-the database, which both initializes a new project and self-heals a restarted
-one. The database file lives in the per-user data directory (`panopt/panopt.db`);
-the daemon owns it, and no project ever sees it.
+Five tables: `projects`, `todos`, `scratchpads`, `agent_tools`, and `processes`
+(Section 6.6). The latter four are keyed by `(project_id, id)`, so ids restart
+at 1 in each project and read naturally in the projected files. A single
+per-project `next_id` counter on the `projects` row is shared across all four
+resource types and bumped in the same transaction as the insert, so an id is
+never handed out twice, never reused after a deletion, and a `#N` reference
+points to exactly one resource. Each mutation commits its transaction and then
+re-projects the affected `.panopt/` file; the first time a project is touched
+in a daemon run, every file is re-projected from the database, which both
+initializes a new project and self-heals a restarted one. The database file
+lives in the per-user data directory (`panopt/panopt.db`); the daemon owns it,
+and no project ever sees it.
 
 ### 6.5 Conflict model
 
@@ -429,22 +429,45 @@ The daemon is the single source of truth. Projected files are derived state.
   update collide, the daemon's value wins (last-writer-wins under daemon
   authority).
 
-### 6.6 Roster
+### 6.6 Agent tools and processes
 
-The roster is a project's persistent agents, commands, and terminals - the
-launchable processes the cockpit knows about. It is one SQLite table modeled on
-Solo's `processes` table, with a `kind` column (`agent` / `command` /
-`terminal`) distinguishing the three. The columns are deliberately minimal -
-name, command, working directory - with room for per-entry settings (auto-start,
-environment, an agent-tool link) to be added later.
+PANopt splits a project's launchable agents and commands across two tables, a
+config layer and an instance layer, mirroring Solo's two-layer model:
 
-Whether an entry is currently running is *not* stored: the cockpit derives it
-from live Zellij pane state. A not-running entry is offered a "start" action.
-The roster is projected to `.panopt/roster.md`.
+- **`agent_tools`** - durable per-project configurations: name, command, cwd,
+  a free-form `tool_type`, and an `enabled` flag controlling whether the
+  config is offered in spawn UIs. One tool can back many running instances.
+- **`processes`** - per-project instances of an agent, command, or terminal:
+  `kind` (`agent` / `command` / `terminal`), name, command, cwd, an optional
+  `agent_tool_id` back-reference, plus nullable lifecycle columns (`pid`,
+  `status`, `agent_state`, `last_seen`) reserved for a future follow-up that
+  owns spawn lifecycle.
 
-The roster is distinct from the agent registry (Section 6.3): the registry is
-the ephemeral set of agents *currently connected* over MCP, while the roster is
-the durable set of processes the project is *configured* to run.
+The split lets a project carry two Claude instances both spawned from agent
+tool `#3`, with each instance addressable by its own `#N`. When a process is
+spawned from a tool, the tool's `command` and `cwd` are copied into the
+process row so post-spawn edits to the tool don't perturb the running
+instance. Deleting a tool nulls the `agent_tool_id` back-reference on any
+process that referenced it; the live instance keeps running.
+
+Both tables draw ids from the unified per-project `next_id` counter
+(Section 6.4), so a `#N` reference still resolves to exactly one row across
+todos, scratchpads, agent_tools, and processes.
+
+Whether a process is currently running is *not* stored today: the cockpit
+derives it from live Zellij pane state, same as the pre-V6 roster did. The
+nullable lifecycle columns turn that into a follow-up rather than a schema
+break, once panoptd owns process spawn (Section 10).
+
+The config and instance layers each project to their own markdown file:
+`.panopt/agent_tools.md` and `.panopt/processes.md`. The cockpit sidebar
+currently renders only `processes.md`, because it is a live-state view;
+agent_tools render once a spawn UI lands.
+
+Both layers are distinct from the agent registry (Section 6.3): the registry
+is the ephemeral set of MCP agents *currently connected*, while agent_tools
+and processes are the durable set of agents/commands/terminals the project
+is configured to run and the live instances of them.
 
 ## 7. Proof of Concept
 

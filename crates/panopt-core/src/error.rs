@@ -17,9 +17,13 @@ pub enum CoreError {
     #[error("todo {todo_id} has no comment {comment_id}")]
     TodoCommentNotFound { todo_id: u64, comment_id: u64 },
 
-    /// No roster entry exists with the given id in the project.
-    #[error("roster entry {0} not found")]
-    RosterNotFound(u64),
+    /// No agent tool exists with the given id in the project.
+    #[error("agent tool {0} not found")]
+    AgentToolNotFound(u64),
+
+    /// No process exists with the given id in the project.
+    #[error("process {0} not found")]
+    ProcessNotFound(u64),
 
     /// A caller-supplied argument was rejected - for example, a todo asked to
     /// block itself. The message is safe to surface to the caller.

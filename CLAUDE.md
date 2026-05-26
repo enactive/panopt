@@ -29,7 +29,7 @@ Logs: `~/.local/share/panopt/panoptd.log` (tail with `just logs`). Database: `~/
 
 ## Invariants
 
-- **One per-project id counter (`projects.next_id`) is shared across todos, scratchpads, and roster entries**, not derived from `MAX(id)`. A `#N` reference resolves to exactly one resource. Deleting the highest-numbered item must not free that id for reuse. See `db.rs` schema notes.
+- **One per-project id counter (`projects.next_id`) is shared across todos, scratchpads, agent tools, and processes**, not derived from `MAX(id)`. A `#N` reference resolves to exactly one resource. Deleting the highest-numbered item must not free that id for reuse. See `db.rs` schema notes.
 - **Schema migrations are forward-only** via `PRAGMA user_version`. Add a new `V<n>` block in `db.rs` and an `if version < n` step — do not rewrite earlier versions.
 - **The plugin never closes panes**, only suppresses them. Swap-in-place is the model: a suppressed pane keeps running hidden, the user owns its lifecycle.
 - **Filesystem projection is atomic**: write to a temp file, then `rename` over the target. Never write directly to `.panopt/*.md`.

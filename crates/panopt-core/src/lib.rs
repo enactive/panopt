@@ -17,7 +17,7 @@ mod state;
 
 pub use error::CoreError;
 pub use model::{
-    Agent, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad,
-    ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
+    Agent, AgentTool, AgentToolPatch, Lock, Priority, Process, ProcessKind, ProcessPatch,
+    ProjectId, Scratchpad, ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 pub use state::Store;

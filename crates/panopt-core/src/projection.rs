@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::model::{Agent, Lock, RosterEntry, Scratchpad, Todo, TodoStatus};
+use crate::model::{Agent, AgentTool, Lock, Process, Scratchpad, Todo, TodoStatus};
 
 /// Per-process counter giving each temp file a unique name, so two concurrent
 /// writes to the same target never collide on the temp path.
@@ -53,8 +53,19 @@ fn scratchpads_index_path(ws: &Path) -> PathBuf {
     panopt_dir(ws).join("scratchpads.md")
 }
 
-/// The roster file: every persistent agent/command/terminal entry.
-fn roster_path(ws: &Path) -> PathBuf {
+/// The agent-tools projection: durable agent configurations (config layer).
+fn agent_tools_path(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("agent_tools.md")
+}
+
+/// The processes projection: per-project process instances (instance layer).
+fn processes_path(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("processes.md")
+}
+
+/// The pre-V6 roster projection, kept only so [`bootstrap`] can remove it
+/// from older installs migrating in place.
+fn legacy_roster_path(ws: &Path) -> PathBuf {
     panopt_dir(ws).join("roster.md")
 }
 
@@ -72,7 +83,10 @@ fn locks_path(ws: &Path) -> PathBuf {
 /// on the same filesystem - a precondition for `rename` to be atomic.
 fn atomic_write(target: &Path, contents: &str) -> io::Result<()> {
     let parent = target.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target has no parent directory",
+        )
     })?;
     let file_name = target
         .file_name()
@@ -101,7 +115,11 @@ pub(crate) fn render_todos_index_md(todos: &[Todo]) -> String {
         return out;
     }
     for todo in todos {
-        let mark = if todo.status == TodoStatus::Completed { 'x' } else { ' ' };
+        let mark = if todo.status == TodoStatus::Completed {
+            'x'
+        } else {
+            ' '
+        };
         out.push_str(&format!(
             "- [{mark}] [#{id}](todos/{id}.md) {title} - {status}, {priority}\n",
             id = todo.id,
@@ -147,7 +165,10 @@ pub(crate) fn render_todo_md(todo: &Todo) -> String {
     if !todo.comments.is_empty() {
         out.push_str("\n## Comments\n");
         for comment in &todo.comments {
-            out.push_str(&format!("\n**{}** - {}\n\n", comment.author, comment.created_at));
+            out.push_str(&format!(
+                "\n**{}** - {}\n\n",
+                comment.author, comment.created_at
+            ));
             out.push_str(comment.body.trim_end());
             out.push('\n');
         }
@@ -191,18 +212,63 @@ pub(crate) fn render_scratchpads_index_md(pads: &[(u64, String, String)]) -> Str
     out
 }
 
-/// Render the roster as a markdown list, one line per entry: its kind, id, and
-/// display label. The cockpit plugin parses this to populate the agents,
-/// commands, and terminals sidebar sections.
-pub(crate) fn render_roster_md(entries: &[RosterEntry]) -> String {
-    let mut out = String::from("# Roster\n\n");
-    if entries.is_empty() {
-        out.push_str("_(no roster entries)_\n");
+/// Render the agent-tools projection as a markdown list, one line per
+/// configured tool: id, label, enabled flag, and the command it would
+/// launch. This is the config-layer view of the two-layer model; the cockpit
+/// reads it for a future spawn picker.
+pub(crate) fn render_agent_tools_md(tools: &[AgentTool]) -> String {
+    let mut out = String::from("# Agent tools\n\n");
+    if tools.is_empty() {
+        out.push_str("_(no agent tools)_\n");
         return out;
     }
-    for e in entries {
-        let label = if e.display_name.is_empty() { &e.name } else { &e.display_name };
-        out.push_str(&format!("- [{}] #{} {}\n", e.kind.as_str(), e.id, label));
+    for t in tools {
+        let label = if t.display_name.is_empty() {
+            &t.name
+        } else {
+            &t.display_name
+        };
+        let flag = if t.enabled { "enabled" } else { "disabled" };
+        let command = if t.command.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", t.command)
+        };
+        out.push_str(&format!("- #{} {} [{}]{}\n", t.id, label, flag, command));
+    }
+    out
+}
+
+/// Render the processes projection as a markdown list, one line per instance:
+/// kind, id, and label, with a trailing `(from #N)` for processes that carry
+/// a back-reference to an agent tool. The line format preserves the shape the
+/// cockpit plugin already parses for the pre-V6 roster file, so the existing
+/// `(kind, id, label)` tuple keeps decoding cleanly.
+pub(crate) fn render_processes_md(processes: &[Process]) -> String {
+    let mut out = String::from("# Processes\n\n");
+    if processes.is_empty() {
+        out.push_str("_(no processes)_\n");
+        return out;
+    }
+    for p in processes {
+        let label = if !p.display_name.is_empty() {
+            p.display_name.as_str()
+        } else if !p.name.is_empty() {
+            p.name.as_str()
+        } else {
+            "(unnamed)"
+        };
+        let tool_suffix = match p.agent_tool_id {
+            Some(tid) => format!(" (from #{tid})"),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "- [{}] #{} {}{}\n",
+            p.kind.as_str(),
+            p.id,
+            label,
+            tool_suffix
+        ));
     }
     out
 }
@@ -239,7 +305,10 @@ pub(crate) fn render_locks_md(locks: &[Lock]) -> String {
     }
     for lock in locks {
         if lock.note.is_empty() {
-            out.push_str(&format!("- `{}` - held by {}\n", lock.name, lock.holder_name));
+            out.push_str(&format!(
+                "- `{}` - held by {}\n",
+                lock.name, lock.holder_name
+            ));
         } else {
             out.push_str(&format!(
                 "- `{}` - held by {} - {}\n",
@@ -262,10 +331,17 @@ pub(crate) fn bootstrap(ws: &Path) -> io::Result<()> {
     fs::create_dir_all(todos_dir(ws))?;
     atomic_write(&panopt_dir(ws).join(".gitignore"), "*\n")?;
     atomic_write(&todos_index_path(ws), &render_todos_index_md(&[]))?;
-    atomic_write(&scratchpads_index_path(ws), &render_scratchpads_index_md(&[]))?;
-    atomic_write(&roster_path(ws), &render_roster_md(&[]))?;
+    atomic_write(
+        &scratchpads_index_path(ws),
+        &render_scratchpads_index_md(&[]),
+    )?;
+    atomic_write(&agent_tools_path(ws), &render_agent_tools_md(&[]))?;
+    atomic_write(&processes_path(ws), &render_processes_md(&[]))?;
     atomic_write(&agents_path(ws), &render_agents_md(&[]))?;
     atomic_write(&locks_path(ws), &render_locks_md(&[]))?;
+    // Drop any pre-V6 roster.md left behind by an older install; the V6
+    // migration removed the table, and the two new files supersede it.
+    let _ = fs::remove_file(legacy_roster_path(ws));
     Ok(())
 }
 
@@ -311,7 +387,10 @@ pub(crate) fn project_scratchpads_index(
     ws: &Path,
     pads: &[(u64, String, String)],
 ) -> io::Result<()> {
-    atomic_write(&scratchpads_index_path(ws), &render_scratchpads_index_md(pads))?;
+    atomic_write(
+        &scratchpads_index_path(ws),
+        &render_scratchpads_index_md(pads),
+    )?;
 
     let live: HashSet<u64> = pads.iter().map(|(id, _, _)| *id).collect();
     if let Ok(entries) = fs::read_dir(scratchpad_dir(ws)) {
@@ -331,9 +410,14 @@ pub(crate) fn project_scratchpads_index(
     Ok(())
 }
 
-/// Rewrite `.panopt/roster.md` from the current roster.
-pub(crate) fn project_roster(ws: &Path, entries: &[RosterEntry]) -> io::Result<()> {
-    atomic_write(&roster_path(ws), &render_roster_md(entries))
+/// Rewrite `.panopt/agent_tools.md` from the current agent-tool list.
+pub(crate) fn project_agent_tools(ws: &Path, tools: &[AgentTool]) -> io::Result<()> {
+    atomic_write(&agent_tools_path(ws), &render_agent_tools_md(tools))
+}
+
+/// Rewrite `.panopt/processes.md` from the current process list.
+pub(crate) fn project_processes(ws: &Path, processes: &[Process]) -> io::Result<()> {
+    atomic_write(&processes_path(ws), &render_processes_md(processes))
 }
 
 /// Rewrite `.panopt/agents.md` from the current agent roster.
@@ -349,11 +433,16 @@ pub(crate) fn project_locks(ws: &Path, locks: &[Lock]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Priority, RosterKind, TodoComment};
+    use crate::model::{Priority, ProcessKind, TodoComment};
 
     /// A todo with the given identity and otherwise-default fields.
     fn todo(id: u64, title: &str, status: TodoStatus) -> Todo {
-        Todo { id, title: title.into(), status, ..Default::default() }
+        Todo {
+            id,
+            title: title.into(),
+            status,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -425,7 +514,10 @@ mod tests {
     #[test]
     fn project_todos_writes_index_and_per_todo_files() {
         let dir = tempfile::tempdir().unwrap();
-        let todos = vec![todo(1, "first", TodoStatus::Open), todo(2, "second", TodoStatus::Open)];
+        let todos = vec![
+            todo(1, "first", TodoStatus::Open),
+            todo(2, "second", TodoStatus::Open),
+        ];
         project_todos(dir.path(), &todos).unwrap();
 
         assert!(dir.path().join(".panopt/todos.md").is_file());
@@ -436,8 +528,14 @@ mod tests {
     #[test]
     fn project_todos_sweeps_deleted_per_todo_files() {
         let dir = tempfile::tempdir().unwrap();
-        project_todos(dir.path(), &[todo(1, "a", TodoStatus::Open), todo(2, "b", TodoStatus::Open)])
-            .unwrap();
+        project_todos(
+            dir.path(),
+            &[
+                todo(1, "a", TodoStatus::Open),
+                todo(2, "b", TodoStatus::Open),
+            ],
+        )
+        .unwrap();
         // Todo 2 is gone on the next projection; its file must be swept.
         project_todos(dir.path(), &[todo(1, "a", TodoStatus::Open)]).unwrap();
 
@@ -469,7 +567,10 @@ mod tests {
 
     #[test]
     fn empty_agent_roster_renders_placeholder() {
-        assert_eq!(render_agents_md(&[]), "# Agents\n\n_(no agents connected)_\n");
+        assert_eq!(
+            render_agents_md(&[]),
+            "# Agents\n\n_(no agents connected)_\n"
+        );
     }
 
     #[test]
@@ -540,9 +641,25 @@ mod tests {
         );
         assert!(dir.path().join(".panopt/todos.md").is_file());
         assert!(dir.path().join(".panopt/scratchpads.md").is_file());
-        assert!(dir.path().join(".panopt/roster.md").is_file());
+        assert!(dir.path().join(".panopt/agent_tools.md").is_file());
+        assert!(dir.path().join(".panopt/processes.md").is_file());
         assert!(dir.path().join(".panopt/agents.md").is_file());
         assert!(dir.path().join(".panopt/locks.md").is_file());
+    }
+
+    #[test]
+    fn bootstrap_removes_a_stale_pre_v6_roster_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let panopt = dir.path().join(".panopt");
+        fs::create_dir_all(&panopt).unwrap();
+        fs::write(panopt.join("roster.md"), "# Roster\n\n_(stale)_\n").unwrap();
+        bootstrap(dir.path()).unwrap();
+        assert!(
+            !panopt.join("roster.md").exists(),
+            "bootstrap must drop the pre-V6 roster.md"
+        );
+        assert!(panopt.join("agent_tools.md").is_file());
+        assert!(panopt.join("processes.md").is_file());
     }
 
     #[test]
@@ -556,7 +673,11 @@ mod tests {
     #[test]
     fn scratchpads_index_links_each_pad() {
         let pads = vec![
-            (1, "design notes".to_string(), "2026-05-23 18:05:21".to_string()),
+            (
+                1,
+                "design notes".to_string(),
+                "2026-05-23 18:05:21".to_string(),
+            ),
             (2, "scratch".to_string(), "2026-05-23 18:06:00".to_string()),
         ];
         assert_eq!(
@@ -568,30 +689,72 @@ mod tests {
     }
 
     #[test]
-    fn empty_roster_renders_placeholder() {
-        assert_eq!(render_roster_md(&[]), "# Roster\n\n_(no roster entries)_\n");
+    fn empty_agent_tools_renders_placeholder() {
+        assert_eq!(
+            render_agent_tools_md(&[]),
+            "# Agent tools\n\n_(no agent tools)_\n"
+        );
     }
 
     #[test]
-    fn roster_lists_each_entry_with_kind_and_label() {
-        let entries = vec![
-            RosterEntry {
+    fn agent_tools_render_with_label_enabled_flag_and_command() {
+        let tools = vec![
+            AgentTool {
                 id: 1,
-                kind: RosterKind::Agent,
-                name: "claude-a".into(),
+                name: "claude".into(),
                 display_name: "Mediator".into(),
+                command: "claude --model sonnet".into(),
+                tool_type: "agent".into(),
+                enabled: true,
                 ..Default::default()
             },
-            RosterEntry {
+            AgentTool {
                 id: 2,
-                kind: RosterKind::Command,
+                name: "scratch".into(),
+                tool_type: "agent".into(),
+                enabled: false,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            render_agent_tools_md(&tools),
+            "# Agent tools\n\n\
+             - #1 Mediator [enabled] claude --model sonnet\n\
+             - #2 scratch [disabled]\n"
+        );
+    }
+
+    #[test]
+    fn empty_processes_renders_placeholder() {
+        assert_eq!(
+            render_processes_md(&[]),
+            "# Processes\n\n_(no processes)_\n"
+        );
+    }
+
+    #[test]
+    fn processes_render_with_kind_id_label_and_optional_tool_ref() {
+        let processes = vec![
+            Process {
+                id: 1,
+                kind: ProcessKind::Agent,
+                name: "claude-a".into(),
+                display_name: "Mediator".into(),
+                agent_tool_id: Some(7),
+                ..Default::default()
+            },
+            Process {
+                id: 2,
+                kind: ProcessKind::Command,
                 name: "Run server".into(),
                 ..Default::default()
             },
         ];
         assert_eq!(
-            render_roster_md(&entries),
-            "# Roster\n\n- [agent] #1 Mediator\n- [command] #2 Run server\n"
+            render_processes_md(&processes),
+            "# Processes\n\n\
+             - [agent] #1 Mediator (from #7)\n\
+             - [command] #2 Run server\n"
         );
     }
 

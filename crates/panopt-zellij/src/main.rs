@@ -1,28 +1,33 @@
 //! PANopt coordination sidebar - a Zellij plugin.
 //!
-//! Renders a sidebar with five collapsible sections - todos, agents, terminals,
-//! commands, scratchpads - read from PANopt's `.panopt/` projection and from
-//! Zellij's live pane state. A caret toggles each section; up/down move a cursor
-//! through the rows; left/right collapse and expand; the mouse clicks any of it.
+//! Each plugin pane renders one kind of resource - todos, agents, terminals,
+//! commands, or scratchpads - selected by the `mode` value in its layout
+//! config. The five panes stack vertically in the cockpit's left column, each
+//! pinned to its own fixed proportion so adding or removing panes on the
+//! right cannot reshape any of them. A keyboard cursor walks the pane's items
+//! and scrolls when it hits the visible window's edge; the mouse clicks any
+//! row.
 //!
-//! The cockpit is this sidebar plus one content pane on the right. Selecting an
-//! item swaps its pane into that one slot and suppresses whatever was there - a
-//! suppressed pane keeps running, just hidden, no stack and no title bar.
-//! Documents (todos, scratchpads, lists) all share one re-pointable
-//! `panopt _viewer` pane; agents, commands, and terminals are each their own
-//! pane. Moving the cursor previews the selected item in the slot - or clears
-//! the slot when the row has nothing to show - always without taking focus off
-//! the sidebar. A click does the same; Enter additionally focuses the pane.
+//! The cockpit is these five panes plus one content pane on the right.
+//! Selecting an item swaps its pane into that one slot and suppresses
+//! whatever was there - a suppressed pane keeps running, just hidden, no
+//! stack and no title bar. Documents (todos, scratchpads, lists) all share
+//! one re-pointable `panopt _viewer` pane; agents, commands, and terminals
+//! are each their own pane. Moving the cursor previews the selected item in
+//! the slot - or clears the slot when the row has nothing to show - always
+//! without taking focus off the plugin pane. A click does the same; Enter
+//! additionally focuses the pane.
 //!
-//! If the user splits the content pane, a selection swaps into whichever pane
-//! was focused last before the sidebar took focus - the designated slot.
+//! If the user splits the content pane, a selection swaps into whichever
+//! pane was focused last before any plugin pane took focus - the designated
+//! slot. Each of the five panes derives the slot independently from the same
+//! `PaneUpdate` manifest, so they all converge on the same target.
 //!
-//! The plugin gates destructive Zellij actions - CloseFocus, CloseTab, Quit -
-//! routed in through named pipes (see `up::render_config`). When an active
-//! agent, command, or terminal would be lost, the plugin refuses by showing a
-//! floating dialog with a `close anyway` override; the sidebar itself has no
-//! such override. Outside the gate, the plugin closes only panes the user
-//! explicitly confirmed via `close anyway`.
+//! The Todos plugin pane doubles as the cockpit gatekeeper: it is the only
+//! pane that handles the close-request and spawn pipes (see `up::render_config`).
+//! When an active agent, command, or terminal would be lost, the Todos pane
+//! refuses by showing a floating dialog with a `close anyway` override; any
+//! of the five plugin panes themselves cannot be closed.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,22 +35,32 @@ use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
 
-/// How many items the todos and scratchpads sections show before a "more" row.
-const ITEM_LIMIT: usize = 7;
-
 /// Routing slot prefix for viewer panes the plugin spawns ad hoc. The layout
 /// boots one viewer with `--slot main`; further viewers spawned by
-/// [`ensure_viewer_in_slot`](PanoptSidebar::ensure_viewer_in_slot) get unique
-/// names `v1`, `v2`, ... so each pane has its own
-/// `.panopt/.cockpit/viewer-<slot>.json` routing file. Per-pane routing keeps
+/// [`PanoptPane::ensure_viewer_in_slot`] get unique names `v<mode-letter><n>`
+/// (`vt1`, `vs1`, `va1`, ...) so each pane has its own
+/// `.panopt/.cockpit/viewer-<slot>.json` routing file and the five plugin
+/// instances cannot collide on the same suffix. Per-pane routing keeps
 /// sidebar navigation single-pane: only the slot's viewer re-points on a
 /// preview, leaving any other split's viewer on whatever it was last showing
 /// (the user's "kept doc" pattern).
 const SPAWNED_VIEWER_SLOT_PREFIX: &str = "v";
 
-/// The five sidebar sections, in fixed top-to-bottom order.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SectionKind {
+/// Per-pane file the cockpit projects agent labels into. Each plugin instance
+/// writes the labels it owns (the Todos pane gets named agents via the
+/// `panopt:spawn-agent` pipe) and every instance reads the file so labels
+/// stay consistent across the five panes.
+const AGENT_LABELS_PATH: &str = "/host/.panopt/.cockpit/agent-labels.json";
+
+/// Which kind of resource one plugin pane renders. Five plugin instances run
+/// in parallel, one per `Mode`, each configured by the `mode "<kind>"` value
+/// in the layout's plugin block. Zellij keys plugin identity on
+/// `(URL, configuration)`, so the five panes are five distinct instances and
+/// can be addressed individually by `zellij action pipe --plugin-configuration
+/// "mode=<kind>"`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Mode {
+    #[default]
     Todos,
     Agents,
     Terminals,
@@ -53,34 +68,51 @@ enum SectionKind {
     Scratchpads,
 }
 
-impl SectionKind {
-    const ORDER: [SectionKind; 5] = [
-        SectionKind::Todos,
-        SectionKind::Agents,
-        SectionKind::Terminals,
-        SectionKind::Commands,
-        SectionKind::Scratchpads,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            SectionKind::Todos => "Todos",
-            SectionKind::Agents => "Agents",
-            SectionKind::Terminals => "Terminals",
-            SectionKind::Commands => "Commands",
-            SectionKind::Scratchpads => "Scratchpads",
+impl Mode {
+    fn parse(s: &str) -> Option<Mode> {
+        match s {
+            "todos" => Some(Mode::Todos),
+            "agents" => Some(Mode::Agents),
+            "terminals" => Some(Mode::Terminals),
+            "commands" => Some(Mode::Commands),
+            "scratchpads" => Some(Mode::Scratchpads),
+            _ => None,
         }
     }
 
-    /// Todos and scratchpads are long; they show a capped list. The roster and
-    /// terminal sections are short and shown whole.
-    fn limited(self) -> bool {
-        matches!(self, SectionKind::Todos | SectionKind::Scratchpads)
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Todos => "Todos",
+            Mode::Agents => "Agents",
+            Mode::Terminals => "Terminals",
+            Mode::Commands => "Commands",
+            Mode::Scratchpads => "Scratchpads",
+        }
+    }
+
+    /// One-letter slug that prefixes spawned viewer slot names so the five
+    /// plugin instances cannot collide on the same `v<N>` suffix.
+    fn letter(self) -> char {
+        match self {
+            Mode::Todos => 't',
+            Mode::Agents => 'a',
+            Mode::Terminals => 'r',
+            Mode::Commands => 'c',
+            Mode::Scratchpads => 's',
+        }
     }
 }
 
 #[derive(Default)]
-struct PanoptSidebar {
+struct PanoptPane {
+    /// Which resource kind this plugin instance renders. Set in
+    /// [`PanoptPane::load`] from the `mode` config key.
+    mode: Mode,
+    /// Whether the `mode` config value was a recognized kind. False means we
+    /// fell back to [`Mode::Todos`] and the header renders a one-line warning
+    /// so a misconfigured pane is visible rather than silently broken.
+    mode_known: bool,
+
     /// Absolute project root, from the layout's plugin config. The cwd for
     /// spawned panes.
     ws: Option<String>,
@@ -91,71 +123,85 @@ struct PanoptSidebar {
     /// Whether Zellij has granted the requested permissions.
     permitted: bool,
 
-    /// Todos parsed from `.panopt/todos.md`: `(id, label)`.
+    /// Todos parsed from `.panopt/todos.md`: `(id, label)`. Populated only
+    /// when this pane's mode actually displays todos.
     todos: Vec<(u64, String)>,
     /// Scratchpads parsed from `.panopt/scratchpads.md`: `(id, label)`.
     scratchpads: Vec<(u64, String)>,
-    /// Roster entries parsed from `.panopt/roster.md`.
-    roster: Vec<RosterRow>,
+    /// Process instances parsed from `.panopt/processes.md`.
+    /// TODO(#27): render agent_tools.md alongside processes once a spawn UI
+    /// exists; until then the sidebar shows only live instances, same as the
+    /// pre-V6 roster view.
+    processes: Vec<ProcessRow>,
     /// Live (and suppressed) content panes flattened from Zellij's manifest.
     panes: Vec<PaneRow>,
 
-    /// The five sections, rebuilt from the data above on every change.
-    sections: Vec<Section>,
-    /// Per-section collapsed flag, kept across rebuilds. Indexed like
-    /// [`SectionKind::ORDER`].
-    collapsed: [bool; 5],
-    /// The row the keyboard cursor is on.
-    focus: Focus,
-    /// One printed-row -> meaning entry, rebuilt every render for click routing.
-    row_map: Vec<RowKind>,
+    /// Items currently shown by this mode, rebuilt on every change. Always a
+    /// single flat list; no sections.
+    items: Vec<Item>,
+    /// Index of the keyboard-selected item. Stays in `0..items.len()`.
+    cursor: usize,
+    /// Index of the topmost item rendered in the visible window. The window
+    /// is `last_rows - 1` items (one row reserved for the title).
+    scroll: usize,
+    /// Last `rows` value passed to [`PanoptPane::render`]. Cached so the key
+    /// and mouse handlers can clamp scroll using a single source of truth.
+    last_rows: usize,
 
-    /// This plugin's own pane id, learned at load - used to return focus to the
-    /// sidebar after a swap.
+    /// This plugin's own pane id, learned at load - used to return focus to
+    /// the plugin pane after a swap.
     plugin_pane: Option<PaneId>,
     /// The pane occupying the designated content slot: the pane a selection
-    /// swaps against. It is the last non-plugin pane focused before the sidebar
-    /// took focus, updated in place whenever the plugin swaps the slot itself.
+    /// swaps against. It is the last non-plugin pane focused before any
+    /// plugin pane took focus, updated in place whenever the plugin swaps
+    /// the slot itself.
     slot_pane: Option<PaneId>,
-    /// How many ad-hoc agents have been numbered, for the next "Agent N" label.
+    /// How many ad-hoc agents this instance has numbered. Only meaningful in
+    /// the Todos (gatekeeper) pane, which is the only pane that handles the
+    /// `panopt:spawn-agent` pipe; other panes pick up labels from the
+    /// projection file at [`AGENT_LABELS_PATH`].
     next_agent: u32,
     /// Counter for allocating unique routing slot names for viewer panes the
-    /// plugin spawns. The boot viewer keeps its `--slot main` from the layout;
-    /// every new viewer takes `v<n>` here, never recycled.
+    /// plugin spawns. Combined with [`Mode::letter`] so two plugin instances
+    /// cannot allocate the same name. The boot viewer keeps its `--slot main`
+    /// from the layout.
     next_viewer_slot: u32,
-    /// Per-agent sidebar label, keyed by terminal pane id. The label is a
-    /// mutable *presentation* string - today a stable "Agent N", later meant to
-    /// be refreshed from the agent's own published activity. Ordering must
-    /// never derive from it: agent rows are ordered by pane id (creation
-    /// order), so the label is free to change without reshuffling the sidebar.
+    /// Sidebar label for each agent pane, keyed by terminal pane id. The
+    /// gatekeeper writes user-supplied labels here and projects the map to
+    /// [`AGENT_LABELS_PATH`]; every other pane reads from that file. Never
+    /// participates in ordering - agent rows order by pane id (creation
+    /// order), so a label change cannot reshuffle the list.
     agent_labels: BTreeMap<u32, String>,
 
-    /// Whether the sidebar plugin pane is currently the focused pane in its
-    /// tab. Updated by [`ingest_panes`](PanoptSidebar::ingest_panes), but only
-    /// from a non-transient manifest: a transient `zellij action pipe` pane
-    /// briefly steals focus while the close-gate pipes fly, and we must not
-    /// let that flicker make the gate think the user is not on the sidebar.
-    /// Used by [`gate_close_focus`](PanoptSidebar::gate_close_focus) to refuse
-    /// closing the sidebar absolutely.
+    /// Whether any plugin pane is currently the focused pane in its tab.
+    /// Updated by [`PanoptPane::ingest_panes`] but only from a non-transient
+    /// manifest: a transient `zellij action pipe` pane briefly steals focus
+    /// while the close-gate pipes fly, and we must not let that flicker make
+    /// the gate think the user has moved off the cockpit panes.
+    /// Used by [`PanoptPane::gate_close_focus`] to refuse closing any plugin
+    /// pane absolutely.
     sidebar_focused: bool,
     /// The tab position with a focused pane, derived from the same manifest
-    /// snapshot that drives `sidebar_focused`. Scopes the CloseTab gate. None
-    /// when no pane was focused in the latest meaningful update.
+    /// snapshot that drives `sidebar_focused`. Scopes the CloseTab gate.
     focused_tab: Option<usize>,
     /// The last gate refusal: what was refused (a label), set when the gate
     /// blocks an action because active items would be lost. Rendered in the
-    /// sidebar header so the user knows their keypress was intercepted.
-    /// Cleared on the next successful navigation. A placeholder until the
-    /// floating-pane dialog (task 5) lands.
+    /// title row so the user knows their keypress was intercepted. Cleared
+    /// on the next successful navigation. Only the Todos pane runs the gate,
+    /// so only the Todos pane ever sets this.
     last_gate_refusal: Option<String>,
-    /// Whether the initial preview has been shown on startup.
+    /// Whether the initial preview has been shown on startup. Only the Todos
+    /// pane drives the initial preview; the others remain idle until the
+    /// user navigates them.
     initial_preview_done: bool,
-    /// Counter for delaying initial preview until the UI is ready.
+    /// Counter for delaying the initial preview until the UI is ready.
     initial_preview_delay: u32,
 }
 
-/// A parsed `.panopt/roster.md` line.
-struct RosterRow {
+/// A parsed `.panopt/processes.md` line. The line format is preserved from
+/// the pre-V6 `roster.md` so the existing `[kind] #id label` parser still
+/// works; any trailing `(from #N)` is dropped from `label`.
+struct ProcessRow {
     kind: String,
     id: u64,
     label: String,
@@ -166,11 +212,11 @@ struct PaneRow {
     id: PaneId,
     title: String,
     focused: bool,
-    /// A suppressed pane is hidden but still running - swapped out of the slot
-    /// by an earlier selection. Used by
-    /// [`route_pane_to_slot`](PanoptSidebar::route_pane_to_slot) and
-    /// [`ensure_viewer_in_slot`](PanoptSidebar::ensure_viewer_in_slot) to tell
-    /// whether a target pane is already on screen.
+    /// A suppressed pane is hidden but still running - swapped out of the
+    /// slot by an earlier selection. Used by
+    /// [`PanoptPane::route_pane_to_slot`] and
+    /// [`PanoptPane::ensure_viewer_in_slot`] to tell whether a target pane
+    /// is already on screen.
     suppressed: bool,
     exited: bool,
     role: PaneRole,
@@ -190,23 +236,17 @@ enum PaneRole {
     Viewer,
     /// An ad-hoc `panopt _agent` pane, started with `a`.
     Agent,
-    /// A `panopt _roster-run <id>` pane, by roster id.
-    Roster(u64),
+    /// A `panopt _process-run <id>` pane, by process id.
+    Process(u64),
     /// A plain terminal the user opened.
     Shell,
 }
 
-/// One built section: its kind and its items.
-struct Section {
-    kind: SectionKind,
-    items: Vec<Item>,
-}
-
-/// One item within a section.
+/// One item rendered in the pane.
 struct Item {
     label: String,
     target: ItemTarget,
-    /// A live marker: a running roster entry, or the Zellij-focused pane.
+    /// A live marker: a running process, or the Zellij-focused pane.
     live: bool,
 }
 
@@ -215,36 +255,30 @@ struct Item {
 enum ItemTarget {
     Todo(u64),
     Scratchpad(u64),
-    /// A roster agent or command, by roster id.
-    Roster(u64),
+    /// A process agent or command, by process id.
+    Process(u64),
     /// An existing pane: an ad-hoc agent or a plain terminal.
     Pane(PaneId),
 }
 
-/// The keyboard cursor: a section, and a row within it (`None` = its header).
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-struct Focus {
-    section: usize,
-    item: Option<usize>,
-}
+register_plugin!(PanoptPane);
 
-/// What a printed row means, for resolving a mouse click.
-#[derive(Clone, Copy)]
-enum RowKind {
-    /// Not interactive: the title, a placeholder, the help line.
-    Inert,
-    /// A section header. A click in columns 0-1 hits the caret.
-    Header(usize),
-    /// An item: section index, item index.
-    Item(usize, usize),
-    /// The "+N more" row of a capped section.
-    More(usize),
-}
-
-register_plugin!(PanoptSidebar);
-
-impl ZellijPlugin for PanoptSidebar {
+impl ZellijPlugin for PanoptPane {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        match configuration
+            .get("mode")
+            .map(String::as_str)
+            .and_then(Mode::parse)
+        {
+            Some(mode) => {
+                self.mode = mode;
+                self.mode_known = true;
+            }
+            None => {
+                self.mode = Mode::Todos;
+                self.mode_known = false;
+            }
+        }
         self.ws = configuration.get("ws").cloned();
         self.panopt_bin = configuration
             .get("panopt_bin")
@@ -255,8 +289,13 @@ impl ZellijPlugin for PanoptSidebar {
             .cloned()
             .unwrap_or_else(|| "7600".to_string());
         self.plugin_pane = Some(PaneId::Plugin(get_plugin_ids().plugin_id));
-        // Clear any routing files left by a previous cockpit session.
-        let _ = fs::remove_dir_all("/host/.panopt/.cockpit");
+        // The Todos pane is the only instance that boots a fresh cockpit (it
+        // is the first pane Zellij loads in the layout); have it clear stale
+        // routing files left by a previous session so all the other panes see
+        // a clean `.cockpit/` mount on startup.
+        if self.mode == Mode::Todos {
+            let _ = fs::remove_dir_all("/host/.panopt/.cockpit");
+        }
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -270,7 +309,7 @@ impl ZellijPlugin for PanoptSidebar {
             EventType::PermissionRequestResult,
         ]);
         self.reload_data();
-        self.rebuild_sections();
+        self.rebuild_items();
         set_timeout(1.0);
     }
 
@@ -282,16 +321,23 @@ impl ZellijPlugin for PanoptSidebar {
             }
             Event::PaneUpdate(manifest) => {
                 self.ingest_panes(manifest);
-                self.rebuild_sections();
+                self.rebuild_items();
                 true
             }
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Timer(_) => {
-                if !self.initial_preview_done && self.slot_pane.is_some() && self.permitted {
+                // Only the Todos pane drives the initial preview - one preview
+                // per cockpit boot is enough, and the other panes have nothing
+                // useful to preview until the user navigates them.
+                if self.mode == Mode::Todos
+                    && !self.initial_preview_done
+                    && self.slot_pane.is_some()
+                    && self.permitted
+                {
                     self.initial_preview_delay += 1;
                     if self.initial_preview_delay >= 2 {
-                        self.preview_focus();
+                        self.preview_cursor();
                         if let Some(plugin) = self.plugin_pane {
                             focus_pane_with_id(plugin, false, false);
                         }
@@ -299,7 +345,7 @@ impl ZellijPlugin for PanoptSidebar {
                     }
                 }
                 self.reload_data();
-                self.rebuild_sections();
+                self.rebuild_items();
                 set_timeout(1.0);
                 true
             }
@@ -307,18 +353,15 @@ impl ZellijPlugin for PanoptSidebar {
         }
     }
 
-    /// `panopt:spawn-agent` opens a new agent pane; `panopt:spawn-blank-pane`
-    /// opens a fresh empty viewer in a brand-new tiled pane - Alt-N's cockpit
-    /// behaviour, dispatched from the keybind via `MessagePlugin`.
-    ///
-    /// `panopt:close-focus-request`, `panopt:close-tab-request`, and
-    /// `panopt:quit-request` are the three destructive actions, retargeted by
-    /// `up::render_config` from Zellij's stock CloseFocus/CloseTab/Quit
-    /// keybinds. The plugin gates each: it refuses the action when an active
-    /// agent, command, or terminal would be lost, and otherwise force-closes
-    /// via the zellij-tile API (which bypasses the rewritten keybind, so the
-    /// gate is not re-triggered).
+    /// Only the Todos pane handles the cockpit-wide pipes. With five plugin
+    /// instances running, every `zellij action pipe` invocation reaches all
+    /// of them; the keybinds in `up::render_config` narrow delivery with
+    /// `--plugin-configuration "mode=todos"`, and this guard provides
+    /// belt-and-braces idempotency if a custom config slips that filter.
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        if self.mode != Mode::Todos {
+            return false;
+        }
         match pipe_message.name.as_str() {
             "panopt:spawn-agent" => {
                 self.spawn_agent_pane(pipe_message.payload.as_deref());
@@ -349,76 +392,88 @@ impl ZellijPlugin for PanoptSidebar {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        // The plugin's stdout becomes the pane content. Each emitted line must
-        // carry non-whitespace - Zellij's parser drops a blank line - so the
-        // row map and the printed lines stay in lockstep.
-        let mut lines: Vec<(String, RowKind, Style)> = Vec::new();
-
-        let title = if !self.permitted {
-            "PANopt - grant permissions in the Zellij prompt".to_string()
-        } else if let Some(refusal) = &self.last_gate_refusal {
-            // Surface the most recent gate refusal so the user understands
-            // why their close keypress did nothing. A short stand-in for the
-            // floating-pane dialog: the next iteration replaces this with a
-            // prompt that has a `close anyway` option.
-            format!("PANopt  blocked: {refusal}")
-        } else {
-            "PANopt  [a]gent [c]todo".to_string()
-        };
-        lines.push((title, RowKind::Inert, Style::HEADER));
-
-        for (si, section) in self.sections.iter().enumerate() {
-            let collapsed = self.collapsed[si];
-            let caret = if collapsed { '>' } else { 'v' };
-            let header = format!("{caret} {} ({})", section.kind.label(), section.items.len());
-            lines.push((header, RowKind::Header(si), Style::HEADER));
-            if collapsed {
-                continue;
-            }
-            if section.items.is_empty() {
-                lines.push(("  (none)".to_string(), RowKind::Inert, Style::DIM));
-                continue;
-            }
-            let limit = if section.kind.limited() {
-                ITEM_LIMIT
-            } else {
-                usize::MAX
-            };
-            for (ii, item) in section.items.iter().enumerate().take(limit) {
-                let marker = if item.live { '*' } else { ' ' };
-                lines.push((
-                    format!(" {marker}{}", item.label),
-                    RowKind::Item(si, ii),
-                    Style::NORMAL,
-                ));
-            }
-            if section.items.len() > limit {
-                let more = section.items.len() - limit;
-                lines.push((format!("  +{more} more"), RowKind::More(si), Style::DIM));
-            }
+        self.last_rows = rows;
+        // The plugin's stdout becomes the pane content. Each emitted line
+        // must carry non-whitespace - Zellij's parser drops a blank line.
+        let total = self.items.len();
+        let visible = rows.saturating_sub(1).max(1);
+        let max_scroll = total.saturating_sub(visible);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
         }
-
-        self.row_map = lines.iter().map(|(_, kind, _)| *kind).take(rows).collect();
-        for (line, kind, style) in lines.into_iter().take(rows) {
-            let focused = self.row_is_focused(kind);
-            print!("{}\r\n", paint(&line, cols, style, focused));
+        let title = self.title_line(total, visible);
+        print!("{}\r\n", paint(&title, cols, Style::Header, false));
+        if total == 0 {
+            print!("{}\r\n", paint("  (none)", cols, Style::Dim, false));
+            return;
+        }
+        let end = (self.scroll + visible).min(total);
+        for idx in self.scroll..end {
+            let item = &self.items[idx];
+            let marker = if item.live { '*' } else { ' ' };
+            let line = format!(" {marker}{}", item.label);
+            let focused = idx == self.cursor;
+            print!("{}\r\n", paint(&line, cols, Style::Normal, focused));
         }
     }
 }
 
-impl PanoptSidebar {
-    // --- data ---
-
-    /// Re-read the three projected index files from Zellij's `/host` mount.
-    fn reload_data(&mut self) {
-        self.todos = read_index("/host/.panopt/todos.md");
-        self.scratchpads = read_index("/host/.panopt/scratchpads.md");
-        self.roster = read_roster("/host/.panopt/roster.md");
+impl PanoptPane {
+    /// The title row text: the mode label, plus a refusal banner (Todos only,
+    /// drives the gate) or a "mode misconfigured" warning (when the `mode`
+    /// config key was absent or unrecognized), and a scroll-range suffix when
+    /// the list is larger than the visible window.
+    fn title_line(&self, total: usize, visible: usize) -> String {
+        if !self.permitted {
+            return "PANopt - grant permissions in the Zellij prompt".to_string();
+        }
+        if !self.mode_known {
+            return format!("{} (mode config missing - defaulted)", self.mode.label());
+        }
+        if self.mode == Mode::Todos {
+            if let Some(refusal) = &self.last_gate_refusal {
+                return format!("{}  blocked: {refusal}", self.mode.label());
+            }
+        }
+        let base = self.mode.label();
+        if total == 0 {
+            return base.to_string();
+        }
+        if total <= visible {
+            return format!("{base} ({total})");
+        }
+        let start = self.scroll + 1;
+        let end = (self.scroll + visible).min(total);
+        format!("{base} ({start}-{end}/{total})")
     }
 
-    /// Flatten the pane manifest into the content-pane list - suppressed panes
-    /// included, since they are the hidden agents and terminals the sidebar
-    /// still lists - and keep the designated slot pane pointing at a live pane.
+    // --- data ---
+
+    /// Re-read whichever projected index files this mode needs. The Todos
+    /// pane reads only todos; Scratchpads only scratchpads; the Agents and
+    /// Commands modes share processes.md plus the agent label projection.
+    fn reload_data(&mut self) {
+        match self.mode {
+            Mode::Todos => {
+                self.todos = read_index("/host/.panopt/todos.md");
+            }
+            Mode::Scratchpads => {
+                self.scratchpads = read_index("/host/.panopt/scratchpads.md");
+            }
+            Mode::Agents | Mode::Commands => {
+                self.processes = read_processes("/host/.panopt/processes.md");
+                self.read_agent_labels();
+            }
+            Mode::Terminals => {
+                self.read_agent_labels();
+            }
+        }
+    }
+
+    /// Flatten the pane manifest into the content-pane list - suppressed
+    /// panes included, since they are the hidden agents and terminals the
+    /// sidebar still lists - and keep the designated slot pane pointing at a
+    /// live pane.
     fn ingest_panes(&mut self, manifest: PaneManifest) {
         let mut tabs: Vec<&usize> = manifest.panes.keys().collect();
         tabs.sort();
@@ -429,11 +484,9 @@ impl PanoptSidebar {
         let mut focused_tab_this_update: Option<usize> = None;
         for tab in tabs {
             for p in &manifest.panes[tab] {
-                // The transient `zellij action pipe` pane briefly steals focus
-                // while a close-request pipe is in flight. We skip it from
-                // focus tracking and from the pane list - it has no role in
-                // the cockpit and would otherwise become the slot pane or
-                // make the gate think the user has moved off the sidebar.
+                // The transient `zellij action pipe` pane briefly steals
+                // focus while a close-request pipe is in flight. Skip it
+                // from focus tracking and from the pane list.
                 if is_transient_pipe_pane(p) {
                     continue;
                 }
@@ -441,11 +494,10 @@ impl PanoptSidebar {
                     saw_focused_pane = true;
                     focused_tab_this_update = Some(*tab);
                     if p.is_plugin {
-                        if let Some(PaneId::Plugin(pid)) = self.plugin_pane {
-                            if p.id == pid {
-                                sidebar_focused_this_update = true;
-                            }
-                        }
+                        // Any plugin pane focused = a cockpit plugin pane is
+                        // focused. The cockpit is the only place plugins
+                        // run, and the gate refuses close on any of the five.
+                        sidebar_focused_this_update = true;
                     }
                 }
                 if p.is_plugin || !p.is_selectable {
@@ -473,37 +525,21 @@ impl PanoptSidebar {
                 });
             }
         }
-        // Order content panes by pane id - creation order. Zellij's manifest
-        // does not keep a stable order as panes move in and out of the
-        // suppressed set, and every slot swap suppresses one pane and reveals
-        // another; without this sort the sidebar's rows reshuffle under the
-        // keyboard cursor between one arrow press and the next.
         rows.sort_by_key(|p| p.id);
         self.panes = rows;
         self.sync_agent_labels();
-        // Keep `slot_pane` on the pane focused before the sidebar took focus:
-        // only overwrite it when a non-plugin pane is focused.
         if let Some(pane) = focused_non_plugin {
             self.slot_pane = Some(pane);
         }
-        // `sidebar_focused` only flips when this update actually carried focus
-        // information - a manifest with no focused pane (e.g. between focus
-        // transitions) preserves the prior value so the gate keeps the right
-        // answer across the transient-pipe interlude.
         if saw_focused_pane {
             self.sidebar_focused = sidebar_focused_this_update;
             self.focused_tab = focused_tab_this_update;
         }
-        // Drop the slot pane if it has since closed.
         if let Some(slot) = self.slot_pane {
             if !self.panes.iter().any(|p| p.id == slot) {
                 self.slot_pane = None;
             }
         }
-        // Adopt a slot pane when there is none yet - at startup, the lone
-        // viewer pane - so the first selection swaps in place. Only adopt a
-        // visible pane: replacing against a suppressed slot wastes the swap
-        // call and can leave the layout confused.
         if self.slot_pane.is_none() {
             self.slot_pane = self
                 .panes
@@ -514,15 +550,10 @@ impl PanoptSidebar {
         }
     }
 
-    /// Whether `pane` is currently on screen - present in the manifest and not
-    /// suppressed. A pane that is already visible should never be swapped into
-    /// the slot: [`replace_pane_with_existing_pane`] would yank it out of its
-    /// current position, collapsing whichever split it was filling.
     fn pane_is_visible(&self, pane: PaneId) -> bool {
         self.panes.iter().any(|p| p.id == pane && !p.suppressed)
     }
 
-    /// The routing slot name of a viewer pane, if `pane` is a viewer with one.
     fn viewer_slot_of(&self, pane: PaneId) -> Option<String> {
         self.panes
             .iter()
@@ -530,9 +561,6 @@ impl PanoptSidebar {
             .and_then(|p| p.viewer_slot.clone())
     }
 
-    /// The first suppressed viewer pane, if one is being held offscreen by a
-    /// previous slot swap. Cheaper than spawning a new viewer when the slot
-    /// needs to switch back to a document.
     fn first_suppressed_viewer(&self) -> Option<PaneId> {
         self.panes
             .iter()
@@ -541,25 +569,29 @@ impl PanoptSidebar {
     }
 
     /// Allocate the next unique routing slot name for a viewer the plugin is
-    /// about to spawn.
+    /// about to spawn. The mode letter scopes the counter per-plugin-instance,
+    /// so two panes spawning a viewer on the same tick still produce distinct
+    /// names (e.g. `vt1` from Todos, `vs1` from Scratchpads).
     fn allocate_viewer_slot(&mut self) -> String {
         self.next_viewer_slot += 1;
-        format!("{SPAWNED_VIEWER_SLOT_PREFIX}{}", self.next_viewer_slot)
+        format!(
+            "{SPAWNED_VIEWER_SLOT_PREFIX}{}{}",
+            self.mode.letter(),
+            self.next_viewer_slot
+        )
     }
 
-    /// The running pane of roster entry `id`, if it is running.
-    fn roster_pane(&self, id: u64) -> Option<PaneId> {
+    fn process_pane(&self, id: u64) -> Option<PaneId> {
         self.panes
             .iter()
-            .find(|p| p.role == PaneRole::Roster(id) && !p.exited)
+            .find(|p| p.role == PaneRole::Process(id) && !p.exited)
             .map(|p| p.id)
     }
 
-    /// Keep [`agent_labels`](Self::agent_labels) in step with the live agent
-    /// panes: forget closed ones, and give any agent still unlabelled - one the
-    /// plugin did not spawn itself, e.g. after a plugin reload - a stable
-    /// "Agent N" fallback. New numbers only ever go up, so a label, once
-    /// assigned, never changes for the life of its pane.
+    /// Keep `agent_labels` in step with the live agent panes: forget closed
+    /// ones, give any agent still unlabelled a stable "Agent N" fallback.
+    /// The Todos pane (the gatekeeper) projects the resulting map to the
+    /// shared file so the other four panes pick up user-supplied labels.
     fn sync_agent_labels(&mut self) {
         let agent_ids: Vec<u32> = self
             .panes
@@ -578,10 +610,24 @@ impl PanoptSidebar {
                     .insert(tid, format!("Agent {}", self.next_agent));
             }
         }
+        if self.mode == Mode::Todos {
+            write_agent_labels(&self.agent_labels);
+        }
     }
 
-    /// The sidebar label for an agent pane: its mutable display label, or the
-    /// pane title as a fallback if it is somehow not yet labelled.
+    /// Read agent labels written by the gatekeeper from
+    /// [`AGENT_LABELS_PATH`]. Merges user-supplied labels into this
+    /// instance's `agent_labels` so non-Todos panes can display them.
+    /// Defensive: a missing or malformed file leaves the map untouched.
+    fn read_agent_labels(&mut self) {
+        let Ok(body) = fs::read_to_string(AGENT_LABELS_PATH) else {
+            return;
+        };
+        for (tid, label) in parse_agent_labels(&body) {
+            self.agent_labels.insert(tid, label);
+        }
+    }
+
     fn agent_label(&self, p: &PaneRow) -> String {
         match p.id {
             PaneId::Terminal(tid) => self
@@ -593,208 +639,187 @@ impl PanoptSidebar {
         }
     }
 
-    /// Rebuild the five sections from the parsed data and live pane state.
-    fn rebuild_sections(&mut self) {
-        let mut sections = Vec::with_capacity(5);
-        for kind in SectionKind::ORDER {
-            let items = match kind {
-                SectionKind::Todos => self
-                    .todos
+    /// Rebuild this pane's item list from parsed data + live panes. The list
+    /// is always a single flat sequence for the pane's mode.
+    fn rebuild_items(&mut self) {
+        let items: Vec<Item> = match self.mode {
+            Mode::Todos => self
+                .todos
+                .iter()
+                .map(|(id, label)| Item {
+                    label: format!("#{id} {label}"),
+                    target: ItemTarget::Todo(*id),
+                    live: false,
+                })
+                .collect(),
+            Mode::Scratchpads => self
+                .scratchpads
+                .iter()
+                .map(|(id, label)| Item {
+                    label: format!("#{id} {label}"),
+                    target: ItemTarget::Scratchpad(*id),
+                    live: false,
+                })
+                .collect(),
+            Mode::Agents => {
+                // Agent-kind processes, plus ad-hoc `a`-spawned agent panes
+                // that have no backing process row.
+                let mut items: Vec<Item> = self
+                    .processes
                     .iter()
-                    .map(|(id, label)| Item {
-                        label: format!("#{id} {label}"),
-                        target: ItemTarget::Todo(*id),
-                        live: false,
-                    })
-                    .collect(),
-                SectionKind::Scratchpads => self
-                    .scratchpads
-                    .iter()
-                    .map(|(id, label)| Item {
-                        label: format!("#{id} {label}"),
-                        target: ItemTarget::Scratchpad(*id),
-                        live: false,
-                    })
-                    .collect(),
-                SectionKind::Agents => {
-                    // Roster agents, plus ad-hoc `a`-spawned agent panes that
-                    // are not roster entries.
-                    let mut items: Vec<Item> = self
-                        .roster
-                        .iter()
-                        .filter(|r| r.kind == "agent")
-                        .map(|r| Item {
-                            label: r.label.clone(),
-                            target: ItemTarget::Roster(r.id),
-                            live: self.roster_pane(r.id).is_some(),
-                        })
-                        .collect();
-                    for p in self.panes.iter().filter(|p| p.role == PaneRole::Agent) {
-                        items.push(Item {
-                            label: self.agent_label(p),
-                            target: ItemTarget::Pane(p.id),
-                            live: true,
-                        });
-                    }
-                    items
-                }
-                SectionKind::Commands => self
-                    .roster
-                    .iter()
-                    .filter(|r| r.kind == "command")
+                    .filter(|r| r.kind == "agent")
                     .map(|r| Item {
                         label: r.label.clone(),
-                        target: ItemTarget::Roster(r.id),
-                        live: self.roster_pane(r.id).is_some(),
+                        target: ItemTarget::Process(r.id),
+                        live: self.process_pane(r.id).is_some(),
                     })
-                    .collect(),
-                SectionKind::Terminals => self
-                    .panes
-                    .iter()
-                    .filter(|p| p.role == PaneRole::Shell)
-                    .map(|p| Item {
-                        label: pane_label(p),
+                    .collect();
+                for p in self.panes.iter().filter(|p| p.role == PaneRole::Agent) {
+                    items.push(Item {
+                        label: self.agent_label(p),
                         target: ItemTarget::Pane(p.id),
-                        live: p.focused,
-                    })
-                    .collect(),
-            };
-            sections.push(Section { kind, items });
-        }
-        self.sections = sections;
-        self.clamp_focus();
-    }
-
-    // --- focus ---
-
-    /// Every keyboard-navigable row, in order: each header, then each item of
-    /// an expanded section.
-    fn nav_rows(&self) -> Vec<Focus> {
-        let mut rows = Vec::new();
-        for (si, section) in self.sections.iter().enumerate() {
-            rows.push(Focus {
-                section: si,
-                item: None,
-            });
-            if !self.collapsed[si] {
-                let shown = visible_item_count(section);
-                for ii in 0..shown {
-                    rows.push(Focus {
-                        section: si,
-                        item: Some(ii),
+                        live: true,
                     });
                 }
+                items
             }
-        }
-        rows
+            Mode::Commands => self
+                .processes
+                .iter()
+                .filter(|r| r.kind == "command")
+                .map(|r| Item {
+                    label: r.label.clone(),
+                    target: ItemTarget::Process(r.id),
+                    live: self.process_pane(r.id).is_some(),
+                })
+                .collect(),
+            Mode::Terminals => self
+                .panes
+                .iter()
+                .filter(|p| p.role == PaneRole::Shell)
+                .map(|p| Item {
+                    label: pane_label(p),
+                    target: ItemTarget::Pane(p.id),
+                    live: p.focused,
+                })
+                .collect(),
+        };
+        self.items = items;
+        self.clamp_cursor();
     }
 
-    /// Keep the focus on a row that still exists after a rebuild.
-    fn clamp_focus(&mut self) {
-        if self.focus.section >= self.sections.len() {
-            self.focus = Focus::default();
+    /// Keep cursor + scroll inside the item bounds after a rebuild.
+    fn clamp_cursor(&mut self) {
+        if self.items.is_empty() {
+            self.cursor = 0;
+            self.scroll = 0;
             return;
         }
-        if let Some(ii) = self.focus.item {
-            let section = &self.sections[self.focus.section];
-            let shown = visible_item_count(section);
-            if self.collapsed[self.focus.section] || ii >= shown {
-                self.focus.item = None;
-            }
+        if self.cursor >= self.items.len() {
+            self.cursor = self.items.len() - 1;
+        }
+        let visible = self.last_rows.saturating_sub(1).max(1);
+        let max_scroll = self.items.len().saturating_sub(visible);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
         }
     }
 
-    fn row_is_focused(&self, kind: RowKind) -> bool {
-        match kind {
-            RowKind::Header(si) => self.focus.section == si && self.focus.item.is_none(),
-            RowKind::Item(si, ii) => self.focus.section == si && self.focus.item == Some(ii),
-            _ => false,
-        }
-    }
+    // --- cursor / scroll ---
 
-    /// Step the keyboard cursor by `delta` rows. Returns whether the cursor
-    /// actually moved - `false` when it was already at the first or last row.
-    fn move_focus(&mut self, delta: i64) -> bool {
-        let nav = self.nav_rows();
-        if nav.is_empty() {
+    /// Step the cursor by `delta` rows and auto-scroll when the cursor
+    /// reaches either edge of the visible window. Returns `true` when the
+    /// cursor moved.
+    fn move_cursor(&mut self, delta: i64) -> bool {
+        if self.items.is_empty() {
             return false;
         }
-        let here = nav
-            .iter()
-            .position(|f| f.section == self.focus.section && f.item == self.focus.item)
-            .unwrap_or(0);
-        let next = (here as i64 + delta).clamp(0, nav.len() as i64 - 1) as usize;
-        let moved = nav[next] != self.focus;
-        self.focus = nav[next];
+        let count = self.items.len();
+        let visible = self.last_rows.saturating_sub(1).max(1);
+        let new = (self.cursor as i64 + delta).clamp(0, count as i64 - 1) as usize;
+        let moved = new != self.cursor;
+        self.cursor = new;
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + visible {
+            self.scroll = self.cursor + 1 - visible;
+        }
         moved
     }
 
-    /// The target of the currently focused item, or `None` when the cursor is
-    /// on a section header.
+    /// The target of the cursor's current item, or `None` when the list is
+    /// empty.
     fn focused_target(&self) -> Option<ItemTarget> {
-        let ii = self.focus.item?;
-        self.sections
-            .get(self.focus.section)
-            .and_then(|s| s.items.get(ii))
-            .map(|item| item.target.clone())
+        self.items.get(self.cursor).map(|i| i.target.clone())
     }
 
-    /// Preview the focused row in the slot, leaving focus on the sidebar. A
-    /// document re-points every viewer; a running pane is routed into the slot
-    /// or - when it is already visible in another split - the slot clears
-    /// instead, since a TTY cannot be in two places at once. Focusing the
-    /// Todos or Scratchpads header previews its list (the same document a
-    /// click would open); other headers and a roster entry that is not
-    /// running clear the slot. Preview never starts a process.
-    fn preview_focus(&mut self) {
+    /// Preview the cursor's row in the slot, leaving focus on this plugin
+    /// pane. A document re-points every viewer; a running pane is routed
+    /// into the slot or - when it is already visible in another split - the
+    /// slot clears instead, since a TTY cannot be in two places at once.
+    fn preview_cursor(&mut self) {
         match self.focused_target() {
             Some(ItemTarget::Todo(id)) => self.open_document("todo", Some(id), false),
             Some(ItemTarget::Scratchpad(id)) => self.open_document("scratchpad", Some(id), false),
-            Some(ItemTarget::Roster(id)) => match self.roster_pane(id) {
+            Some(ItemTarget::Process(id)) => match self.process_pane(id) {
                 Some(pane) => self.route_pane_to_slot(pane, false),
                 None => self.clear_slot(),
             },
             Some(ItemTarget::Pane(pane)) => self.route_pane_to_slot(pane, false),
-            None => match self.sections.get(self.focus.section).map(|s| s.kind) {
-                Some(SectionKind::Todos) => self.open_document("todo-list", None, false),
-                Some(SectionKind::Scratchpads) => {
-                    self.open_document("scratchpad-list", None, false)
-                }
-                _ => self.clear_slot(),
-            },
+            None => self.clear_slot(),
         }
     }
 
     // --- input ---
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
-        // Any acknowledged keypress dismisses the gate-refusal banner so it
-        // does not linger across unrelated input.
         self.clear_gate_refusal();
         match key.bare_key {
             BareKey::Up => {
-                if self.move_focus(-1) {
-                    self.preview_focus();
+                if self.move_cursor(-1) {
+                    self.preview_cursor();
                 }
             }
             BareKey::Down => {
-                if self.move_focus(1) {
-                    self.preview_focus();
+                if self.move_cursor(1) {
+                    self.preview_cursor();
                 }
             }
-            BareKey::Left => self.set_collapsed(self.focus.section, true),
-            BareKey::Right => self.set_collapsed(self.focus.section, false),
-            BareKey::Enter => self.activate_focus(),
+            BareKey::PageUp => {
+                let step = self.page_step();
+                if self.move_cursor(-(step as i64)) {
+                    self.preview_cursor();
+                }
+            }
+            BareKey::PageDown => {
+                let step = self.page_step();
+                if self.move_cursor(step as i64) {
+                    self.preview_cursor();
+                }
+            }
+            BareKey::Home => {
+                if self.move_cursor(-(self.items.len() as i64)) {
+                    self.preview_cursor();
+                }
+            }
+            BareKey::End => {
+                if self.move_cursor(self.items.len() as i64) {
+                    self.preview_cursor();
+                }
+            }
+            BareKey::Enter => self.activate_cursor(),
             BareKey::Char('a') => self.spawn_agent_pane(None),
-            // `c` opens a fresh todo form in the slot - the routing kind
-            // `new-todo` tells the viewer to construct a blank Form rather
-            // than load a `.panopt/todos/<id>.md`. `e` is a focused alias of
-            // pressing Enter on a todo: route the same way but force focus
-            // into the form so the user can type immediately. `n` is the
-            // scratchpad counterpart of `c`.
-            BareKey::Char('c') => self.open_document("new-todo", None, true),
-            BareKey::Char('e') => self.edit_focused_todo(),
-            BareKey::Char('n') => self.open_document("new-scratchpad", None, true),
+            BareKey::Char('c') if self.mode == Mode::Todos => {
+                self.open_document("new-todo", None, true)
+            }
+            BareKey::Char('e') if self.mode == Mode::Todos => self.edit_focused_todo(),
+            BareKey::Char('n') if self.mode == Mode::Scratchpads => {
+                self.open_document("new-scratchpad", None, true)
+            }
+            BareKey::Char('L') => self.open_mode_list(true),
+            // `/` (filter) and `s` (sort) are stubs - the keys are reserved
+            // for future sort/filter behavior but do nothing today.
+            BareKey::Char('/') | BareKey::Char('s') => {}
             _ => return false,
         }
         true
@@ -802,56 +827,40 @@ impl PanoptSidebar {
 
     fn handle_mouse(&mut self, mouse: Mouse) -> bool {
         match mouse {
-            Mouse::LeftClick(line, col) => {
+            Mouse::LeftClick(line, _col) => {
                 if line < 0 {
                     return false;
                 }
-                let handled = match self.row_map.get(line as usize).copied() {
-                    Some(RowKind::Header(si)) => {
-                        self.focus = Focus {
-                            section: si,
-                            item: None,
-                        };
-                        if col < 2 {
-                            self.toggle_collapsed(si);
-                        } else {
-                            self.open_section_list(si, false);
-                        }
-                        true
-                    }
-                    Some(RowKind::Item(si, ii)) => {
-                        self.focus = Focus {
-                            section: si,
-                            item: Some(ii),
-                        };
-                        self.activate_item(si, ii, false);
-                        true
-                    }
-                    Some(RowKind::More(si)) => {
-                        self.open_section_list(si, false);
-                        true
-                    }
-                    _ => false,
-                };
-                if handled {
-                    // A click anywhere in the sidebar keeps it focused - and,
-                    // when the sidebar was not focused, this is the click that
-                    // both focuses it and selects the row.
+                let row = line as usize;
+                if row == 0 {
+                    // Click on the title row opens the full-list view for
+                    // modes that have one; for the others it is a no-op.
+                    self.open_mode_list(false);
                     if let Some(plugin) = self.plugin_pane {
                         focus_pane_with_id(plugin, false, false);
                     }
+                    return true;
                 }
-                handled
+                let idx = self.scroll + (row - 1);
+                if idx >= self.items.len() {
+                    return false;
+                }
+                self.cursor = idx;
+                self.activate_item(idx, false);
+                if let Some(plugin) = self.plugin_pane {
+                    focus_pane_with_id(plugin, false, false);
+                }
+                true
             }
             Mouse::ScrollUp(_) => {
-                if self.move_focus(-1) {
-                    self.preview_focus();
+                if self.move_cursor(-1) {
+                    self.preview_cursor();
                 }
                 true
             }
             Mouse::ScrollDown(_) => {
-                if self.move_focus(1) {
-                    self.preview_focus();
+                if self.move_cursor(1) {
+                    self.preview_cursor();
                 }
                 true
             }
@@ -859,62 +868,47 @@ impl PanoptSidebar {
         }
     }
 
-    /// Act on the focused row from the keyboard (Enter): a header opens its
-    /// list, an item opens itself, and focus moves onto the content pane.
-    fn activate_focus(&mut self) {
-        match self.focus.item {
-            None => self.open_section_list(self.focus.section, true),
-            Some(ii) => self.activate_item(self.focus.section, ii, true),
+    /// Step size for PageUp/PageDown - one screenful of visible items.
+    fn page_step(&self) -> usize {
+        self.last_rows.saturating_sub(1).max(1)
+    }
+
+    /// Act on the cursor's row from the keyboard (Enter): focus moves onto
+    /// the content pane.
+    fn activate_cursor(&mut self) {
+        if let Some(idx) = self.items.get(self.cursor).map(|_| self.cursor) {
+            self.activate_item(idx, true);
         }
     }
 
-    /// Act on item `ii` of section `si`. `focus` moves keyboard focus onto the
-    /// content pane (Enter); a click passes `false` to stay in the sidebar.
-    fn activate_item(&mut self, si: usize, ii: usize, focus: bool) {
-        let Some(target) = self
-            .sections
-            .get(si)
-            .and_then(|s| s.items.get(ii))
-            .map(|item| item.target.clone())
-        else {
+    /// Act on item `idx`. `focus` moves keyboard focus onto the content
+    /// pane (Enter); a click passes `false` to stay on this plugin pane.
+    fn activate_item(&mut self, idx: usize, focus: bool) {
+        let Some(target) = self.items.get(idx).map(|i| i.target.clone()) else {
             return;
         };
         match target {
             ItemTarget::Todo(id) => self.open_document("todo", Some(id), focus),
             ItemTarget::Scratchpad(id) => self.open_document("scratchpad", Some(id), focus),
-            ItemTarget::Roster(id) => self.activate_roster(id, focus),
+            ItemTarget::Process(id) => self.activate_process(id, focus),
             ItemTarget::Pane(pane) => self.route_pane_to_slot(pane, focus),
         }
     }
 
-    /// Open a section's full list. Todos and scratchpads open a list in the
-    /// viewer; the roster and terminal sections just toggle collapse. `focus`
-    /// is threaded to the viewer the same way [`activate_item`] threads it.
-    fn open_section_list(&mut self, si: usize, focus: bool) {
-        match self.sections.get(si).map(|s| s.kind) {
-            Some(SectionKind::Todos) => self.open_document("todo-list", None, focus),
-            Some(SectionKind::Scratchpads) => self.open_document("scratchpad-list", None, focus),
-            _ => self.toggle_collapsed(si),
-        }
-    }
-
-    fn toggle_collapsed(&mut self, si: usize) {
-        if si < self.collapsed.len() {
-            self.set_collapsed(si, !self.collapsed[si]);
-        }
-    }
-
-    fn set_collapsed(&mut self, si: usize, collapsed: bool) {
-        if si < self.collapsed.len() {
-            self.collapsed[si] = collapsed;
-            self.clamp_focus();
+    /// Open the full-list view in the slot for modes that have one. Todos
+    /// and Scratchpads display their respective lists; the agent/command/
+    /// terminal modes are no-ops because their lists are already shown whole.
+    fn open_mode_list(&mut self, focus: bool) {
+        match self.mode {
+            Mode::Todos => self.open_document("todo-list", None, focus),
+            Mode::Scratchpads => self.open_document("scratchpad-list", None, focus),
+            _ => {}
         }
     }
 
     /// Open the in-slot todo form for the focused todo, if one is focused.
     /// Identical to pressing Enter on the same row, but with focus forced
-    /// into the form so the user can type immediately - useful when the
-    /// sidebar still has keyboard focus.
+    /// into the form so the user can type immediately.
     fn edit_focused_todo(&mut self) {
         if let Some(ItemTarget::Todo(id)) = self.focused_target() {
             self.open_document("todo", Some(id), true);
@@ -923,13 +917,6 @@ impl PanoptSidebar {
 
     // --- slot routing ---
 
-    /// Open a document (`todo`/`scratchpad`) or a section list
-    /// (`todo-list`/`scratchpad-list`) in the slot's viewer. Per-pane routing
-    /// means only the slot's viewer re-points; any other viewer pane the user
-    /// has on screen (a split they made to keep a doc visible, say) stays on
-    /// whatever it was showing. If the slot is not a viewer yet, a viewer is
-    /// brought into it: revealing a suppressed one when available, spawning a
-    /// fresh one otherwise.
     fn open_document(&mut self, kind: &str, id: Option<u64>, focus: bool) {
         if !self.permitted {
             return;
@@ -937,25 +924,17 @@ impl PanoptSidebar {
         self.ensure_viewer_in_slot(kind, id, focus);
     }
 
-    /// Clear the slot to the empty viewer - what the cockpit shows when the
-    /// selection lands on a row with nothing useful to display (a section
-    /// header, a roster entry that is not running, or a Pane target that is
-    /// already visible in another split and cannot be duplicated). Per-pane
-    /// routing means only the slot's viewer clears; any other split's viewer
-    /// keeps whatever it was showing.
     fn clear_slot(&mut self) {
         self.ensure_viewer_in_slot("empty", None, false);
     }
 
-    /// Bring roster entry `id` into the slot: swap in its pane when it is
-    /// already running, otherwise start it there.
-    fn activate_roster(&mut self, id: u64, focus: bool) {
-        if let Some(pane) = self.roster_pane(id) {
+    fn activate_process(&mut self, id: u64, focus: bool) {
+        if let Some(pane) = self.process_pane(id) {
             self.route_pane_to_slot(pane, focus);
             return;
         }
         let args = vec![
-            "_roster-run".to_string(),
+            "_process-run".to_string(),
             "--port".to_string(),
             self.port.clone(),
             id.to_string(),
@@ -963,11 +942,6 @@ impl PanoptSidebar {
         self.spawn_in_slot(args, focus);
     }
 
-    /// Route an existing terminal pane (agent, terminal, running roster
-    /// command) into the slot. A pane that is already visible in another split
-    /// cannot be duplicated: instead a preview clears the slot - so the arrow
-    /// press has a visible effect - and an activate just focuses the existing
-    /// pane, leaving the slot alone.
     fn route_pane_to_slot(&mut self, pane: PaneId, focus: bool) {
         if self.pane_is_visible(pane) && self.slot_pane != Some(pane) {
             if focus {
@@ -980,17 +954,6 @@ impl PanoptSidebar {
         self.show_in_slot(pane, focus);
     }
 
-    /// Ensure the slot hosts a visible viewer pane and that the viewer is
-    /// pointed at `kind`/`id`. Three cases:
-    ///
-    /// - The slot already holds a visible viewer: write its routing file and
-    ///   focus it if asked. The other-viewer routing was handled by the caller
-    ///   (`open_document`).
-    /// - A suppressed viewer is available: bring it into the slot via
-    ///   [`show_in_slot`] after writing routing to its slot name, so it
-    ///   re-displays with the right item.
-    /// - No viewer exists yet: allocate a fresh slot name, pre-write its
-    ///   routing file, and spawn `panopt _viewer --slot <name>` into the slot.
     fn ensure_viewer_in_slot(&mut self, kind: &str, id: Option<u64>, focus: bool) {
         if let Some(slot) = self.slot_pane {
             if self.pane_is_visible(slot) {
@@ -1028,14 +991,6 @@ impl PanoptSidebar {
         self.spawn_in_slot(args, focus);
     }
 
-    /// Swap an existing pane into the designated slot, suppressing whatever was
-    /// there. `focus` moves keyboard focus onto it; otherwise focus returns to
-    /// the sidebar so the user can keep navigating.
-    ///
-    /// This is the low-level primitive: it does not check whether `pane` is
-    /// already visible in another split. Callers reaching this for an
-    /// already-visible target route through [`route_pane_to_slot`] instead, to
-    /// avoid yanking the pane out of its current position.
     fn show_in_slot(&mut self, pane: PaneId, focus: bool) {
         let is_slot = self.slot_pane == Some(pane);
         if !is_slot {
@@ -1048,15 +1003,12 @@ impl PanoptSidebar {
         if focus {
             focus_pane_with_id(pane, false, false);
         } else if !is_slot {
-            // A swap can move focus onto the new pane; hand it back.
             if let Some(plugin) = self.plugin_pane {
                 focus_pane_with_id(plugin, false, false);
             }
         }
     }
 
-    /// Spawn a `panopt` subcommand as a new pane in the designated slot,
-    /// suppressing the slot's current pane. Returns the new pane's id.
     fn spawn_in_slot(&mut self, args: Vec<String>, focus: bool) -> Option<PaneId> {
         let ws = self.launch_cwd()?;
         let command = CommandToRun {
@@ -1065,8 +1017,6 @@ impl PanoptSidebar {
             cwd: Some(ws),
         };
         let new = match self.slot_pane {
-            // `open_command_pane_in_place_of_pane_id` suppresses the replaced
-            // pane (false = do not close it) and does not change focus.
             Some(slot) => {
                 open_command_pane_in_place_of_pane_id(slot, command, false, BTreeMap::new())
             }
@@ -1083,11 +1033,6 @@ impl PanoptSidebar {
         new
     }
 
-    /// Spawn a fresh empty viewer in a brand-new tiled pane - not in the slot:
-    /// the user pressed Alt-N to *add* a pane, not replace the slot's. The
-    /// viewer is given a unique routing slot name (`v<n>`) so the sidebar can
-    /// re-point it independently of the boot viewer and every other Alt-N
-    /// pane - that's what makes the new pane addressable.
     fn spawn_blank_pane(&mut self) {
         let Some(ws) = self.launch_cwd() else {
             return;
@@ -1113,9 +1058,9 @@ impl PanoptSidebar {
         );
     }
 
-    /// Spawn a new agent pane (`panopt _agent`) in the slot and focus it,
-    /// giving it a stable sidebar label: the caller's name, or the next
-    /// "Agent N" for an unnamed one.
+    /// Spawn a new agent pane and label it. Only the Todos (gatekeeper) pane
+    /// reaches this from a pipe; from the keyboard, any of the five panes
+    /// can press `a` and spawn an unnamed agent.
     fn spawn_agent_pane(&mut self, id: Option<&str>) {
         let mut args = vec!["_agent".to_string()];
         if let Some(id) = id {
@@ -1133,10 +1078,11 @@ impl PanoptSidebar {
             }
         };
         self.agent_labels.insert(tid, label);
+        // Project labels right away so the other four panes pick up the
+        // new agent's name on their next reload tick.
+        write_agent_labels(&self.agent_labels);
     }
 
-    /// The cwd for a launched pane: the project root. `None` when permissions
-    /// are not yet granted or no project is configured.
     fn launch_cwd(&self) -> Option<PathBuf> {
         if !self.permitted {
             return None;
@@ -1145,26 +1091,14 @@ impl PanoptSidebar {
     }
 
     // --- close gate ---
-    //
-    // The plugin is the policy point for every destructive Zellij action.
-    // `up::render_config` rewrites CloseFocus, CloseTab, and Quit keybinds to
-    // pipe a request here; we either refuse (recording the refusal so the
-    // sidebar header can show it; a richer floating-pane dialog is the next
-    // iteration) or force-close via the zellij-tile API, which bypasses the
-    // rewritten keybinds and so does not re-trigger the gate.
 
-    /// CloseFocus came in. Refuse if the sidebar is focused (absolutely - no
-    /// override). When the target pane is an active item, open the
-    /// close-gate dialog so the user can confirm with `close anyway`.
-    /// Otherwise close the target via the plugin API (which does not
-    /// re-trigger the gate).
     fn gate_close_focus(&mut self) {
         if !self.permitted {
             return;
         }
         if self.sidebar_focused {
-            // Sidebar is part of the cockpit, not a closeable artifact. No
-            // dialog is offered - the gate is absolute here.
+            // Any of the five plugin panes is part of the cockpit shell -
+            // not a closeable artifact. Absolute refusal; no dialog.
             self.refuse_gate("cannot close the sidebar");
             return;
         }
@@ -1178,8 +1112,6 @@ impl PanoptSidebar {
         close_pane_with_id(target);
     }
 
-    /// CloseTab came in. Open the dialog when any pane in the focused tab is
-    /// active; otherwise close the tab.
     fn gate_close_tab(&mut self) {
         if !self.permitted {
             return;
@@ -1195,8 +1127,6 @@ impl PanoptSidebar {
         close_focused_tab();
     }
 
-    /// Quit came in. Open the dialog when any pane across the session is
-    /// active; otherwise quit Zellij.
     fn gate_quit(&mut self) {
         if !self.permitted {
             return;
@@ -1209,11 +1139,6 @@ impl PanoptSidebar {
         quit_zellij();
     }
 
-    /// Spawn the close-gate dialog as a floating `panopt _close-gate` pane.
-    /// Encodes the active items as `kind:label;kind:label;...`, replacing
-    /// `:` and `;` in labels so the CLI parser can split unambiguously.
-    /// When the dialog can't be spawned (no project root yet) we fall back
-    /// to the sidebar header banner so the user still sees the refusal.
     fn spawn_close_gate_dialog(
         &mut self,
         scope: &str,
@@ -1262,11 +1187,6 @@ impl PanoptSidebar {
         );
     }
 
-    /// Handle the user's decision piped back from the close-gate dialog.
-    /// The payload is `scope=...;target_pane=...;decision=close` - only the
-    /// `decision=close` case acts; anything else (parse failure, cancel) is
-    /// a no-op. Calls the matching zellij-tile API directly, which bypasses
-    /// the rewritten keybinds, so the gate is not re-triggered.
     fn handle_gate_decision(&mut self, payload: Option<&str>) {
         let Some(payload) = payload else { return };
         let mut scope: Option<&str> = None;
@@ -1300,19 +1220,6 @@ impl PanoptSidebar {
         }
     }
 
-    /// Whether `pane` is an active item the gate must protect. Returns the
-    /// item with its display label and kind, or `None` if not active.
-    ///
-    /// Rules (locked by the design grilling):
-    /// - A roster agent's live pane is always active (the agent is the work).
-    /// - A roster command's live pane is always active (until it exits).
-    /// - A roster terminal, an ad-hoc agent, and a plain shell are active
-    ///   only when their foreground command differs from the user's shell -
-    ///   read via [`get_pane_running_command`], compared against a whitelist
-    ///   of common shells (plugins cannot read `$SHELL` from the WASM
-    ///   sandbox, so the whitelist is the source of truth for now).
-    /// - A viewer pane is never active.
-    /// - An exited pane is never active.
     fn pane_active(&self, pane: PaneId) -> Option<ActiveItem> {
         let p = self.panes.iter().find(|p| p.id == pane)?;
         if p.exited {
@@ -1321,8 +1228,8 @@ impl PanoptSidebar {
         if matches!(p.role, PaneRole::Viewer) {
             return None;
         }
-        if let PaneRole::Roster(rid) = p.role {
-            if let Some(r) = self.roster.iter().find(|r| r.id == rid) {
+        if let PaneRole::Process(rid) = p.role {
+            if let Some(r) = self.processes.iter().find(|r| r.id == rid) {
                 return match r.kind.as_str() {
                     "agent" => Some(ActiveItem {
                         label: r.label.clone(),
@@ -1339,10 +1246,6 @@ impl PanoptSidebar {
                 };
             }
         }
-        // Ad-hoc Agent panes and plain Shell panes both gate on the shell
-        // rule - a Claude Code instance the user spawned via `a` runs as
-        // `panopt _agent`, which is not a shell name, so it is correctly
-        // treated as active.
         let label = if matches!(p.role, PaneRole::Agent) {
             self.agent_label(p)
         } else {
@@ -1351,11 +1254,6 @@ impl PanoptSidebar {
         self.pane_active_terminal(pane, &label)
     }
 
-    /// The shell-child rule: a terminal pane is active when its current
-    /// foreground command is not one of the known shell binaries. Errors
-    /// from the host (the pane is a plugin, exited, or the OS query failed)
-    /// produce `None` - we prefer false negatives to false positives so a
-    /// confused inspection does not trap the user.
     fn pane_active_terminal(&self, pane: PaneId, label: &str) -> Option<ActiveItem> {
         let argv = get_pane_running_command(pane).ok()?;
         let exe = argv.first()?;
@@ -1374,7 +1272,6 @@ impl PanoptSidebar {
         }
     }
 
-    /// Active items inside the given tab. Used by the CloseTab gate.
     fn active_in_tab(&self, tab: usize) -> Vec<ActiveItem> {
         self.panes
             .iter()
@@ -1383,7 +1280,6 @@ impl PanoptSidebar {
             .collect()
     }
 
-    /// Active items across every tab. Used by the Quit gate.
     fn active_anywhere(&self) -> Vec<ActiveItem> {
         self.panes
             .iter()
@@ -1391,28 +1287,19 @@ impl PanoptSidebar {
             .collect()
     }
 
-    /// Record a gate refusal so the next render shows it in the sidebar
-    /// header. A placeholder for the floating-pane dialog: the user gets a
-    /// terse explanation rather than a richer list + "close anyway" prompt.
     fn refuse_gate(&mut self, reason: &str) {
         self.last_gate_refusal = Some(reason.to_string());
     }
 
-    /// Clear any pending refusal banner - called on every navigation so the
-    /// banner is short-lived and does not linger across unrelated input.
     fn clear_gate_refusal(&mut self) {
         self.last_gate_refusal = None;
     }
 }
 
-/// One item the gate has classified as active. Carries the user-visible
-/// label so the refusal message can name what is blocking close.
 #[derive(Clone, Debug)]
 struct ActiveItem {
     label: String,
     kind: ActiveKind,
-    /// The pane that holds the active work - used by the (future) dialog to
-    /// pass force-close back to the gate.
     #[allow(dead_code)]
     pane: PaneId,
 }
@@ -1434,10 +1321,6 @@ impl ActiveKind {
     }
 }
 
-/// Known shell binary basenames. The WASM sandbox blocks `$SHELL` so we
-/// cannot read the user's exact login shell; the whitelist covers the
-/// common cases. A roster terminal running its shell at a prompt reads as
-/// idle; one running `cargo test` or `vim` reads as active.
 fn is_user_shell(basename: &str) -> bool {
     matches!(
         basename,
@@ -1445,36 +1328,25 @@ fn is_user_shell(basename: &str) -> bool {
     )
 }
 
-/// Whether a pane is a transient `zellij action pipe` pane the close-gate
-/// keybinds spawn. We filter these out of focus tracking so the gate's
-/// "previous focus" pointer keeps the user's actual pane, and out of the
-/// pane list so they never show up in the sidebar even for one frame.
-///
-/// The match is intentionally narrow: a stray `zellij action ...` the user
-/// runs by hand won't trip this; only invocations with a `panopt:` pipe name
-/// do.
 fn is_transient_pipe_pane(p: &PaneInfo) -> bool {
     p.terminal_command.as_deref().is_some_and(|c| {
         c.contains("zellij") && c.contains("action") && c.contains("pipe") && c.contains("panopt:")
     })
 }
 
-/// Classify a content pane by the command it was launched with. A plain
-/// terminal the user opened has no launch command and is a [`PaneRole::Shell`].
 fn classify_pane(command: Option<&str>) -> PaneRole {
     let Some(cmd) = command else {
         return PaneRole::Shell;
     };
     if cmd.contains("_viewer") {
         PaneRole::Viewer
-    } else if cmd.contains("_roster-run") {
-        // The roster id is the last positional arg; `--port <n>` precedes it.
+    } else if cmd.contains("_process-run") {
         match cmd
             .split_whitespace()
             .filter_map(|t| t.parse::<u64>().ok())
             .next_back()
         {
-            Some(id) => PaneRole::Roster(id),
+            Some(id) => PaneRole::Process(id),
             None => PaneRole::Shell,
         }
     } else if cmd.contains("_agent") {
@@ -1484,7 +1356,6 @@ fn classify_pane(command: Option<&str>) -> PaneRole {
     }
 }
 
-/// The sidebar label for a content pane: its title, marked when it has exited.
 fn pane_label(p: &PaneRow) -> String {
     let title = if p.title.trim().is_empty() {
         "(untitled)"
@@ -1498,20 +1369,8 @@ fn pane_label(p: &PaneRow) -> String {
     }
 }
 
-/// The visible (uncapped) item count of a section - what the keyboard cursor
-/// can land on.
-fn visible_item_count(section: &Section) -> usize {
-    if section.kind.limited() {
-        section.items.len().min(ITEM_LIMIT)
-    } else {
-        section.items.len()
-    }
-}
-
-/// Write the viewer's routing file `.panopt/.cockpit/viewer-<slot>.json`. The
-/// viewer polls this file and re-points itself at the named item. Each viewer
-/// pane owns its own `slot` token, so writes can target one viewer (a slot
-/// clear) or every viewer (a document preview), depending on the caller.
+/// Write the viewer's routing file `.panopt/.cockpit/viewer-<slot>.json`.
+/// Each viewer pane owns its own `slot` token, so writes target one viewer.
 fn write_routing(kind: &str, id: Option<u64>, slot: &str) {
     let dir = "/host/.panopt/.cockpit";
     if fs::create_dir_all(dir).is_err() {
@@ -1528,9 +1387,99 @@ fn write_routing(kind: &str, id: Option<u64>, slot: &str) {
     }
 }
 
-/// Pull the `--slot X` token out of a viewer pane's launch command. Returns
-/// `None` for a command without that flag (defensive: every viewer the plugin
-/// or the layout spawns passes it).
+/// Project the agent-label map to [`AGENT_LABELS_PATH`] atomically (temp +
+/// rename). Tiny JSON-ish format: `{"<tid>":"<label>",...}`. Labels never
+/// embed `"` so a hand-rolled serializer is enough and avoids dragging in a
+/// JSON dep for one tiny file.
+fn write_agent_labels(labels: &BTreeMap<u32, String>) {
+    let dir = "/host/.panopt/.cockpit";
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut body = String::from("{");
+    for (i, (tid, label)) in labels.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        let safe = label.replace('\\', "\\\\").replace('"', "\\\"");
+        body.push_str(&format!("\"{tid}\":\"{safe}\""));
+    }
+    body.push('}');
+    let tmp = format!("{dir}/.agent-labels.tmp");
+    if fs::write(&tmp, body).is_ok() {
+        let _ = fs::rename(&tmp, AGENT_LABELS_PATH);
+    }
+}
+
+/// Parse the agent-label projection back into `(tid, label)` pairs. Tolerant
+/// of an empty/malformed file: returns an empty iterator on any parse error.
+fn parse_agent_labels(body: &str) -> Vec<(u32, String)> {
+    let body = body.trim();
+    let Some(inner) = body.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+        return Vec::new();
+    };
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for entry in split_top_level(inner, ',') {
+        let entry = entry.trim();
+        let Some(colon) = entry.find(':') else {
+            continue;
+        };
+        let key = entry[..colon].trim();
+        let value = entry[colon + 1..].trim();
+        let Some(tid) = key
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(label) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+            continue;
+        };
+        let unescaped = label.replace("\\\"", "\"").replace("\\\\", "\\");
+        out.push((tid, unescaped));
+    }
+    out
+}
+
+/// Split `body` on `sep`, respecting `"..."` strings so a separator inside a
+/// label does not split the entry. The projection writer escapes `"` and `\`
+/// in labels, so the only thing this needs to dodge is unescaped `,` inside
+/// a string.
+fn split_top_level(body: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for c in body.chars() {
+        if escape {
+            current.push(c);
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            current.push(c);
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            current.push(c);
+            continue;
+        }
+        if c == sep && !in_string {
+            out.push(std::mem::take(&mut current));
+            continue;
+        }
+        current.push(c);
+    }
+    out.push(current);
+    out
+}
+
 fn parse_viewer_slot(command: Option<&str>) -> Option<String> {
     let cmd = command?;
     let mut tokens = cmd.split_whitespace();
@@ -1542,8 +1491,6 @@ fn parse_viewer_slot(command: Option<&str>) -> Option<String> {
     None
 }
 
-/// Read a `.panopt/` index file (`todos.md`, `scratchpads.md`) into
-/// `(id, label)` pairs.
 fn read_index(path: &str) -> Vec<(u64, String)> {
     match fs::read_to_string(path) {
         Ok(body) => body.lines().filter_map(parse_index_line).collect(),
@@ -1551,16 +1498,13 @@ fn read_index(path: &str) -> Vec<(u64, String)> {
     }
 }
 
-/// Read `.panopt/roster.md` into roster rows.
-fn read_roster(path: &str) -> Vec<RosterRow> {
+fn read_processes(path: &str) -> Vec<ProcessRow> {
     match fs::read_to_string(path) {
-        Ok(body) => body.lines().filter_map(parse_roster_line).collect(),
+        Ok(body) => body.lines().filter_map(parse_process_line).collect(),
         Err(_) => Vec::new(),
     }
 }
 
-/// Parse one index line - `- [ ] [#3](todos/3.md) the title ...` or
-/// `- [#1](scratchpad/1.md) the title` - into its id and trailing label.
 fn parse_index_line(line: &str) -> Option<(u64, String)> {
     let line = line.trim();
     if !line.starts_with("- [") {
@@ -1574,16 +1518,23 @@ fn parse_index_line(line: &str) -> Option<(u64, String)> {
     Some((id, label))
 }
 
-/// Parse one `.panopt/roster.md` line - `- [agent] #1 Mediator` - into a row.
-fn parse_roster_line(line: &str) -> Option<RosterRow> {
+/// Parse one `- [kind] #id label [(from #N)]` line from `processes.md`. The
+/// trailing `(from #N)` (when present) names the source agent tool and is
+/// dropped from `label`.
+fn parse_process_line(line: &str) -> Option<ProcessRow> {
     let rest = line.trim().strip_prefix("- [")?;
     let close = rest.find(']')?;
     let kind = rest[..close].to_string();
     let after = rest[close + 1..].trim_start().strip_prefix('#')?;
     let space = after.find(' ')?;
     let id: u64 = after[..space].parse().ok()?;
-    let label = after[space + 1..].trim().to_string();
-    Some(RosterRow { kind, id, label })
+    let mut label = after[space + 1..].trim().to_string();
+    if let Some(from_at) = label.rfind(" (from #") {
+        if label.ends_with(')') {
+            label.truncate(from_at);
+        }
+    }
+    Some(ProcessRow { kind, id, label })
 }
 
 /// The ANSI styling a printed row carries.
@@ -1594,15 +1545,9 @@ enum Style {
     Dim,
 }
 
-impl Style {
-    const NORMAL: Style = Style::Normal;
-    const HEADER: Style = Style::Header;
-    const DIM: Style = Style::Dim;
-}
-
-/// Truncate `content` to `cols` and wrap it in the SGR codes for `style`, with
-/// the focused row reversed. The codes are added after truncation so they
-/// never count toward the width.
+/// Truncate `content` to `cols` and wrap it in the SGR codes for `style`,
+/// with the focused row reversed. The codes are added after truncation so
+/// they never count toward the width.
 fn paint(content: &str, cols: usize, style: Style, focused: bool) -> String {
     let truncated: String = content.chars().take(cols).collect();
     let mut codes: Vec<&str> = Vec::new();
@@ -1625,22 +1570,21 @@ fn paint(content: &str, cols: usize, style: Style, focused: bool) -> String {
 mod tests {
     use super::*;
 
-    /// A sidebar with the given todo items and every section expanded.
-    fn sidebar_with_todos(n: usize) -> PanoptSidebar {
-        let items = (0..n)
-            .map(|i| Item {
-                label: format!("todo {i}"),
-                target: ItemTarget::Todo(i as u64),
-                live: false,
-            })
-            .collect();
-        PanoptSidebar {
-            sections: vec![Section {
-                kind: SectionKind::Todos,
-                items,
-            }],
-            ..PanoptSidebar::default()
+    fn pane_with(mode: Mode) -> PanoptPane {
+        PanoptPane {
+            mode,
+            mode_known: true,
+            permitted: true,
+            last_rows: 10,
+            ..PanoptPane::default()
         }
+    }
+
+    fn todos_pane(n: usize) -> PanoptPane {
+        let mut pane = pane_with(Mode::Todos);
+        pane.todos = (0..n).map(|i| (i as u64, format!("todo {i}"))).collect();
+        pane.rebuild_items();
+        pane
     }
 
     #[test]
@@ -1660,9 +1604,6 @@ mod tests {
 
     #[test]
     fn parses_a_scratchpad_index_line_with_updated_timestamp() {
-        // The post-V4 form embeds `- updated <ts>` in the trailing label.
-        // The parser treats everything after `") "` as the label, so the
-        // timestamp simply flows into the cockpit's row text.
         let (id, label) =
             parse_index_line("- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21")
                 .unwrap();
@@ -1678,17 +1619,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_roster_line() {
-        let row = parse_roster_line("- [agent] #1 NASTL-Mediator").unwrap();
+    fn parses_a_process_line() {
+        let row = parse_process_line("- [agent] #1 NASTL-Mediator").unwrap();
         assert_eq!(row.kind, "agent");
         assert_eq!(row.id, 1);
         assert_eq!(row.label, "NASTL-Mediator");
     }
 
     #[test]
-    fn ignores_non_roster_lines() {
-        assert!(parse_roster_line("# Roster").is_none());
-        assert!(parse_roster_line("_(no roster entries)_").is_none());
+    fn parses_a_process_line_with_a_from_suffix() {
+        let row = parse_process_line("- [agent] #4 NASTL-Mediator (from #3)").unwrap();
+        assert_eq!(row.kind, "agent");
+        assert_eq!(row.id, 4);
+        assert_eq!(row.label, "NASTL-Mediator");
+    }
+
+    #[test]
+    fn ignores_non_process_lines() {
+        assert!(parse_process_line("# Processes").is_none());
+        assert!(parse_process_line("_(no processes)_").is_none());
     }
 
     #[test]
@@ -1698,8 +1647,8 @@ mod tests {
             PaneRole::Viewer
         );
         assert_eq!(
-            classify_pane(Some("/bin/panopt _roster-run --port 7600 5")),
-            PaneRole::Roster(5)
+            classify_pane(Some("/bin/panopt _process-run --port 7600 5")),
+            PaneRole::Process(5)
         );
         assert_eq!(
             classify_pane(Some("/bin/panopt _agent --id mediator-1a2b")),
@@ -1710,71 +1659,81 @@ mod tests {
     }
 
     #[test]
-    fn move_focus_walks_the_header_and_each_item() {
-        let mut sidebar = sidebar_with_todos(2);
-        // The cursor starts on the section header.
+    fn parse_viewer_slot_extracts_the_slot_token() {
         assert_eq!(
-            sidebar.focus,
-            Focus {
-                section: 0,
-                item: None
-            }
+            parse_viewer_slot(Some("/bin/panopt _viewer --slot main --port 7600")),
+            Some("main".to_string())
         );
-        // Down stops on each item in turn.
-        assert!(sidebar.move_focus(1));
         assert_eq!(
-            sidebar.focus,
-            Focus {
-                section: 0,
-                item: Some(0)
-            }
+            parse_viewer_slot(Some("/bin/panopt _viewer --port 7600 --slot vt2")),
+            Some("vt2".to_string())
         );
-        assert!(sidebar.move_focus(1));
-        assert_eq!(
-            sidebar.focus,
-            Focus {
-                section: 0,
-                item: Some(1)
-            }
-        );
-        // Up walks back onto the header.
-        assert!(sidebar.move_focus(-1));
-        assert!(sidebar.move_focus(-1));
-        assert_eq!(
-            sidebar.focus,
-            Focus {
-                section: 0,
-                item: None
-            }
-        );
+        assert_eq!(parse_viewer_slot(Some("/bin/zsh -l")), None);
+        assert_eq!(parse_viewer_slot(None), None);
     }
 
     #[test]
-    fn move_focus_reports_no_movement_at_the_ends() {
-        let mut sidebar = sidebar_with_todos(1);
-        // Already on the first row.
-        assert!(!sidebar.move_focus(-1));
-        // Move to the last row, then confirm Down there does not move.
-        assert!(sidebar.move_focus(1));
-        assert!(!sidebar.move_focus(1));
-        assert_eq!(
-            sidebar.focus,
-            Focus {
-                section: 0,
-                item: Some(0)
-            }
-        );
+    fn cursor_walks_each_item_and_clamps_at_the_ends() {
+        let mut pane = todos_pane(3);
+        assert_eq!(pane.cursor, 0);
+        assert!(!pane.move_cursor(-1));
+        assert!(pane.move_cursor(1));
+        assert_eq!(pane.cursor, 1);
+        assert!(pane.move_cursor(1));
+        assert_eq!(pane.cursor, 2);
+        assert!(!pane.move_cursor(1));
+        assert_eq!(pane.cursor, 2);
     }
 
     #[test]
-    fn focused_target_is_none_on_a_header_and_set_on_an_item() {
-        let mut sidebar = sidebar_with_todos(1);
-        assert!(sidebar.focused_target().is_none());
-        sidebar.move_focus(1);
-        assert!(matches!(
-            sidebar.focused_target(),
-            Some(ItemTarget::Todo(0))
-        ));
+    fn cursor_no_movement_on_empty_list() {
+        let mut pane = pane_with(Mode::Todos);
+        assert!(!pane.move_cursor(1));
+        assert!(!pane.move_cursor(-1));
+    }
+
+    #[test]
+    fn scroll_pages_when_cursor_passes_the_visible_window() {
+        // last_rows = 10 -> visible = 9 items.
+        let mut pane = todos_pane(20);
+        // Move cursor down past the visible window.
+        for _ in 0..9 {
+            pane.move_cursor(1);
+        }
+        assert_eq!(pane.cursor, 9);
+        // The 10th down (cursor 0..=9 is the 10th step) is the one that
+        // forces the scroll: cursor 9 >= scroll(0) + visible(9), so scroll
+        // jumps to 1 to keep the cursor in view.
+        assert_eq!(pane.scroll, 1, "scroll: {}", pane.scroll);
+        // Continue past the end: scroll keeps pace.
+        for _ in 0..10 {
+            pane.move_cursor(1);
+        }
+        assert_eq!(pane.cursor, 19);
+        assert_eq!(pane.scroll, 11); // cursor(19) + 1 - visible(9) = 11
+    }
+
+    #[test]
+    fn scroll_resets_when_list_shrinks_under_cursor() {
+        let mut pane = todos_pane(20);
+        for _ in 0..15 {
+            pane.move_cursor(1);
+        }
+        assert_eq!(pane.cursor, 15);
+        // The list shrinks below the cursor; clamp_cursor keeps things sane.
+        pane.todos.truncate(5);
+        pane.rebuild_items();
+        assert_eq!(pane.cursor, 4);
+        let visible = pane.last_rows.saturating_sub(1).max(1);
+        assert!(pane.scroll <= pane.items.len().saturating_sub(visible));
+    }
+
+    #[test]
+    fn focused_target_reads_the_cursor() {
+        let mut pane = todos_pane(2);
+        assert!(matches!(pane.focused_target(), Some(ItemTarget::Todo(0))));
+        pane.move_cursor(1);
+        assert!(matches!(pane.focused_target(), Some(ItemTarget::Todo(1))));
     }
 
     #[test]
@@ -1786,8 +1745,6 @@ mod tests {
             terminal_command: Some(cmd.to_string()),
             ..Default::default()
         };
-        // Two agent panes delivered high-id-first, as a slot swap can leave
-        // them in the manifest.
         let mut panes = HashMap::new();
         panes.insert(
             0usize,
@@ -1796,43 +1753,21 @@ mod tests {
                 pane(4, "/bin/panopt _agent --id a"),
             ],
         );
-        let mut sidebar = PanoptSidebar::default();
+        let mut sidebar = pane_with(Mode::Agents);
         sidebar.ingest_panes(PaneManifest { panes });
-        sidebar.rebuild_sections();
-        // The Agents section lists them low id first, so the keyboard cursor's
-        // index keeps meaning the same agent across rebuilds.
-        let agents = &sidebar.sections[1];
-        assert!(matches!(agents.kind, SectionKind::Agents));
+        sidebar.rebuild_items();
         assert!(matches!(
-            agents.items[0].target,
+            sidebar.items[0].target,
             ItemTarget::Pane(PaneId::Terminal(4))
         ));
         assert!(matches!(
-            agents.items[1].target,
+            sidebar.items[1].target,
             ItemTarget::Pane(PaneId::Terminal(9))
         ));
     }
 
     #[test]
-    fn parse_viewer_slot_extracts_the_slot_token() {
-        // The slot token is what keys the per-pane routing file - the cockpit
-        // writes to `viewer-<slot>.json` for each viewer pane.
-        assert_eq!(
-            parse_viewer_slot(Some("/bin/panopt _viewer --slot main --port 7600")),
-            Some("main".to_string())
-        );
-        assert_eq!(
-            parse_viewer_slot(Some("/bin/panopt _viewer --port 7600 --slot v2")),
-            Some("v2".to_string())
-        );
-        assert_eq!(parse_viewer_slot(Some("/bin/zsh -l")), None);
-        assert_eq!(parse_viewer_slot(None), None);
-    }
-
-    #[test]
     fn ingest_panes_captures_each_viewer_slot_name() {
-        // Per-pane routing depends on the plugin learning each viewer's
-        // `--slot X` token from the launch command at ingest time.
         use std::collections::HashMap;
         let mut panes = HashMap::new();
         panes.insert(
@@ -1850,7 +1785,9 @@ mod tests {
                     id: 7,
                     is_selectable: true,
                     is_suppressed: true,
-                    terminal_command: Some("/bin/panopt _viewer --slot v1 --port 7600".to_string()),
+                    terminal_command: Some(
+                        "/bin/panopt _viewer --slot vt1 --port 7600".to_string(),
+                    ),
                     ..Default::default()
                 },
                 PaneInfo {
@@ -1861,34 +1798,24 @@ mod tests {
                 },
             ],
         );
-        let mut sidebar = PanoptSidebar::default();
+        let mut sidebar = pane_with(Mode::Todos);
         sidebar.ingest_panes(PaneManifest { panes });
-        // Each viewer's slot token is captured - that's what `write_routing`
-        // keys off when re-pointing the slot's viewer at a new item.
         assert_eq!(
             sidebar.viewer_slot_of(PaneId::Terminal(3)),
             Some("main".to_string())
         );
         assert_eq!(
             sidebar.viewer_slot_of(PaneId::Terminal(7)),
-            Some("v1".to_string())
+            Some("vt1".to_string())
         );
-        // The suppressed viewer is the one `ensure_viewer_in_slot` reveals
-        // into the slot before falling back to spawning a fresh one.
         assert_eq!(sidebar.first_suppressed_viewer(), Some(PaneId::Terminal(7)));
-        // The agent pane carries no viewer slot name.
         assert!(sidebar.viewer_slot_of(PaneId::Terminal(9)).is_none());
     }
 
     #[test]
     fn pane_is_visible_tracks_the_suppressed_flag() {
-        // Two agent panes: one on screen, one suppressed (the slot-swap
-        // bookkeeping). `route_pane_to_slot` keys off this to clear the slot
-        // rather than yank an already-visible pane out of its split - the fix
-        // for the disappearing pane when the sidebar previews into a non-slot
-        // split.
         use std::collections::HashMap;
-        let pane = |id: u32, suppressed: bool| PaneInfo {
+        let make_pane = |id: u32, suppressed: bool| PaneInfo {
             id,
             is_selectable: true,
             is_suppressed: suppressed,
@@ -1896,12 +1823,11 @@ mod tests {
             ..Default::default()
         };
         let mut panes = HashMap::new();
-        panes.insert(0usize, vec![pane(4, false), pane(9, true)]);
-        let mut sidebar = PanoptSidebar::default();
+        panes.insert(0usize, vec![make_pane(4, false), make_pane(9, true)]);
+        let mut sidebar = pane_with(Mode::Todos);
         sidebar.ingest_panes(PaneManifest { panes });
         assert!(sidebar.pane_is_visible(PaneId::Terminal(4)));
         assert!(!sidebar.pane_is_visible(PaneId::Terminal(9)));
-        // A pane not in the manifest at all is also not visible.
         assert!(!sidebar.pane_is_visible(PaneId::Terminal(99)));
     }
 
@@ -1919,20 +1845,84 @@ mod tests {
             panes.insert(0usize, ids.iter().map(|&id| agent(id)).collect());
             PaneManifest { panes }
         };
-        let mut sidebar = PanoptSidebar::default();
+        let mut sidebar = pane_with(Mode::Agents);
         sidebar.ingest_panes(manifest(&[4, 9]));
-        sidebar.rebuild_sections();
-        let agents = &sidebar.sections[1];
-        assert_eq!(agents.items[0].label, "Agent 1"); // pane 4
-        assert_eq!(agents.items[1].label, "Agent 2"); // pane 9
-                                                      // A later manifest delivers the panes in the other order and adds one.
-                                                      // Existing labels stay put; the new pane takes the next number; rows
-                                                      // stay ordered by pane id.
+        sidebar.rebuild_items();
+        assert_eq!(sidebar.items[0].label, "Agent 1");
+        assert_eq!(sidebar.items[1].label, "Agent 2");
         sidebar.ingest_panes(manifest(&[12, 9, 4]));
-        sidebar.rebuild_sections();
-        let agents = &sidebar.sections[1];
-        assert_eq!(agents.items[0].label, "Agent 1"); // pane 4, unchanged
-        assert_eq!(agents.items[1].label, "Agent 2"); // pane 9, unchanged
-        assert_eq!(agents.items[2].label, "Agent 3"); // pane 12, new
+        sidebar.rebuild_items();
+        assert_eq!(sidebar.items[0].label, "Agent 1");
+        assert_eq!(sidebar.items[1].label, "Agent 2");
+        assert_eq!(sidebar.items[2].label, "Agent 3");
+    }
+
+    #[test]
+    fn mode_parse_recognizes_each_kind() {
+        for (s, m) in [
+            ("todos", Mode::Todos),
+            ("agents", Mode::Agents),
+            ("terminals", Mode::Terminals),
+            ("commands", Mode::Commands),
+            ("scratchpads", Mode::Scratchpads),
+        ] {
+            assert_eq!(Mode::parse(s), Some(m));
+        }
+        assert_eq!(Mode::parse("bogus"), None);
+        assert_eq!(Mode::parse(""), None);
+    }
+
+    #[test]
+    fn mode_letters_are_distinct() {
+        use std::collections::HashSet;
+        let letters: HashSet<char> = [
+            Mode::Todos,
+            Mode::Agents,
+            Mode::Terminals,
+            Mode::Commands,
+            Mode::Scratchpads,
+        ]
+        .into_iter()
+        .map(|m| m.letter())
+        .collect();
+        assert_eq!(letters.len(), 5, "every mode needs its own slot prefix");
+    }
+
+    #[test]
+    fn viewer_slot_carries_mode_letter() {
+        let mut todos = pane_with(Mode::Todos);
+        let mut scratchpads = pane_with(Mode::Scratchpads);
+        let a = todos.allocate_viewer_slot();
+        let b = scratchpads.allocate_viewer_slot();
+        // Two panes both allocating their first slot - the mode letter is
+        // what stops them from colliding on the same `v1`.
+        assert_ne!(a, b);
+        assert!(a.contains('t'));
+        assert!(b.contains('s'));
+    }
+
+    #[test]
+    fn agent_labels_roundtrip_through_the_projection_format() {
+        let mut input = BTreeMap::new();
+        input.insert(4u32, "Mediator".to_string());
+        input.insert(9u32, "Edge \"case\" with, commas".to_string());
+        let mut body = String::from("{");
+        for (i, (tid, label)) in input.iter().enumerate() {
+            if i > 0 {
+                body.push(',');
+            }
+            let safe = label.replace('\\', "\\\\").replace('"', "\\\"");
+            body.push_str(&format!("\"{tid}\":\"{safe}\""));
+        }
+        body.push('}');
+        let parsed: BTreeMap<u32, String> = parse_agent_labels(&body).into_iter().collect();
+        assert_eq!(parsed, input);
+    }
+
+    #[test]
+    fn agent_labels_parser_tolerates_malformed_input() {
+        assert!(parse_agent_labels("").is_empty());
+        assert!(parse_agent_labels("not json").is_empty());
+        assert!(parse_agent_labels("{}").is_empty());
     }
 }

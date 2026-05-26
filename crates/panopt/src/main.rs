@@ -4,13 +4,14 @@
 //! opens agent panes - each with a stable per-agent identity (DESIGN.md §9).
 
 mod agent;
+mod agent_tool;
 mod close_gate;
 mod daemon;
 mod edit;
 mod mcp;
 mod mcpclient;
 mod paths;
-mod roster;
+mod process;
 mod scratchpad_form;
 mod todo;
 mod todo_form;
@@ -57,13 +58,22 @@ enum Cmd {
         #[command(subcommand)]
         action: todo::TodoCmd,
     },
-    /// Inspect and edit the project's roster of agents, commands, and terminals.
-    Roster {
-        /// Project root the roster belongs to (default: the current directory).
+    /// Inspect and edit the project's agent tools (durable spawn configs).
+    #[command(name = "agent-tool")]
+    AgentTool {
+        /// Project root the agent tools belong to (default: the current directory).
         #[arg(long, global = true)]
         ws: Option<PathBuf>,
         #[command(subcommand)]
-        action: roster::RosterCmd,
+        action: agent_tool::AgentToolCmd,
+    },
+    /// Inspect and edit the project's processes (agent/command/terminal instances).
+    Process {
+        /// Project root the processes belong to (default: the current directory).
+        #[arg(long, global = true)]
+        ws: Option<PathBuf>,
+        #[command(subcommand)]
+        action: process::ProcessCmd,
     },
     /// Internal: the entrypoint that runs inside an agent pane.
     #[command(name = "_agent", hide = true)]
@@ -73,12 +83,12 @@ enum Cmd {
         #[arg(long)]
         id: Option<String>,
     },
-    /// Internal: start a roster entry in this pane.
-    #[command(name = "_roster-run", hide = true)]
-    RosterRun {
+    /// Internal: start a process in this pane.
+    #[command(name = "_process-run", hide = true)]
+    ProcessRun {
         #[arg(long)]
         ws: Option<PathBuf>,
-        /// Numeric id of the roster entry to start.
+        /// Numeric id of the process to start.
         id: u64,
     },
     /// Internal: a long-lived cockpit viewer pane.
@@ -118,9 +128,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::Up { plugin } => up::run(plugin, cli.port),
         Cmd::Agent { name } => agent::spawn(name),
         Cmd::Todo { ws, action } => todo::run(ws, action, cli.port),
-        Cmd::Roster { ws, action } => roster::run(ws, action, cli.port),
+        Cmd::AgentTool { ws, action } => agent_tool::run(ws, action, cli.port),
+        Cmd::Process { ws, action } => process::run(ws, action, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
-        Cmd::RosterRun { ws, id } => roster::exec_entry(ws, id, cli.port),
+        Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
         Cmd::CloseGateExec { scope, items, target_pane } => {
             close_gate::run(&scope, &items, target_pane, cli.port)

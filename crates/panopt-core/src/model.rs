@@ -156,71 +156,140 @@ pub struct TodoPatch {
     pub tags: Option<Vec<String>>,
 }
 
-/// What a [`RosterEntry`] launches: an agent CLI, a project command, or a
-/// plain terminal. Modeled on the values of Solo's `processes.kind` column.
+/// What a [`Process`] is - an agent CLI, a project command, or a plain
+/// terminal. Modeled on the values of Solo's `processes.kind` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RosterKind {
+pub enum ProcessKind {
     #[default]
     Agent,
     Command,
     Terminal,
 }
 
-impl RosterKind {
+impl ProcessKind {
     /// The token stored in SQLite and used on the wire and in the projection.
     pub fn as_str(self) -> &'static str {
         match self {
-            RosterKind::Agent => "agent",
-            RosterKind::Command => "command",
-            RosterKind::Terminal => "terminal",
+            ProcessKind::Agent => "agent",
+            ProcessKind::Command => "command",
+            ProcessKind::Terminal => "terminal",
         }
     }
 
     /// Parse a stored or wire token; `None` for an unrecognized string.
-    pub fn parse(s: &str) -> Option<RosterKind> {
+    pub fn parse(s: &str) -> Option<ProcessKind> {
         match s {
-            "agent" => Some(RosterKind::Agent),
-            "command" => Some(RosterKind::Command),
-            "terminal" => Some(RosterKind::Terminal),
+            "agent" => Some(ProcessKind::Agent),
+            "command" => Some(ProcessKind::Command),
+            "terminal" => Some(ProcessKind::Terminal),
             _ => None,
         }
     }
 }
 
-/// A persistent, per-project roster entry: a launchable agent, command, or
-/// terminal. Modeled on a row of Solo's `processes` table.
-///
-/// Whether the entry is currently running is *not* stored here - the cockpit
-/// derives that from live Zellij pane state. The roster holds only the durable
-/// definition.
+/// A durable, per-project agent configuration: the "what to launch" half of
+/// the two-layer process model (todo #27). One tool can back many running
+/// [`Process`] instances. Modeled on a row of Solo's `agent_tools` table.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RosterEntry {
-    /// Numeric id, unique within the project, restarting at 1 per project.
+pub struct AgentTool {
+    /// Numeric id, unique within the project, drawn from the unified
+    /// `projects.next_id` counter (todo #16).
     pub id: u64,
-    pub kind: RosterKind,
-    /// Identifier-style name.
+    /// Identifier-style name (e.g. "claude").
     pub name: String,
     /// Optional human label for the cockpit; falls back to `name` when empty.
     pub display_name: String,
-    /// The shell command this entry launches. Empty for a plain terminal.
+    /// The shell command this tool launches when used to spawn a process.
     pub command: String,
-    /// Working directory for the launched command; empty means the project root.
+    /// Working directory passed to the launched command; empty means the
+    /// project root.
     pub cwd: String,
-    /// Sort key within the project's roster.
+    /// Free-form tag for future categorization (Solo carries one per tool).
+    /// Defaults to `"agent"`.
+    pub tool_type: String,
+    /// Whether the tool is offered in spawn UIs. Stored but not yet enforced
+    /// (no spawn UI exists in PANopt yet).
+    pub enabled: bool,
+    /// Sort key within the project's agent tools.
     pub position: i64,
     /// SQLite `datetime('now')` text (UTC).
     pub created_at: String,
 }
 
-/// A set of optional edits to a [`RosterEntry`], applied by
-/// [`crate::Store::roster_update`]. Each `None` field is left untouched.
+/// A set of optional edits to an [`AgentTool`], applied by
+/// [`crate::Store::agent_tool_update`]. Each `None` field is left untouched.
 #[derive(Debug, Default, Clone)]
-pub struct RosterPatch {
+pub struct AgentToolPatch {
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub tool_type: Option<String>,
+    pub enabled: Option<bool>,
+    pub position: Option<i64>,
+}
+
+/// A per-project process instance: the "what's running" half of the
+/// two-layer model (todo #27). Carries an optional back-reference to its
+/// source [`AgentTool`] when `kind` is `Agent`, plus nullable lifecycle
+/// columns reserved for a follow-up that wires spawn ownership.
+///
+/// Whether the process is currently alive is still *not* stored - the cockpit
+/// continues to derive that from live Zellij pane state until panoptd owns
+/// the spawn lifecycle (DESIGN.md S10).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Process {
+    /// Numeric id, unique within the project, drawn from the unified
+    /// `projects.next_id` counter.
+    pub id: u64,
+    pub kind: ProcessKind,
+    /// Identifier-style name. Empty rows fall back to the linked tool's name
+    /// at projection time.
+    pub name: String,
+    /// Optional human label for the cockpit; falls back to `name` when empty.
+    pub display_name: String,
+    /// The shell command this process executes. For agent kinds this is
+    /// copied from the source [`AgentTool`] at spawn time so post-spawn edits
+    /// to the tool don't perturb the running instance.
+    pub command: String,
+    /// Working directory; empty means the project root.
+    pub cwd: String,
+    /// Sort key within the project's processes.
+    pub position: i64,
+    /// Back-reference to the [`AgentTool`] this instance was spawned from.
+    /// `None` for migrated pre-V6 rows and for command/terminal processes
+    /// that have no backing tool. Deleting a tool sets this to `None`
+    /// (ON DELETE SET NULL) so the live instance keeps running.
+    pub agent_tool_id: Option<u64>,
+    /// OS process id, populated only once panoptd owns the spawn lifecycle.
+    pub pid: Option<i64>,
+    /// Free-form lifecycle status (`"running"`, `"exited"`, ...). `None`
+    /// until lifecycle ownership lands.
+    pub status: Option<String>,
+    /// Free-form agent state (`"idle"`, `"thinking"`, `"planning"`),
+    /// produced by a future TUI-parsing layer.
+    pub agent_state: Option<String>,
+    /// SQLite `datetime('now')` text of the last lifecycle ping. `None`
+    /// until lifecycle ownership lands.
+    pub last_seen: Option<String>,
+    /// SQLite `datetime('now')` text (UTC) at row creation.
+    pub created_at: String,
+}
+
+/// A set of optional edits to a [`Process`], applied by
+/// [`crate::Store::process_update`]. Each `None` field is left untouched.
+#[derive(Debug, Default, Clone)]
+pub struct ProcessPatch {
     pub name: Option<String>,
     pub display_name: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub position: Option<i64>,
+    pub agent_tool_id: Option<Option<u64>>,
+    pub pid: Option<Option<i64>>,
+    pub status: Option<Option<String>>,
+    pub agent_state: Option<Option<String>>,
+    pub last_seen: Option<Option<String>>,
 }
 
 /// A connected agent, as tracked by the in-memory registry.

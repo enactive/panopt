@@ -19,8 +19,8 @@ use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
 use crate::model::{
-    Agent, Lock, Priority, ProjectId, RosterEntry, RosterKind, RosterPatch, Scratchpad,
-    ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
+    Agent, AgentTool, AgentToolPatch, Lock, Priority, Process, ProcessKind, ProcessPatch,
+    ProjectId, Scratchpad, ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 use crate::projection;
 use crate::registry::Registry;
@@ -399,36 +399,41 @@ impl Store {
             .ok_or(CoreError::ScratchpadNotFound(id))
     }
 
-    // --- roster ---
+    // --- agent_tools ---
 
-    /// Create a roster entry in `project` and return its id. `position` is set
-    /// to the new id so entries default to creation order yet stay reorderable.
-    pub fn roster_create(
+    /// Create an agent tool (configuration) in `project` and return its id.
+    /// `position` defaults to the new id so tools sort by creation order
+    /// while staying reorderable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_tool_create(
         &mut self,
         project: ProjectId,
-        kind: RosterKind,
         name: String,
         display_name: String,
         command: String,
         cwd: String,
+        tool_type: String,
+        enabled: bool,
     ) -> Result<u64, CoreError> {
         let pid = project.0;
         let id = {
             let tx = self.conn.transaction()?;
             let next = next_id(&tx, pid)?;
             tx.execute(
-                "INSERT INTO roster
-                    (project_id, id, kind, name, display_name, command, cwd, position, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
+                "INSERT INTO agent_tools
+                    (project_id, id, name, display_name, command, cwd,
+                     tool_type, enabled, position, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))",
                 params![
                     pid,
                     next,
-                    kind.as_str(),
                     name,
                     display_name,
                     command,
                     cwd,
-                    next
+                    tool_type,
+                    enabled as i64,
+                    next,
                 ],
             )?;
             tx.execute(
@@ -438,46 +443,246 @@ impl Store {
             tx.commit()?;
             next as u64
         };
-        self.reproject_roster(project)?;
+        self.reproject_agent_tools(project)?;
         Ok(id)
     }
 
-    /// List a project's roster entries, ordered by `position` then `id`.
-    pub fn roster_list(&self, project: ProjectId) -> Result<Vec<RosterEntry>, CoreError> {
+    /// List a project's agent tools, ordered by `position` then `id`.
+    pub fn agent_tool_list(&self, project: ProjectId) -> Result<Vec<AgentTool>, CoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, name, display_name, command, cwd, position, created_at
-               FROM roster WHERE project_id = ?1 ORDER BY position, id",
+            "SELECT id, name, display_name, command, cwd, tool_type, enabled, position, created_at
+               FROM agent_tools WHERE project_id = ?1 ORDER BY position, id",
         )?;
         let rows = stmt.query_map([project.0], |r| {
-            let kind: String = r.get(1)?;
-            Ok(RosterEntry {
+            Ok(AgentTool {
                 id: r.get::<_, i64>(0)? as u64,
-                kind: RosterKind::parse(&kind).unwrap_or_default(),
-                name: r.get(2)?,
-                display_name: r.get(3)?,
-                command: r.get(4)?,
-                cwd: r.get(5)?,
-                position: r.get(6)?,
-                created_at: r.get(7)?,
+                name: r.get(1)?,
+                display_name: r.get(2)?,
+                command: r.get(3)?,
+                cwd: r.get(4)?,
+                tool_type: r.get(5)?,
+                enabled: r.get::<_, i64>(6)? != 0,
+                position: r.get(7)?,
+                created_at: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Fetch one roster entry, or [`CoreError::RosterNotFound`] if it is absent.
-    pub fn roster_get(&self, project: ProjectId, id: u64) -> Result<RosterEntry, CoreError> {
-        self.fetch_roster(project, id)
+    /// Fetch one agent tool, or [`CoreError::AgentToolNotFound`] if it is absent.
+    pub fn agent_tool_get(&self, project: ProjectId, id: u64) -> Result<AgentTool, CoreError> {
+        self.fetch_agent_tool(project, id)
     }
 
-    /// Apply a [`RosterPatch`]: every `Some` field is written, every `None`
-    /// field is left as-is.
-    pub fn roster_update(
+    /// Apply an [`AgentToolPatch`]: every `Some` field is written, every
+    /// `None` field is left as-is.
+    pub fn agent_tool_update(
         &mut self,
         project: ProjectId,
         id: u64,
-        patch: RosterPatch,
+        patch: AgentToolPatch,
     ) -> Result<(), CoreError> {
-        let mut entry = self.fetch_roster(project, id)?;
+        let mut entry = self.fetch_agent_tool(project, id)?;
+        if let Some(v) = patch.name {
+            entry.name = v;
+        }
+        if let Some(v) = patch.display_name {
+            entry.display_name = v;
+        }
+        if let Some(v) = patch.command {
+            entry.command = v;
+        }
+        if let Some(v) = patch.cwd {
+            entry.cwd = v;
+        }
+        if let Some(v) = patch.tool_type {
+            entry.tool_type = v;
+        }
+        if let Some(v) = patch.enabled {
+            entry.enabled = v;
+        }
+        if let Some(v) = patch.position {
+            entry.position = v;
+        }
+        self.conn.execute(
+            "UPDATE agent_tools
+                SET name = ?1, display_name = ?2, command = ?3, cwd = ?4,
+                    tool_type = ?5, enabled = ?6, position = ?7
+              WHERE project_id = ?8 AND id = ?9",
+            params![
+                entry.name,
+                entry.display_name,
+                entry.command,
+                entry.cwd,
+                entry.tool_type,
+                entry.enabled as i64,
+                entry.position,
+                project.0,
+                id as i64,
+            ],
+        )?;
+        self.reproject_agent_tools(project)
+    }
+
+    /// Delete an agent tool. Any process rows that reference it keep running -
+    /// only the back-reference is severed (`agent_tool_id` becomes `None`) so a
+    /// live instance survives its source config. SQLite's composite-FK
+    /// `ON DELETE SET NULL` would also try to null the non-nullable
+    /// `project_id`, so the unlinking is handled here in one transaction with
+    /// the delete instead.
+    pub fn agent_tool_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        let pid = project.0;
+        let changed = {
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "UPDATE processes SET agent_tool_id = NULL
+                  WHERE project_id = ?1 AND agent_tool_id = ?2",
+                params![pid, id as i64],
+            )?;
+            let deleted = tx.execute(
+                "DELETE FROM agent_tools WHERE project_id = ?1 AND id = ?2",
+                params![pid, id as i64],
+            )?;
+            tx.commit()?;
+            deleted
+        };
+        if changed == 0 {
+            return Err(CoreError::AgentToolNotFound(id));
+        }
+        // The unlink may have changed processes too; refresh both projections.
+        self.reproject_agent_tools(project)?;
+        self.reproject_processes(project)
+    }
+
+    fn fetch_agent_tool(&self, project: ProjectId, id: u64) -> Result<AgentTool, CoreError> {
+        self.conn
+            .query_row(
+                "SELECT name, display_name, command, cwd, tool_type, enabled, position, created_at
+                   FROM agent_tools WHERE project_id = ?1 AND id = ?2",
+                params![project.0, id as i64],
+                |r| {
+                    Ok(AgentTool {
+                        id,
+                        name: r.get(0)?,
+                        display_name: r.get(1)?,
+                        command: r.get(2)?,
+                        cwd: r.get(3)?,
+                        tool_type: r.get(4)?,
+                        enabled: r.get::<_, i64>(5)? != 0,
+                        position: r.get(6)?,
+                        created_at: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(CoreError::AgentToolNotFound(id))
+    }
+
+    // --- processes ---
+
+    /// Create a process instance in `project` and return its id.
+    ///
+    /// If `agent_tool_id` is `Some`, the referenced tool must exist in the
+    /// same project; otherwise a [`CoreError::BadRequest`] is returned so a
+    /// stale id never becomes a silent NULL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_create(
+        &mut self,
+        project: ProjectId,
+        kind: ProcessKind,
+        name: String,
+        display_name: String,
+        command: String,
+        cwd: String,
+        agent_tool_id: Option<u64>,
+    ) -> Result<u64, CoreError> {
+        let pid = project.0;
+        if let Some(tool_id) = agent_tool_id {
+            // Validate at the app layer too; the FK alone would translate a
+            // missing tool into an opaque SQLite constraint error.
+            self.fetch_agent_tool(project, tool_id)
+                .map_err(|e| match e {
+                    CoreError::AgentToolNotFound(_) => CoreError::BadRequest(format!(
+                        "agent_tool_id {tool_id} does not exist in this project"
+                    )),
+                    other => other,
+                })?;
+        }
+        let id = {
+            let tx = self.conn.transaction()?;
+            let next = next_id(&tx, pid)?;
+            tx.execute(
+                "INSERT INTO processes
+                    (project_id, id, kind, name, display_name, command, cwd,
+                     position, agent_tool_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))",
+                params![
+                    pid,
+                    next,
+                    kind.as_str(),
+                    name,
+                    display_name,
+                    command,
+                    cwd,
+                    next,
+                    agent_tool_id.map(|v| v as i64),
+                ],
+            )?;
+            tx.execute(
+                "UPDATE projects SET next_id = ?1 WHERE id = ?2",
+                params![next + 1, pid],
+            )?;
+            tx.commit()?;
+            next as u64
+        };
+        self.reproject_processes(project)?;
+        Ok(id)
+    }
+
+    /// List a project's processes, ordered by `position` then `id`.
+    pub fn process_list(&self, project: ProjectId) -> Result<Vec<Process>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, display_name, command, cwd, position,
+                    agent_tool_id, pid, status, agent_state, last_seen, created_at
+               FROM processes WHERE project_id = ?1 ORDER BY position, id",
+        )?;
+        let rows = stmt.query_map([project.0], |r| {
+            let kind: String = r.get(1)?;
+            Ok(Process {
+                id: r.get::<_, i64>(0)? as u64,
+                kind: ProcessKind::parse(&kind).unwrap_or_default(),
+                name: r.get(2)?,
+                display_name: r.get(3)?,
+                command: r.get(4)?,
+                cwd: r.get(5)?,
+                position: r.get(6)?,
+                agent_tool_id: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                pid: r.get(8)?,
+                status: r.get(9)?,
+                agent_state: r.get(10)?,
+                last_seen: r.get(11)?,
+                created_at: r.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fetch one process, or [`CoreError::ProcessNotFound`] if it is absent.
+    pub fn process_get(&self, project: ProjectId, id: u64) -> Result<Process, CoreError> {
+        self.fetch_process(project, id)
+    }
+
+    /// Apply a [`ProcessPatch`]: every outer `Some` field is written. Inner
+    /// nullable fields (`agent_tool_id`, `pid`, `status`, `agent_state`,
+    /// `last_seen`) use `Some(Option<T>)` so a caller can both set and clear
+    /// them.
+    pub fn process_update(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        patch: ProcessPatch,
+    ) -> Result<(), CoreError> {
+        let mut entry = self.fetch_process(project, id)?;
         if let Some(v) = patch.name {
             entry.name = v;
         }
@@ -493,58 +698,94 @@ impl Store {
         if let Some(v) = patch.position {
             entry.position = v;
         }
+        if let Some(v) = patch.agent_tool_id {
+            if let Some(tool_id) = v {
+                self.fetch_agent_tool(project, tool_id)
+                    .map_err(|e| match e {
+                        CoreError::AgentToolNotFound(_) => CoreError::BadRequest(format!(
+                            "agent_tool_id {tool_id} does not exist in this project"
+                        )),
+                        other => other,
+                    })?;
+            }
+            entry.agent_tool_id = v;
+        }
+        if let Some(v) = patch.pid {
+            entry.pid = v;
+        }
+        if let Some(v) = patch.status {
+            entry.status = v;
+        }
+        if let Some(v) = patch.agent_state {
+            entry.agent_state = v;
+        }
+        if let Some(v) = patch.last_seen {
+            entry.last_seen = v;
+        }
         self.conn.execute(
-            "UPDATE roster
-                SET name = ?1, display_name = ?2, command = ?3, cwd = ?4, position = ?5
-              WHERE project_id = ?6 AND id = ?7",
+            "UPDATE processes
+                SET name = ?1, display_name = ?2, command = ?3, cwd = ?4,
+                    position = ?5, agent_tool_id = ?6, pid = ?7, status = ?8,
+                    agent_state = ?9, last_seen = ?10
+              WHERE project_id = ?11 AND id = ?12",
             params![
                 entry.name,
                 entry.display_name,
                 entry.command,
                 entry.cwd,
                 entry.position,
+                entry.agent_tool_id.map(|v| v as i64),
+                entry.pid,
+                entry.status,
+                entry.agent_state,
+                entry.last_seen,
                 project.0,
                 id as i64,
             ],
         )?;
-        self.reproject_roster(project)
+        self.reproject_processes(project)
     }
 
-    /// Delete a roster entry.
-    pub fn roster_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+    /// Delete a process.
+    pub fn process_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let changed = self.conn.execute(
-            "DELETE FROM roster WHERE project_id = ?1 AND id = ?2",
+            "DELETE FROM processes WHERE project_id = ?1 AND id = ?2",
             params![project.0, id as i64],
         )?;
         if changed == 0 {
-            return Err(CoreError::RosterNotFound(id));
+            return Err(CoreError::ProcessNotFound(id));
         }
-        self.reproject_roster(project)
+        self.reproject_processes(project)
     }
 
-    /// Fetch one roster entry by id within `project`.
-    fn fetch_roster(&self, project: ProjectId, id: u64) -> Result<RosterEntry, CoreError> {
+    fn fetch_process(&self, project: ProjectId, id: u64) -> Result<Process, CoreError> {
         self.conn
             .query_row(
-                "SELECT kind, name, display_name, command, cwd, position, created_at
-                   FROM roster WHERE project_id = ?1 AND id = ?2",
+                "SELECT kind, name, display_name, command, cwd, position,
+                        agent_tool_id, pid, status, agent_state, last_seen, created_at
+                   FROM processes WHERE project_id = ?1 AND id = ?2",
                 params![project.0, id as i64],
                 |r| {
                     let kind: String = r.get(0)?;
-                    Ok(RosterEntry {
+                    Ok(Process {
                         id,
-                        kind: RosterKind::parse(&kind).unwrap_or_default(),
+                        kind: ProcessKind::parse(&kind).unwrap_or_default(),
                         name: r.get(1)?,
                         display_name: r.get(2)?,
                         command: r.get(3)?,
                         cwd: r.get(4)?,
                         position: r.get(5)?,
-                        created_at: r.get(6)?,
+                        agent_tool_id: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                        pid: r.get(7)?,
+                        status: r.get(8)?,
+                        agent_state: r.get(9)?,
+                        last_seen: r.get(10)?,
+                        created_at: r.get(11)?,
                     })
                 },
             )
             .optional()?
-            .ok_or(CoreError::RosterNotFound(id))
+            .ok_or(CoreError::ProcessNotFound(id))
     }
 
     // --- todos ---
@@ -1017,9 +1258,15 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    fn reproject_roster(&self, project: ProjectId) -> Result<(), CoreError> {
+    fn reproject_agent_tools(&self, project: ProjectId) -> Result<(), CoreError> {
         let root = self.project_root(project)?;
-        projection::project_roster(&root, &self.roster_list(project)?)?;
+        projection::project_agent_tools(&root, &self.agent_tool_list(project)?)?;
+        Ok(())
+    }
+
+    fn reproject_processes(&self, project: ProjectId) -> Result<(), CoreError> {
+        let root = self.project_root(project)?;
+        projection::project_processes(&root, &self.process_list(project)?)?;
         Ok(())
     }
 
@@ -1039,7 +1286,8 @@ impl Store {
     /// project per process by [`Self::ensure_project`].
     fn reproject_all(&self, root: &Path, project: ProjectId) -> Result<(), CoreError> {
         projection::project_todos(root, &self.todo_list(project)?)?;
-        projection::project_roster(root, &self.roster_list(project)?)?;
+        projection::project_agent_tools(root, &self.agent_tool_list(project)?)?;
+        projection::project_processes(root, &self.process_list(project)?)?;
         projection::project_agents(root, &self.registry.list(project.0))?;
         projection::project_locks(root, &self.lock_list(project))?;
         projection::project_scratchpads_index(root, &self.scratchpad_index_rows(project)?)?;
@@ -1052,7 +1300,7 @@ impl Store {
 
 /// Read a project's global `next_id` counter, mapping a missing project row to
 /// [`CoreError::ProjectNotFound`]. The counter is shared across todos,
-/// scratchpads, and roster entries, so a `#N` reference is unambiguous.
+/// scratchpads, agent tools, and processes, so a `#N` reference is unambiguous.
 fn next_id(conn: &Connection, pid: i64) -> Result<i64, CoreError> {
     conn.query_row("SELECT next_id FROM projects WHERE id = ?1", [pid], |r| {
         r.get(0)
@@ -1100,28 +1348,130 @@ mod tests {
 
     #[test]
     fn ids_are_globally_unique_across_resource_types() {
-        // Todo #16: one shared sequence so `#N` resolves to exactly one
-        // resource. A todo, then a scratchpad, then a roster entry must all
-        // get distinct ids in creation order.
+        // Todo #16 + #27: one shared sequence so `#N` resolves to exactly one
+        // resource. A todo, scratchpad, agent tool, and process all draw from
+        // the same counter in creation order.
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
         assert_eq!(fx.store.todo_create(p, "a".into()).unwrap(), 1);
         assert_eq!(fx.store.scratchpad_create(p, "pad".into()).unwrap(), 2);
         assert_eq!(
             fx.store
-                .roster_create(
+                .agent_tool_create(
                     p,
-                    RosterKind::Command,
-                    "r".into(),
+                    "claude".into(),
                     String::new(),
                     String::new(),
                     String::new(),
+                    "agent".into(),
+                    true,
                 )
                 .unwrap(),
             3
         );
-        assert_eq!(fx.store.todo_create(p, "b".into()).unwrap(), 4);
-        assert_eq!(fx.store.scratchpad_create(p, "pad2".into()).unwrap(), 5);
+        assert_eq!(
+            fx.store
+                .process_create(
+                    p,
+                    ProcessKind::Command,
+                    "build".into(),
+                    String::new(),
+                    "cargo build".into(),
+                    String::new(),
+                    None,
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(fx.store.todo_create(p, "b".into()).unwrap(), 5);
+        assert_eq!(fx.store.scratchpad_create(p, "pad2".into()).unwrap(), 6);
+    }
+
+    #[test]
+    fn process_create_with_invalid_agent_tool_id_is_rejected() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let err = fx
+            .store
+            .process_create(
+                p,
+                ProcessKind::Agent,
+                "claude-1".into(),
+                String::new(),
+                "claude".into(),
+                String::new(),
+                Some(42),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CoreError::BadRequest(_)), "{err:?}");
+    }
+
+    #[test]
+    fn process_create_with_valid_agent_tool_id_links_it() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let tool = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude".into(),
+                String::new(),
+                "claude".into(),
+                String::new(),
+                "agent".into(),
+                true,
+            )
+            .unwrap();
+        let proc = fx
+            .store
+            .process_create(
+                p,
+                ProcessKind::Agent,
+                "claude-1".into(),
+                String::new(),
+                "claude".into(),
+                String::new(),
+                Some(tool),
+            )
+            .unwrap();
+        let row = fx.store.process_get(p, proc).unwrap();
+        assert_eq!(row.agent_tool_id, Some(tool));
+    }
+
+    #[test]
+    fn deleting_an_agent_tool_nulls_the_processes_back_reference() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let tool = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude".into(),
+                String::new(),
+                "claude".into(),
+                String::new(),
+                "agent".into(),
+                true,
+            )
+            .unwrap();
+        let proc = fx
+            .store
+            .process_create(
+                p,
+                ProcessKind::Agent,
+                "claude-1".into(),
+                String::new(),
+                "claude".into(),
+                String::new(),
+                Some(tool),
+            )
+            .unwrap();
+        fx.store.agent_tool_delete(p, tool).unwrap();
+        let row = fx.store.process_get(p, proc).unwrap();
+        assert_eq!(
+            row.agent_tool_id, None,
+            "ON DELETE SET NULL keeps the live process running but unlinks the tool"
+        );
     }
 
     #[test]
@@ -1789,49 +2139,105 @@ mod tests {
     }
 
     #[test]
-    fn roster_create_list_update_delete_and_project() {
+    fn agent_tool_create_list_update_delete_and_project() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
 
         let id = fx
             .store
-            .roster_create(
+            .agent_tool_create(
                 p,
-                RosterKind::Agent,
                 "claude".into(),
                 "Mediator".into(),
                 "claude --model sonnet".into(),
                 String::new(),
+                "agent".into(),
+                true,
             )
             .unwrap();
         assert_eq!(id, 1);
 
-        let entries = fx.store.roster_list(p).unwrap();
+        let entries = fx.store.agent_tool_list(p).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, RosterKind::Agent);
+        assert_eq!(entries[0].name, "claude");
         assert_eq!(entries[0].display_name, "Mediator");
+        assert!(entries[0].enabled);
 
-        // The roster is projected to disk for the cockpit plugin to read.
-        let roster_md = std::fs::read_to_string(root.join(".panopt/roster.md")).unwrap();
-        assert!(roster_md.contains("- [agent] #1 Mediator"), "{roster_md}");
+        // The tool projection is what the cockpit reads for the spawn picker.
+        let tools_md = std::fs::read_to_string(root.join(".panopt/agent_tools.md")).unwrap();
+        assert!(tools_md.contains("- #1 Mediator"), "{tools_md}");
 
         fx.store
-            .roster_update(
+            .agent_tool_update(
                 p,
                 id,
-                RosterPatch {
+                AgentToolPatch {
                     command: Some("claude".into()),
+                    enabled: Some(false),
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert_eq!(fx.store.roster_get(p, id).unwrap().command, "claude");
+        let updated = fx.store.agent_tool_get(p, id).unwrap();
+        assert_eq!(updated.command, "claude");
+        assert!(!updated.enabled);
 
-        fx.store.roster_delete(p, id).unwrap();
-        assert!(fx.store.roster_list(p).unwrap().is_empty());
+        fx.store.agent_tool_delete(p, id).unwrap();
+        assert!(fx.store.agent_tool_list(p).unwrap().is_empty());
         assert!(matches!(
-            fx.store.roster_delete(p, id),
-            Err(CoreError::RosterNotFound(_))
+            fx.store.agent_tool_delete(p, id),
+            Err(CoreError::AgentToolNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn process_create_list_update_delete_and_project() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+
+        let id = fx
+            .store
+            .process_create(
+                p,
+                ProcessKind::Command,
+                "build".into(),
+                "Build".into(),
+                "cargo build".into(),
+                "/tmp".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(id, 1);
+
+        let entries = fx.store.process_list(p).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, ProcessKind::Command);
+        assert_eq!(entries[0].display_name, "Build");
+        assert!(entries[0].agent_tool_id.is_none());
+
+        let processes_md = std::fs::read_to_string(root.join(".panopt/processes.md")).unwrap();
+        assert!(
+            processes_md.contains("- [command] #1 Build"),
+            "{processes_md}"
+        );
+
+        fx.store
+            .process_update(
+                p,
+                id,
+                ProcessPatch {
+                    command: Some("cargo test".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fx.store.process_get(p, id).unwrap().command, "cargo test");
+
+        fx.store.process_delete(p, id).unwrap();
+        assert!(fx.store.process_list(p).unwrap().is_empty());
+        assert!(matches!(
+            fx.store.process_delete(p, id),
+            Err(CoreError::ProcessNotFound(_))
         ));
     }
 
