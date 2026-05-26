@@ -103,6 +103,104 @@ impl Mode {
     }
 }
 
+/// Status filter applied to the Todos pane. Each variant matches a wire
+/// token from the projection's `- <status>, <priority>` suffix.
+///
+/// `OpenUnblocked` is the default working-set filter, but the sidebar reads
+/// only the projection (no MCP), and the index doesn't carry blocker info;
+/// in this pane `OpenUnblocked` degrades to "open" until the projection
+/// learns to record blockers per row. The viewer pane on the right uses MCP
+/// and applies the full blocker-aware filter, so the precise unblocked
+/// view is available there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum TodoFilter {
+    All,
+    Open,
+    #[default]
+    OpenUnblocked,
+    InProgress,
+    Backlog,
+    Completed,
+    NotDone,
+}
+
+const ALL_TODO_FILTERS: [TodoFilter; 7] = [
+    TodoFilter::All,
+    TodoFilter::Open,
+    TodoFilter::OpenUnblocked,
+    TodoFilter::InProgress,
+    TodoFilter::Backlog,
+    TodoFilter::Completed,
+    TodoFilter::NotDone,
+];
+
+impl TodoFilter {
+    fn label(self) -> &'static str {
+        match self {
+            TodoFilter::All => "all",
+            TodoFilter::Open => "open",
+            TodoFilter::OpenUnblocked => "open-unblocked",
+            TodoFilter::InProgress => "in_progress",
+            TodoFilter::Backlog => "backlog",
+            TodoFilter::Completed => "completed",
+            TodoFilter::NotDone => "not_done",
+        }
+    }
+
+    fn next(self) -> TodoFilter {
+        let i = ALL_TODO_FILTERS
+            .iter()
+            .position(|f| *f == self)
+            .unwrap_or(0);
+        ALL_TODO_FILTERS[(i + 1) % ALL_TODO_FILTERS.len()]
+    }
+
+    fn prev(self) -> TodoFilter {
+        let i = ALL_TODO_FILTERS
+            .iter()
+            .position(|f| *f == self)
+            .unwrap_or(0);
+        ALL_TODO_FILTERS[(i + ALL_TODO_FILTERS.len() - 1) % ALL_TODO_FILTERS.len()]
+    }
+
+    /// Whether the projection-index label passes this filter. The label is
+    /// the trailing text after the link, e.g. `"the title - open, high"`.
+    /// Without blocker info, `OpenUnblocked` is approximated as `Open`.
+    fn includes_label(self, label: &str) -> bool {
+        if matches!(self, TodoFilter::All) {
+            return true;
+        }
+        let Some(status) = parse_status_suffix(label) else {
+            // Missing / unparsable status: leave the entry visible so a
+            // stray projection format never silently hides a real todo.
+            return true;
+        };
+        match self {
+            TodoFilter::All => true,
+            TodoFilter::Open | TodoFilter::OpenUnblocked => status == "open",
+            TodoFilter::InProgress => status == "in_progress",
+            TodoFilter::Backlog => status == "backlog",
+            TodoFilter::Completed => status == "completed",
+            TodoFilter::NotDone => status == "not_done",
+        }
+    }
+}
+
+/// Extract the wire status token from a projection-index label suffix like
+/// `wire up auth - open, high`. Returns `None` for labels without a known
+/// suffix; callers treat that as "do not hide."
+fn parse_status_suffix(label: &str) -> Option<&str> {
+    let dash = label.rfind(" - ")?;
+    let rest = &label[dash + 3..];
+    let comma = rest.find(',').unwrap_or(rest.len());
+    let token = rest[..comma].trim();
+    matches!(
+        token,
+        "open" | "in_progress" | "backlog" | "completed" | "not_done"
+    )
+    .then_some(token)
+}
+
 #[derive(Default)]
 struct PanoptPane {
     /// Which resource kind this plugin instance renders. Set in
@@ -139,6 +237,12 @@ struct PanoptPane {
     /// Items currently shown by this mode, rebuilt on every change. Always a
     /// single flat list; no sections.
     items: Vec<Item>,
+    /// Status filter the Todos pane applies when building [`Self::items`].
+    /// Cycled with `f` / `F`; held across rebuilds so the user keeps their
+    /// view as the projection changes underneath. Ignored by every other
+    /// mode.
+    todo_filter: TodoFilter,
+
     /// Index of the keyboard-selected item. Stays in `0..items.len()`.
     cursor: usize,
     /// Index of the topmost item rendered in the visible window. The window
@@ -476,15 +580,23 @@ impl PanoptPane {
         }
         let total = self.items.len();
         let visible = self.last_rows.max(1);
+        // Todos pane carries an extra filter segment so the user can tell at
+        // a glance what slice of todos the list is showing. Other modes keep
+        // the bare title.
+        let filter_seg = if self.mode == Mode::Todos {
+            format!(" [{}]", self.todo_filter.label())
+        } else {
+            String::new()
+        };
         if total == 0 {
-            return base.to_string();
+            return format!("{base}{filter_seg}");
         }
         if total <= visible {
-            return format!("{base} ({total})");
+            return format!("{base}{filter_seg} ({total})");
         }
         let start = self.scroll + 1;
         let end = (self.scroll + visible).min(total);
-        format!("{base} ({start}-{end}/{total})")
+        format!("{base}{filter_seg} ({start}-{end}/{total})")
     }
 
     /// Push the current [`Self::frame_title`] to Zellij as the pane's frame
@@ -693,6 +805,22 @@ impl PanoptPane {
         }
     }
 
+    /// Step the todo filter forward (`forward=true`) or backward, rebuild
+    /// the visible items, and refresh the frame title so the user sees the
+    /// new filter without an extra keypress.
+    fn cycle_todo_filter(&mut self, forward: bool) {
+        if self.mode != Mode::Todos {
+            return;
+        }
+        self.todo_filter = if forward {
+            self.todo_filter.next()
+        } else {
+            self.todo_filter.prev()
+        };
+        self.rebuild_items();
+        self.sync_frame_title();
+    }
+
     /// Rebuild this pane's item list from parsed data + live panes. The list
     /// is always a single flat sequence for the pane's mode.
     fn rebuild_items(&mut self) {
@@ -700,6 +828,7 @@ impl PanoptPane {
             Mode::Todos => self
                 .todos
                 .iter()
+                .filter(|(_, label)| self.todo_filter.includes_label(label))
                 .map(|(id, label)| Item {
                     label: format!("#{id} {label}"),
                     target: ItemTarget::Todo(*id),
@@ -871,6 +1000,11 @@ impl PanoptPane {
                 self.open_document("new-scratchpad", None, true)
             }
             BareKey::Char('L') => self.open_mode_list(true),
+            // Cycle the todo filter forward (`f`) or backward (`F`). Only
+            // meaningful in the Todos pane; for other modes the keys fall
+            // through to the no-op stubs below.
+            BareKey::Char('f') if self.mode == Mode::Todos => self.cycle_todo_filter(true),
+            BareKey::Char('F') if self.mode == Mode::Todos => self.cycle_todo_filter(false),
             // `/` (filter) and `s` (sort) are stubs - the keys are reserved
             // for future sort/filter behavior but do nothing today.
             BareKey::Char('/') | BareKey::Char('s') => {}

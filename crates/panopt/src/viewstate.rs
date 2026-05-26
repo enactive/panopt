@@ -15,12 +15,16 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 /// A remembered position within one item.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct ViewState {
     /// First visible row, for a scrollable document.
     pub scroll: u16,
     /// Selected row, for a navigable list.
     pub cursor: usize,
+    /// Free-form per-target hints, e.g. the todo list's status filter. The
+    /// shape is `{ "todo_filter": "open-unblocked" }`; unknown keys are
+    /// ignored on read so adding new ones is safe.
+    pub extras: serde_json::Map<String, Value>,
 }
 
 /// A stable hex hash of a project path, used as its view-state filename.
@@ -66,25 +70,37 @@ fn write(project: &Path, map: &Map<String, Value>) {
     }
 }
 
-/// The remembered state for `key`, or a default when none is stored.
+/// The remembered state for `key`, or a default when none is stored. Any
+/// fields beyond `scroll` / `cursor` are preserved in `extras` so callers
+/// like the todo list can stash their own per-target hints (e.g. the active
+/// status filter) without this module needing to know about them.
 pub fn get(project: &Path, key: &str) -> ViewState {
     match read(project).get(key) {
-        Some(v) => ViewState {
-            scroll: v.get("scroll").and_then(Value::as_u64).unwrap_or(0) as u16,
-            cursor: v.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize,
-        },
-        None => ViewState::default(),
+        Some(Value::Object(obj)) => {
+            let scroll = obj.get("scroll").and_then(Value::as_u64).unwrap_or(0) as u16;
+            let cursor = obj.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let mut extras = obj.clone();
+            extras.remove("scroll");
+            extras.remove("cursor");
+            ViewState {
+                scroll,
+                cursor,
+                extras,
+            }
+        }
+        _ => ViewState::default(),
     }
 }
 
 /// Persist the state for `key`, read-modify-writing the project's file so a
-/// concurrent viewer pane does not clobber another key.
+/// concurrent viewer pane does not clobber another key. Any `extras` keys
+/// the caller set are written alongside `scroll` and `cursor`.
 pub fn set(project: &Path, key: &str, state: ViewState) {
     let mut map = read(project);
-    map.insert(
-        key.to_string(),
-        json!({ "scroll": state.scroll, "cursor": state.cursor }),
-    );
+    let mut obj = state.extras;
+    obj.insert("scroll".into(), json!(state.scroll));
+    obj.insert("cursor".into(), json!(state.cursor));
+    map.insert(key.to_string(), Value::Object(obj));
     write(project, &map);
 }
 

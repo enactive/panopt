@@ -142,11 +142,113 @@ enum Content {
     ScratchpadForm(Box<ScratchpadForm>),
 }
 
-/// One row of a list view: where selecting it routes, and its display label.
+/// One row of a list view: where selecting it routes, its display label, and
+/// the metadata the filter needs.
+///
+/// `status` and `is_blocked` are only populated for todo entries; scratchpad
+/// entries leave them at their defaults and the [`TodoFilter`] simply never
+/// hides scratchpad entries.
 struct ListEntry {
     target: Target,
     label: String,
+    /// The todo's status token (one of "open", "in_progress", "backlog",
+    /// "completed", "not_done"). `None` for non-todo entries.
+    status: Option<String>,
+    /// True when this todo has at least one blocker. Always false for non-todo
+    /// entries.
+    is_blocked: bool,
 }
+
+/// What subset of todos the list view shows. Applied to a todo `ListEntry`'s
+/// `status` and `is_blocked`; non-todo entries are always shown.
+///
+/// `OpenUnblocked` is the default because that is the working set most of the
+/// time - todos ready to pick up, with no upstream work waiting. The user
+/// cycles through the other variants with `f` / `F` in the list view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum TodoFilter {
+    All,
+    Open,
+    #[default]
+    OpenUnblocked,
+    InProgress,
+    Backlog,
+    Completed,
+    NotDone,
+}
+
+impl TodoFilter {
+    /// The wire-style label shown in the header.
+    fn label(self) -> &'static str {
+        match self {
+            TodoFilter::All => "all",
+            TodoFilter::Open => "open",
+            TodoFilter::OpenUnblocked => "open-unblocked",
+            TodoFilter::InProgress => "in_progress",
+            TodoFilter::Backlog => "backlog",
+            TodoFilter::Completed => "completed",
+            TodoFilter::NotDone => "not_done",
+        }
+    }
+
+    /// The serialised form used by viewstate, identical to [`Self::label`].
+    fn as_key(self) -> &'static str {
+        self.label()
+    }
+
+    /// Parse a viewstate-stored token, defaulting to [`TodoFilter::default`]
+    /// on an unrecognised value (a forward-compatibility hedge for stored
+    /// filters whose meaning has since shifted).
+    fn parse(s: &str) -> TodoFilter {
+        ALL_FILTERS
+            .iter()
+            .copied()
+            .find(|f| f.as_key() == s)
+            .unwrap_or_default()
+    }
+
+    /// Next filter in the cycle, wrapping at the end.
+    fn next(self) -> TodoFilter {
+        let i = ALL_FILTERS.iter().position(|f| *f == self).unwrap_or(0);
+        ALL_FILTERS[(i + 1) % ALL_FILTERS.len()]
+    }
+
+    /// Previous filter in the cycle, wrapping at the start.
+    fn prev(self) -> TodoFilter {
+        let i = ALL_FILTERS.iter().position(|f| *f == self).unwrap_or(0);
+        ALL_FILTERS[(i + ALL_FILTERS.len() - 1) % ALL_FILTERS.len()]
+    }
+
+    /// Whether `entry` passes this filter. Non-todo entries (no `status`)
+    /// always pass; this keeps the same filter knob safe to leave on when the
+    /// pane switches to a non-todo list.
+    fn includes(self, entry: &ListEntry) -> bool {
+        let Some(status) = entry.status.as_deref() else {
+            return true;
+        };
+        match self {
+            TodoFilter::All => true,
+            TodoFilter::Open => status == "open",
+            TodoFilter::OpenUnblocked => status == "open" && !entry.is_blocked,
+            TodoFilter::InProgress => status == "in_progress",
+            TodoFilter::Backlog => status == "backlog",
+            TodoFilter::Completed => status == "completed",
+            TodoFilter::NotDone => status == "not_done",
+        }
+    }
+}
+
+/// Every [`TodoFilter`] variant in cycle order, used by the `f` / `F` keys
+/// and by [`TodoFilter::parse`].
+const ALL_FILTERS: [TodoFilter; 7] = [
+    TodoFilter::All,
+    TodoFilter::Open,
+    TodoFilter::OpenUnblocked,
+    TodoFilter::InProgress,
+    TodoFilter::Backlog,
+    TodoFilter::Completed,
+    TodoFilter::NotDone,
+];
 
 /// Run the viewer. `slot` is the routing token the plugin assigned this pane;
 /// `kind`/`id` are the initial item. The MCP URL is built from `ws` + `port`
@@ -216,6 +318,11 @@ struct Viewer {
     cursor: usize,
     /// Content-area height from the last draw, for scroll clamping.
     viewport: u16,
+    /// Active status filter for the todo list. Restored from viewstate when
+    /// the pane points at `Target::TodoList`; for other targets the field is
+    /// kept around but ignored, so leaving the list and coming back lands on
+    /// the same filter the user last set.
+    todo_filter: TodoFilter,
     last_refresh: Instant,
     needs_draw: bool,
 }
@@ -228,6 +335,12 @@ impl Viewer {
             .join(format!("viewer-{slot}.json"));
         let routing_mtime = mtime(&routing_path);
         let vs = viewstate::get(&ws, &target.key());
+        let todo_filter = vs
+            .extras
+            .get("todo_filter")
+            .and_then(Value::as_str)
+            .map(TodoFilter::parse)
+            .unwrap_or_default();
         let mut viewer = Viewer {
             ws,
             url,
@@ -239,6 +352,7 @@ impl Viewer {
             scroll: vs.scroll,
             cursor: vs.cursor,
             viewport: 1,
+            todo_filter,
             last_refresh: Instant::now(),
             needs_draw: true,
         };
@@ -323,6 +437,11 @@ impl Viewer {
                     KeyCode::Home | KeyCode::Char('g') => self.move_by(i64::MIN / 2),
                     KeyCode::End | KeyCode::Char('G') => self.move_by(i64::MAX / 2),
                     KeyCode::Enter => self.open_selected(),
+                    // Status filter for the todo list. Lowercase `f` cycles
+                    // forward, capital `F` cycles back; both are no-ops for
+                    // other targets so the binding does not collide there.
+                    KeyCode::Char('f') => self.cycle_filter(true),
+                    KeyCode::Char('F') => self.cycle_filter(false),
                     _ => return false,
                 }
                 self.needs_draw = true;
@@ -376,29 +495,31 @@ impl Viewer {
         }
     }
 
-    /// The list entry index at terminal row `row`, or `None` when the row
-    /// falls on the header, the footer, or past the last entry. The body
-    /// always starts at row 1 (right after the 1-row header) and is
-    /// `viewport` rows tall.
+    /// The filtered list cursor's position in terminal row `row`, or `None`
+    /// when the row falls on the header, the footer, or past the last visible
+    /// entry. The body always starts at row 1 (right after the 1-row header)
+    /// and is `viewport` rows tall.
     fn list_row_at(&self, row: u16) -> Option<usize> {
-        let Content::List(entries) = &self.content else {
+        if !matches!(self.content, Content::List(_)) {
             return None;
-        };
+        }
         if row == 0 || row > self.viewport {
             return None;
         }
+        let visible_len = self.visible_indices().len();
         let body_row = (row - 1) as usize;
-        let start = list_scroll(self.cursor, self.viewport as usize, entries.len());
+        let start = list_scroll(self.cursor, self.viewport as usize, visible_len);
         let idx = start + body_row;
-        (idx < entries.len()).then_some(idx)
+        (idx < visible_len).then_some(idx)
     }
 
     /// Move the cursor (list mode) or the scroll offset (document mode) by
-    /// `delta` rows, clamped to the content.
+    /// `delta` rows, clamped to the content. The list cursor is in *visible*
+    /// space - it skips entries the filter hides.
     fn move_by(&mut self, delta: i64) {
         match &self.content {
-            Content::List(entries) => {
-                let max = entries.len().saturating_sub(1) as i64;
+            Content::List(_) => {
+                let max = self.visible_indices().len().saturating_sub(1) as i64;
                 self.cursor = (self.cursor as i64 + delta).clamp(0, max.max(0)) as usize;
             }
             Content::Doc(lines) => {
@@ -409,14 +530,59 @@ impl Viewer {
         }
     }
 
-    /// In list mode, route the viewer to the selected item.
+    /// In list mode, route the viewer to the selected (visible) item.
     fn open_selected(&mut self) {
         if let Content::List(entries) = &self.content {
-            if let Some(entry) = entries.get(self.cursor) {
-                let target = entry.target.clone();
-                self.switch(target);
+            let visible = self.visible_indices();
+            if let Some(&idx) = visible.get(self.cursor) {
+                if let Some(entry) = entries.get(idx) {
+                    let target = entry.target.clone();
+                    self.switch(target);
+                }
             }
         }
+    }
+
+    /// The indices of `Content::List` entries that pass the current filter.
+    /// For non-todo lists (and for non-list content), the filter is the
+    /// identity, so this returns every index.
+    fn visible_indices(&self) -> Vec<usize> {
+        let Content::List(entries) = &self.content else {
+            return Vec::new();
+        };
+        let apply_filter = matches!(self.target, Target::TodoList);
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if !apply_filter || self.todo_filter.includes(e) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Cycle the todo filter forward (`f`) or backward (`F`). No-op when the
+    /// active target isn't the todo list.
+    fn cycle_filter(&mut self, forward: bool) {
+        if !matches!(self.target, Target::TodoList) {
+            return;
+        }
+        self.todo_filter = if forward {
+            self.todo_filter.next()
+        } else {
+            self.todo_filter.prev()
+        };
+        // The visible-entry set just changed; keep the cursor on the new
+        // visible range and persist the choice for next time.
+        let visible_len = self.visible_indices().len();
+        if self.cursor >= visible_len {
+            self.cursor = visible_len.saturating_sub(1);
+        }
+        self.persist_viewstate();
+        self.needs_draw = true;
     }
 
     /// Re-point the viewer at `target`, persisting the outgoing item's
@@ -436,20 +602,40 @@ impl Viewer {
             }
             _ => {}
         }
+        self.persist_viewstate();
+        self.target = target;
+        let vs = viewstate::get(&self.ws, &self.target.key());
+        self.scroll = vs.scroll;
+        self.cursor = vs.cursor;
+        self.todo_filter = vs
+            .extras
+            .get("todo_filter")
+            .and_then(Value::as_str)
+            .map(TodoFilter::parse)
+            .unwrap_or_default();
+        self.reload_content();
+        self.needs_draw = true;
+    }
+
+    /// Persist the current target's scroll, cursor, and filter so reopening
+    /// the same item or list lands on the same row and view.
+    fn persist_viewstate(&self) {
+        let mut extras = serde_json::Map::new();
+        if matches!(self.target, Target::TodoList) {
+            extras.insert(
+                "todo_filter".into(),
+                Value::String(self.todo_filter.as_key().to_string()),
+            );
+        }
         viewstate::set(
             &self.ws,
             &self.target.key(),
             ViewState {
                 scroll: self.scroll,
                 cursor: self.cursor,
+                extras,
             },
         );
-        self.target = target;
-        let vs = viewstate::get(&self.ws, &self.target.key());
-        self.scroll = vs.scroll;
-        self.cursor = vs.cursor;
-        self.reload_content();
-        self.needs_draw = true;
     }
 
     /// If the routing file changed, switch to the item it now names.
@@ -545,7 +731,14 @@ impl Viewer {
                 ))),
                 Err(e) => Content::Message(format!("could not load scratchpad #{id}: {e:#}")),
             },
-            Target::TodoList => Content::List(read_index(path.as_deref(), Target::Todo)),
+            Target::TodoList => match load_todo_list(&self.url) {
+                Ok(entries) => Content::List(entries),
+                // Fall back to the projection: it carries less detail (no
+                // blocker info), but it keeps the pane useful when the
+                // daemon is unreachable. The `open-unblocked` filter is
+                // approximated as `open` in this mode.
+                Err(_) => Content::List(read_todo_index(path.as_deref())),
+            },
             Target::ScratchpadList => {
                 Content::List(read_index(path.as_deref(), Target::Scratchpad))
             }
@@ -554,10 +747,12 @@ impl Viewer {
     }
 
     /// Keep the scroll offset and list cursor within the loaded content.
+    /// The list cursor is in *visible* (post-filter) space, so an empty
+    /// filtered view collapses it to 0.
     fn clamp(&mut self) {
         match &self.content {
-            Content::List(entries) => {
-                let max = entries.len().saturating_sub(1);
+            Content::List(_) => {
+                let max = self.visible_indices().len().saturating_sub(1);
                 if self.cursor > max {
                     self.cursor = max;
                 }
@@ -623,23 +818,25 @@ impl Viewer {
                 );
             }
             Content::List(entries) => {
+                let visible = self.visible_indices();
                 let viewport = self.viewport as usize;
-                let start = list_scroll(self.cursor, viewport, entries.len());
-                let lines: Vec<Line> = entries
+                let start = list_scroll(self.cursor, viewport, visible.len());
+                let lines: Vec<Line> = visible
                     .iter()
                     .enumerate()
                     .skip(start)
                     .take(viewport.max(1))
-                    .map(|(i, entry)| {
-                        let style = if i == self.cursor {
+                    .filter_map(|(visible_i, &raw_i)| {
+                        let entry = entries.get(raw_i)?;
+                        let style = if visible_i == self.cursor {
                             Style::default().add_modifier(Modifier::REVERSED)
                         } else {
                             Style::default()
                         };
-                        Line::styled(format!(" {}", entry.label), style)
+                        Some(Line::styled(format!(" {}", entry.label), style))
                     })
                     .collect();
-                let body = if entries.is_empty() {
+                let body = if visible.is_empty() {
                     Text::from(" (empty)")
                 } else {
                     Text::from(lines)
@@ -664,10 +861,25 @@ impl Viewer {
             Target::NewTodo => " New todo".to_string(),
             Target::Scratchpad(id) => format!(" Scratchpad #{id}"),
             Target::NewScratchpad => " New scratchpad".to_string(),
-            Target::TodoList => " Todos".to_string(),
+            Target::TodoList => {
+                let (visible, total) = self.list_counts();
+                format!(
+                    " Todos  ·  {} ({visible}/{total})",
+                    self.todo_filter.label()
+                )
+            }
             Target::ScratchpadList => " Scratchpads".to_string(),
             Target::Empty => " PANopt viewer".to_string(),
         }
+    }
+
+    /// `(visible_count, total_count)` for the current list, or `(0, 0)` when
+    /// the content isn't a list.
+    fn list_counts(&self) -> (usize, usize) {
+        let Content::List(entries) = &self.content else {
+            return (0, 0);
+        };
+        (self.visible_indices().len(), entries.len())
     }
 
     fn footer(&self) -> String {
@@ -675,6 +887,8 @@ impl Viewer {
             // The form draws its own footer; the viewer-level footer is unused
             // in form mode, but we still produce a string for the type's sake.
             String::new()
+        } else if matches!(self.target, Target::TodoList) {
+            " j/k move   Enter open   f/F filter   q close".to_string()
         } else if self.target.is_list() {
             " j/k move   Enter open   q close".to_string()
         } else {
@@ -714,7 +928,8 @@ fn resolve_blocker_title(url: &str, id: u64) -> Option<String> {
 }
 
 /// Read a `.panopt/` index file into list entries, mapping each id through
-/// `into_target` to the target selecting it should open.
+/// `into_target` to the target selecting it should open. Used for the
+/// scratchpad list, which has no status/blocker filter to honour.
 fn read_index(path: Option<&Path>, into_target: impl Fn(u64) -> Target) -> Vec<ListEntry> {
     let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {
         return Vec::new();
@@ -724,8 +939,77 @@ fn read_index(path: Option<&Path>, into_target: impl Fn(u64) -> Target) -> Vec<L
         .map(|(id, title)| ListEntry {
             target: into_target(id),
             label: format!("#{id} {title}"),
+            status: None,
+            is_blocked: false,
         })
         .collect()
+}
+
+/// Fallback projection reader for the todo list, used when the MCP call to
+/// `todo_list` fails. Each line carries the status token (parsed out of the
+/// `- <status>, <priority>` suffix the projection writes), but blocker info
+/// is absent here - the projection does not record blockers per-line. With
+/// no blocker info, `OpenUnblocked` degrades to "open" (we never hide a
+/// todo whose blocker state we cannot determine).
+fn read_todo_index(path: Option<&Path>) -> Vec<ListEntry> {
+    let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(parse_index_line)
+        .map(|(id, label)| {
+            let status = parse_status_suffix(&label);
+            ListEntry {
+                target: Target::Todo(id),
+                label: format!("#{id} {label}"),
+                status,
+                is_blocked: false,
+            }
+        })
+        .collect()
+}
+
+/// Pull the wire status token out of a projection label like
+/// `wire the form - open, high`. Returns `None` when the suffix is missing
+/// or doesn't match a known token, so the entry simply isn't filtered by
+/// status (it remains visible under every filter, including `All`).
+fn parse_status_suffix(label: &str) -> Option<String> {
+    let dash = label.rfind(" - ")?;
+    let rest = &label[dash + 3..];
+    let comma = rest.find(',').unwrap_or(rest.len());
+    let token = rest[..comma].trim();
+    matches!(
+        token,
+        "open" | "in_progress" | "backlog" | "completed" | "not_done"
+    )
+    .then(|| token.to_string())
+}
+
+/// One-shot `todo_list` against the daemon, returning enriched list entries
+/// that the filter can act on. Each entry's display label matches the
+/// projection's `#<id> <title> - <status>, <priority>` shape so switching
+/// between MCP-backed and file-backed loading is visually seamless.
+fn load_todo_list(url: &str) -> Result<Vec<ListEntry>> {
+    let client = Client::connect(url)?;
+    let outcome = client.call("todo_list", json!({}));
+    client.close();
+    let arr = outcome?.as_array().cloned().unwrap_or_default();
+    Ok(arr
+        .iter()
+        .filter_map(|t| {
+            let id = t["id"].as_u64()?;
+            let title = t["title"].as_str().unwrap_or("");
+            let status = t["status"].as_str().unwrap_or("open").to_string();
+            let priority = t["priority"].as_str().unwrap_or("medium");
+            let blockers = t["blockers"].as_array().map(|a| a.len()).unwrap_or(0);
+            Some(ListEntry {
+                target: Target::Todo(id),
+                label: format!("#{id} {title} - {status}, {priority}"),
+                status: Some(status),
+                is_blocked: blockers > 0,
+            })
+        })
+        .collect())
 }
 
 /// Parse one `.panopt/` index line - `- [ ] [#3](todos/3.md) the title ...` or
@@ -855,6 +1139,10 @@ mod tests {
             .map(|i| ListEntry {
                 target: Target::Todo(i as u64),
                 label: format!("#{i}"),
+                // The existing list_row_at tests run with the `All` filter,
+                // so every entry is visible regardless of status.
+                status: Some("open".to_string()),
+                is_blocked: false,
             })
             .collect();
         Viewer {
@@ -868,6 +1156,7 @@ mod tests {
             scroll: 0,
             cursor,
             viewport,
+            todo_filter: TodoFilter::All,
             last_refresh: Instant::now(),
             needs_draw: false,
         }
@@ -910,5 +1199,101 @@ mod tests {
         let mut viewer = viewer_with_list(5, 5, 0);
         viewer.content = Content::Message("hello".to_string());
         assert_eq!(viewer.list_row_at(1), None);
+    }
+
+    /// Build a viewer whose list carries four todos with the given
+    /// `(status, is_blocked)` pairs.
+    fn viewer_with_statuses(rows: &[(&str, bool)], filter: TodoFilter) -> Viewer {
+        let entries = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (status, blocked))| ListEntry {
+                target: Target::Todo(i as u64 + 1),
+                label: format!("#{} t", i + 1),
+                status: Some((*status).to_string()),
+                is_blocked: *blocked,
+            })
+            .collect();
+        Viewer {
+            ws: PathBuf::from("/tmp"),
+            url: String::new(),
+            routing_path: PathBuf::from("/tmp/r.json"),
+            routing_mtime: None,
+            target: Target::TodoList,
+            content: Content::List(entries),
+            content_mtime: None,
+            scroll: 0,
+            cursor: 0,
+            viewport: 5,
+            todo_filter: filter,
+            last_refresh: Instant::now(),
+            needs_draw: false,
+        }
+    }
+
+    #[test]
+    fn open_unblocked_hides_blocked_open_todos_and_other_statuses() {
+        let viewer = viewer_with_statuses(
+            &[
+                ("open", false),        // visible
+                ("open", true),         // hidden: blocked
+                ("in_progress", false), // hidden: wrong status
+                ("completed", false),   // hidden: wrong status
+            ],
+            TodoFilter::OpenUnblocked,
+        );
+        assert_eq!(viewer.visible_indices(), vec![0]);
+    }
+
+    #[test]
+    fn all_filter_shows_every_entry() {
+        let viewer = viewer_with_statuses(
+            &[("open", true), ("completed", false), ("not_done", false)],
+            TodoFilter::All,
+        );
+        assert_eq!(viewer.visible_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filter_cycle_visits_every_variant_and_wraps() {
+        let mut seen = vec![TodoFilter::default()];
+        let mut cur = TodoFilter::default();
+        for _ in 0..ALL_FILTERS.len() {
+            cur = cur.next();
+            seen.push(cur);
+        }
+        // After exactly one full cycle we're back to the default; every
+        // variant has appeared.
+        assert_eq!(seen.last(), Some(&TodoFilter::default()));
+        // ALL_FILTERS is the source of truth for the cycle; check that the
+        // length matches the number of distinct variants by string label.
+        let labels: std::collections::HashSet<&str> =
+            ALL_FILTERS.iter().map(|f| f.label()).collect();
+        assert_eq!(labels.len(), ALL_FILTERS.len());
+    }
+
+    #[test]
+    fn parse_status_suffix_recognises_known_tokens() {
+        assert_eq!(
+            parse_status_suffix("wire up auth - open, high"),
+            Some("open".to_string())
+        );
+        assert_eq!(
+            parse_status_suffix("ship it - not_done, medium"),
+            Some("not_done".to_string())
+        );
+        // No suffix at all - leave the entry unfiltered by status.
+        assert_eq!(parse_status_suffix("just a title"), None);
+        // Unknown token doesn't tag the entry; the projection grammar can
+        // grow new tokens later without crashing this parser.
+        assert_eq!(parse_status_suffix("future - archived, medium"), None);
+    }
+
+    #[test]
+    fn cycle_filter_is_a_noop_when_not_on_todo_list() {
+        let mut viewer = viewer_with_statuses(&[("open", false)], TodoFilter::All);
+        viewer.target = Target::ScratchpadList;
+        viewer.cycle_filter(true);
+        assert_eq!(viewer.todo_filter, TodoFilter::All);
     }
 }
