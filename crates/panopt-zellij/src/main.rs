@@ -109,8 +109,8 @@ struct PanoptPane {
     /// [`PanoptPane::load`] from the `mode` config key.
     mode: Mode,
     /// Whether the `mode` config value was a recognized kind. False means we
-    /// fell back to [`Mode::Todos`] and the header renders a one-line warning
-    /// so a misconfigured pane is visible rather than silently broken.
+    /// fell back to [`Mode::Todos`] and the frame title carries a warning so
+    /// a misconfigured pane is visible rather than silently broken.
     mode_known: bool,
 
     /// Absolute project root, from the layout's plugin config. The cwd for
@@ -185,11 +185,16 @@ struct PanoptPane {
     /// snapshot that drives `sidebar_focused`. Scopes the CloseTab gate.
     focused_tab: Option<usize>,
     /// The last gate refusal: what was refused (a label), set when the gate
-    /// blocks an action because active items would be lost. Rendered in the
-    /// title row so the user knows their keypress was intercepted. Cleared
-    /// on the next successful navigation. Only the Todos pane runs the gate,
-    /// so only the Todos pane ever sets this.
+    /// blocks an action because active items would be lost. Surfaced through
+    /// the pane's frame title so the user knows their keypress was
+    /// intercepted. Cleared on the next successful navigation. Only the Todos
+    /// pane runs the gate, so only the Todos pane ever sets this.
     last_gate_refusal: Option<String>,
+    /// The frame title most recently pushed to Zellij via
+    /// [`rename_plugin_pane`]. Kept so we only re-issue the host call when
+    /// the title actually changes (gate refusal appears/clears, scroll
+    /// position shifts, ...) rather than on every render tick.
+    last_frame_title: String,
     /// Whether the initial preview has been shown on startup. Only the Todos
     /// pane drives the initial preview; the others remain idle until the
     /// user navigates them.
@@ -310,11 +315,12 @@ impl ZellijPlugin for PanoptPane {
         ]);
         self.reload_data();
         self.rebuild_items();
+        self.sync_frame_title();
         set_timeout(1.0);
     }
 
     fn update(&mut self, event: Event) -> bool {
-        match event {
+        let dirty = match event {
             Event::PermissionRequestResult(status) => {
                 self.permitted = matches!(status, PermissionStatus::Granted);
                 true
@@ -350,7 +356,17 @@ impl ZellijPlugin for PanoptPane {
                 true
             }
             _ => false,
+        };
+        // The frame title is set via the `rename_plugin_pane` plugin command,
+        // which serializes itself onto stdout for the host to read. The host
+        // only consumes those command bytes BETWEEN events - issuing a plugin
+        // command from inside `render` makes the JSON leak in as a phantom
+        // content row and shifts every item down by one. So sync the title
+        // only here, never in `render`.
+        if dirty {
+            self.sync_frame_title();
         }
+        dirty
     }
 
     /// Only the Todos pane handles the cockpit-wide pipes. With five plugin
@@ -393,49 +409,67 @@ impl ZellijPlugin for PanoptPane {
 
     fn render(&mut self, rows: usize, cols: usize) {
         self.last_rows = rows;
-        // The plugin's stdout becomes the pane content. Each emitted line
-        // must carry non-whitespace - Zellij's parser drops a blank line.
+        // The plugin's stdout becomes the pane content. The mode label
+        // lives in Zellij's frame title (set by `sync_frame_title` from
+        // `update`); the pane body is just the item list.
+        //
+        // Cursor handling matters here. Zellij does not reset the cursor
+        // position between renders, and a `\r\n` after the LAST line moves
+        // the cursor one row past the visible area - the terminal then
+        // scrolls up to keep the cursor on-screen, pushing the first item
+        // off the top. So:
+        //   1. Home the cursor + clear the pane on every render, so any
+        //      stale rows (or leaked stdout chatter) cannot pile up.
+        //   2. Separate items with `\r\n` but do not emit one after the
+        //      final item, so the cursor stays inside the visible area.
+        print!("\u{1b}[H\u{1b}[2J");
         let total = self.items.len();
-        let visible = rows.saturating_sub(1).max(1);
+        let visible = rows.max(1);
         let max_scroll = total.saturating_sub(visible);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
-        let title = self.title_line(total, visible);
-        print!("{}\r\n", paint(&title, cols, Style::Header, false));
         if total == 0 {
-            print!("{}\r\n", paint("  (none)", cols, Style::Dim, false));
+            print!("{}", paint("  (none)", cols, Style::Dim, false));
             return;
         }
         let end = (self.scroll + visible).min(total);
+        let mut first = true;
         for idx in self.scroll..end {
+            if !first {
+                print!("\r\n");
+            }
+            first = false;
             let item = &self.items[idx];
             let marker = if item.live { '*' } else { ' ' };
             let line = format!(" {marker}{}", item.label);
             let focused = idx == self.cursor;
-            print!("{}\r\n", paint(&line, cols, Style::Normal, focused));
+            print!("{}", paint(&line, cols, Style::Normal, focused));
         }
     }
 }
 
 impl PanoptPane {
-    /// The title row text: the mode label, plus a refusal banner (Todos only,
-    /// drives the gate) or a "mode misconfigured" warning (when the `mode`
-    /// config key was absent or unrecognized), and a scroll-range suffix when
-    /// the list is larger than the visible window.
-    fn title_line(&self, total: usize, visible: usize) -> String {
+    /// Build the pane's frame title: the mode label plus any status the
+    /// pane wants to surface to the user (permission prompt, mode-config
+    /// warning, gate refusal, or scroll position when the list overflows).
+    /// The frame title is the only place these statuses live now - the pane
+    /// body is just the item list.
+    fn frame_title(&self) -> String {
+        let base = self.mode.label();
         if !self.permitted {
-            return "PANopt - grant permissions in the Zellij prompt".to_string();
+            return format!("{base} - grant permissions");
         }
         if !self.mode_known {
-            return format!("{} (mode config missing - defaulted)", self.mode.label());
+            return format!("{base} (mode config missing - defaulted)");
         }
         if self.mode == Mode::Todos {
             if let Some(refusal) = &self.last_gate_refusal {
-                return format!("{}  blocked: {refusal}", self.mode.label());
+                return format!("{base} - blocked: {refusal}");
             }
         }
-        let base = self.mode.label();
+        let total = self.items.len();
+        let visible = self.last_rows.max(1);
         if total == 0 {
             return base.to_string();
         }
@@ -445,6 +479,20 @@ impl PanoptPane {
         let start = self.scroll + 1;
         let end = (self.scroll + visible).min(total);
         format!("{base} ({start}-{end}/{total})")
+    }
+
+    /// Push the current [`Self::frame_title`] to Zellij as the pane's frame
+    /// title - but only when the text actually changes, since renaming is a
+    /// host call and `update` runs on every event.
+    fn sync_frame_title(&mut self) {
+        let title = self.frame_title();
+        if title == self.last_frame_title {
+            return;
+        }
+        if let Some(PaneId::Plugin(pid)) = self.plugin_pane {
+            rename_plugin_pane(pid, &title);
+        }
+        self.last_frame_title = title;
     }
 
     // --- data ---
@@ -718,7 +766,7 @@ impl PanoptPane {
         if self.cursor >= self.items.len() {
             self.cursor = self.items.len() - 1;
         }
-        let visible = self.last_rows.saturating_sub(1).max(1);
+        let visible = self.last_rows.max(1);
         let max_scroll = self.items.len().saturating_sub(visible);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
@@ -735,7 +783,7 @@ impl PanoptPane {
             return false;
         }
         let count = self.items.len();
-        let visible = self.last_rows.saturating_sub(1).max(1);
+        let visible = self.last_rows.max(1);
         let new = (self.cursor as i64 + delta).clamp(0, count as i64 - 1) as usize;
         let moved = new != self.cursor;
         self.cursor = new;
@@ -831,17 +879,7 @@ impl PanoptPane {
                 if line < 0 {
                     return false;
                 }
-                let row = line as usize;
-                if row == 0 {
-                    // Click on the title row opens the full-list view for
-                    // modes that have one; for the others it is a no-op.
-                    self.open_mode_list(false);
-                    if let Some(plugin) = self.plugin_pane {
-                        focus_pane_with_id(plugin, false, false);
-                    }
-                    return true;
-                }
-                let idx = self.scroll + (row - 1);
+                let idx = self.scroll + line as usize;
                 if idx >= self.items.len() {
                     return false;
                 }
@@ -870,7 +908,7 @@ impl PanoptPane {
 
     /// Step size for PageUp/PageDown - one screenful of visible items.
     fn page_step(&self) -> usize {
-        self.last_rows.saturating_sub(1).max(1)
+        self.last_rows.max(1)
     }
 
     /// Act on the cursor's row from the keyboard (Enter): focus moves onto
@@ -1034,6 +1072,14 @@ impl PanoptPane {
     }
 
     fn spawn_blank_pane(&mut self) {
+        // The five sidebar panes are part of the cockpit shell, not slots
+        // a new pane belongs in - splitting them shreds the fixed layout.
+        // Refuse here so Alt-N and the rewritten pane-mode keys (`n`/`d`/
+        // `r`/`s`) all funnel through the same gate.
+        if self.sidebar_focused {
+            self.refuse_gate("cannot create panes from the sidebar");
+            return;
+        }
         let Some(ws) = self.launch_cwd() else {
             return;
         };
@@ -1289,10 +1335,15 @@ impl PanoptPane {
 
     fn refuse_gate(&mut self, reason: &str) {
         self.last_gate_refusal = Some(reason.to_string());
+        self.sync_frame_title();
     }
 
     fn clear_gate_refusal(&mut self) {
+        if self.last_gate_refusal.is_none() {
+            return;
+        }
         self.last_gate_refusal = None;
+        self.sync_frame_title();
     }
 }
 
@@ -1541,7 +1592,6 @@ fn parse_process_line(line: &str) -> Option<ProcessRow> {
 #[derive(Clone, Copy)]
 enum Style {
     Normal,
-    Header,
     Dim,
 }
 
@@ -1555,7 +1605,6 @@ fn paint(content: &str, cols: usize, style: Style, focused: bool) -> String {
         codes.push("7");
     }
     match style {
-        Style::Header => codes.push("1"),
         Style::Dim => codes.push("2"),
         Style::Normal => {}
     }
@@ -1694,23 +1743,26 @@ mod tests {
 
     #[test]
     fn scroll_pages_when_cursor_passes_the_visible_window() {
-        // last_rows = 10 -> visible = 9 items.
+        // last_rows = 10 -> visible = 10 items (the mode label lives in the
+        // pane's frame title, so the body uses every row for items).
         let mut pane = todos_pane(20);
-        // Move cursor down past the visible window.
+        // Move cursor down through the visible window; the 10th step lands
+        // on cursor 9, which is the last row still in view (scroll stays).
         for _ in 0..9 {
             pane.move_cursor(1);
         }
         assert_eq!(pane.cursor, 9);
-        // The 10th down (cursor 0..=9 is the 10th step) is the one that
-        // forces the scroll: cursor 9 >= scroll(0) + visible(9), so scroll
-        // jumps to 1 to keep the cursor in view.
-        assert_eq!(pane.scroll, 1, "scroll: {}", pane.scroll);
+        assert_eq!(pane.scroll, 0, "scroll: {}", pane.scroll);
+        // The next step pushes cursor past the bottom edge, scroll jumps to 1.
+        pane.move_cursor(1);
+        assert_eq!(pane.cursor, 10);
+        assert_eq!(pane.scroll, 1);
         // Continue past the end: scroll keeps pace.
-        for _ in 0..10 {
+        for _ in 0..9 {
             pane.move_cursor(1);
         }
         assert_eq!(pane.cursor, 19);
-        assert_eq!(pane.scroll, 11); // cursor(19) + 1 - visible(9) = 11
+        assert_eq!(pane.scroll, 10); // cursor(19) + 1 - visible(10) = 10
     }
 
     #[test]
