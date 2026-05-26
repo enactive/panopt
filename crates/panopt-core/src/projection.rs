@@ -115,10 +115,13 @@ pub(crate) fn render_todos_index_md(todos: &[Todo]) -> String {
         return out;
     }
     for todo in todos {
-        let mark = if todo.status == TodoStatus::Completed {
-            'x'
-        } else {
-            ' '
+        let mark = match todo.status {
+            TodoStatus::Completed => 'x',
+            // Closed-but-not-done renders as `[-]`, a common markdown
+            // convention for cancelled / won't-do items. It distinguishes
+            // these from still-open todos without claiming they're done.
+            TodoStatus::NotDone => '-',
+            _ => ' ',
         };
         out.push_str(&format!(
             "- [{mark}] [#{id}](todos/{id}.md) {title} - {status}, {priority}\n",

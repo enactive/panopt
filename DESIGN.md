@@ -350,9 +350,12 @@ rather than a GPU-rendered surface - immaterial for a coordination sidebar.
 
 ### 6.1 Todos
 
-Fields: id, title, body, status (open / in_progress / backlog / completed),
-priority (high / medium / low), assignee, tags, blockers, comments, and
-created / updated / completed timestamps. This mirrors a trimmed subset of
+Fields: id, title, body, status (open / in_progress / backlog / completed /
+not_done), priority (high / medium / low), assignee, tags, blockers, comments,
+and created / updated / completed timestamps. `not_done` is panopt's own
+addition for todos that were closed without being completed (cancelled,
+won't-fix); only `completed` populates the `completed` timestamp. This
+mirrors a trimmed subset of
 Solo's `todos` table plus its `todo_comments` and `todo_blockers` side tables.
 The one deliberate divergence is `assignee`: Solo uses a foreign key to an
 agent, but PANopt's registry is in-memory and ephemeral (Section 6.3), so the

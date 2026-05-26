@@ -57,10 +57,15 @@ logs:
 
 # If a daemon is already running on port 7600, `panopt up` connects to it
 # rather than restarting it - use `just stop && just up` to force a fresh
-# debug daemon.
+# debug daemon, or `just restart-daemon` to swap the daemon out without
+# touching the cockpit.
 #
-# Launch the cockpit in the current project (debug binaries).
+# Launch the cockpit in the current project (debug binaries). `cargo build`
+# runs first so `panoptd` reflects the latest sources; without it,
+# `cargo run -p panopt` would happily re-spawn yesterday's `panoptd` from
+# `target/debug/`.
 up:
+    cargo build --workspace
     cargo run -p panopt -- up
 
 # Stop the running panoptd (SIGTERM x2 to clear the clients-connected gate).
@@ -68,6 +73,32 @@ stop:
     -pkill -TERM -x panoptd
     @sleep 1
     -pkill -TERM -x panoptd
+
+# Rebuild panoptd, stop the running daemon, and re-launch it detached. The
+# cockpit's MCP clients reconnect on the next call, so this is the
+# ergonomic path while a cockpit is open: edit handler code, `just
+# restart-daemon`, the next autosave hits the new binary.
+restart-daemon:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p panoptd
+    pkill -TERM -x panoptd 2>/dev/null || true
+    sleep 1
+    pkill -TERM -x panoptd 2>/dev/null || true
+    sleep 1
+    mkdir -p "$HOME/.local/share/panopt"
+    setsid -f target/debug/panoptd --port 7600 \
+        < /dev/null \
+        >> "$HOME/.local/share/panopt/panoptd.log" 2>&1
+    for _ in $(seq 1 50); do
+        if ss -ltn 2>/dev/null | grep -q '127.0.0.1:7600'; then
+            echo "panoptd restarted on 127.0.0.1:7600"
+            exit 0
+        fi
+        sleep 0.1
+    done
+    echo "panoptd did not start listening within 5s; see ~/.local/share/panopt/panoptd.log" >&2
+    exit 1
 
 # Open the panopt sqlite database in the sqlite3 shell.
 db:

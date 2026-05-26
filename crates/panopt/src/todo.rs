@@ -48,7 +48,7 @@ pub enum TodoCmd {
         title: Option<String>,
         #[arg(long)]
         body: Option<String>,
-        /// One of open, in_progress, backlog, completed.
+        /// One of open, in_progress, backlog, completed, not_done.
         #[arg(long)]
         status: Option<String>,
         /// One of high, medium, low.
@@ -61,13 +61,9 @@ pub enum TodoCmd {
         tags: Option<String>,
     },
     /// Mark a todo complete.
-    Done {
-        id: u64,
-    },
+    Done { id: u64 },
     /// Delete a todo.
-    Rm {
-        id: u64,
-    },
+    Rm { id: u64 },
     /// Record that one todo is blocked by another.
     Block {
         /// The blocked todo.
@@ -111,7 +107,9 @@ pub fn run(ws: Option<PathBuf>, cmd: TodoCmd, port: u16) -> Result<()> {
 pub(crate) fn observer_url(ws: Option<PathBuf>, port: u16) -> Result<String> {
     let ws = resolve_ws(ws)?;
     let encoded = utf8_percent_encode(&ws.to_string_lossy(), NON_ALPHANUMERIC).to_string();
-    Ok(format!("http://127.0.0.1:{port}/mcp?ws={encoded}&observer=1"))
+    Ok(format!(
+        "http://127.0.0.1:{port}/mcp?ws={encoded}&observer=1"
+    ))
 }
 
 /// The project root: the given path, or the current directory, canonicalized.
@@ -173,11 +171,17 @@ fn dispatch(client: &Client, cmd: TodoCmd) -> Result<()> {
             println!("deleted todo #{id}");
         }
         TodoCmd::Block { id, by } => {
-            client.call("todo_add_blocker", json!({ "todo_id": id, "blocker_id": by }))?;
+            client.call(
+                "todo_add_blocker",
+                json!({ "todo_id": id, "blocker_id": by }),
+            )?;
             println!("todo #{id} is now blocked by #{by}");
         }
         TodoCmd::Unblock { id, by } => {
-            client.call("todo_remove_blocker", json!({ "todo_id": id, "blocker_id": by }))?;
+            client.call(
+                "todo_remove_blocker",
+                json!({ "todo_id": id, "blocker_id": by }),
+            )?;
             println!("todo #{id} is no longer blocked by #{by}");
         }
         TodoCmd::Comment { id, body, author } => {
@@ -281,14 +285,24 @@ fn print_todo(t: &Value) {
 /// The non-empty strings of a JSON array value.
 fn string_list(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// The ids of a JSON array value, rendered as `#n`.
 fn id_list(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(Value::as_u64).map(|n| format!("#{n}")).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_u64)
+                .map(|n| format!("#{n}"))
+                .collect()
+        })
         .unwrap_or_default()
 }
 

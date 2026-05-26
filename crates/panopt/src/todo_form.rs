@@ -29,7 +29,7 @@ use tui_textarea::TextArea;
 use crate::mcpclient::Client;
 
 /// The cyclable status values, in cycle order.
-pub(crate) const STATUSES: [&str; 4] = ["open", "in_progress", "backlog", "completed"];
+pub(crate) const STATUSES: [&str; 5] = ["open", "in_progress", "backlog", "completed", "not_done"];
 /// The cyclable priority values, in cycle order.
 pub(crate) const PRIORITIES: [&str; 3] = ["high", "medium", "low"];
 
@@ -73,6 +73,28 @@ struct CommentEntry {
 struct BlockerEntry {
     id: u64,
     title: String,
+}
+
+/// Snapshot of the scalar fields the daemon last reported, captured at
+/// load time and after each successful save.
+///
+/// `flush` diffs the current field values against this baseline and sends only
+/// the fields that actually changed. Without the diff, every autosave would
+/// write back the form's stale view of fields the user never touched — and
+/// would clobber any concurrent change another client made to the same todo
+/// (a CLI `todo_complete`, an agent's MCP edit, the user editing the same
+/// todo in a second pane). With the diff, an idle field is omitted from
+/// `todo_update`, which the daemon treats as "leave unchanged."
+#[derive(Clone, Default)]
+struct Baseline {
+    title: String,
+    body: String,
+    /// One of the tokens in [`STATUSES`].
+    status: String,
+    /// One of the tokens in [`PRIORITIES`].
+    priority: String,
+    assignee: String,
+    tags: Vec<String>,
 }
 
 /// What [`TodoForm::handle_key`] is telling the host to do next.
@@ -147,6 +169,11 @@ pub struct TodoForm {
     /// `draw_body` scroll so the cursor stays on screen as the user edits or
     /// pastes past the bottom of the field.
     body_scroll: usize,
+
+    /// Last-known daemon-side values of the scalar fields, used by `flush` to
+    /// send only the fields the user actually changed since load (or since
+    /// the previous save). Updated after every successful save.
+    baseline: Baseline,
 }
 
 impl TodoForm {
@@ -177,6 +204,18 @@ impl TodoForm {
             can_quit: true,
             message: "new todo - type to begin".to_string(),
             body_scroll: 0,
+            // A new todo's baseline matches the daemon's defaults for
+            // `todo_create`: empty title/body/assignee/tags, status `open`,
+            // priority `medium`. After the first save populates `id`, the
+            // baseline is refreshed to the values just sent.
+            baseline: Baseline {
+                title: String::new(),
+                body: String::new(),
+                status: "open".to_string(),
+                priority: "medium".to_string(),
+                assignee: String::new(),
+                tags: Vec::new(),
+            },
         }
     }
 
@@ -220,15 +259,29 @@ impl TodoForm {
                     .collect()
             })
             .unwrap_or_default();
+        let title = todo["title"].as_str().unwrap_or("").to_string();
+        let body = todo["body"].as_str().unwrap_or("").to_string();
+        let status = todo["status"].as_str().unwrap_or("open").to_string();
+        let priority = todo["priority"].as_str().unwrap_or("medium").to_string();
+        let assignee = todo["assignee"].as_str().unwrap_or("").to_string();
+        let tag_list = string_list(&todo["tags"]);
+        let baseline = Baseline {
+            title: title.clone(),
+            body: body.clone(),
+            status: status.clone(),
+            priority: priority.clone(),
+            assignee: assignee.clone(),
+            tags: tag_list.clone(),
+        };
         Ok(TodoForm {
             url: url.to_string(),
             id: Some(id),
-            title: text_area(todo["title"].as_str().unwrap_or("")),
-            assignee: text_area(todo["assignee"].as_str().unwrap_or("")),
+            title: text_area(&title),
+            assignee: text_area(&assignee),
             tags: text_area(&tags),
-            body: text_area(todo["body"].as_str().unwrap_or("")),
-            status: index_of(&STATUSES, todo["status"].as_str().unwrap_or("open")),
-            priority: index_of(&PRIORITIES, todo["priority"].as_str().unwrap_or("medium")),
+            body: text_area(&body),
+            status: index_of(&STATUSES, &status),
+            priority: index_of(&PRIORITIES, &priority),
             focus: 0,
             comments,
             comment_cursor: 0,
@@ -245,6 +298,7 @@ impl TodoForm {
             can_quit: true,
             message: format!("editing todo #{id}"),
             body_scroll: 0,
+            baseline,
         })
     }
 
@@ -566,11 +620,17 @@ impl TodoForm {
         self.title.lines().join(" ").trim().is_empty()
     }
 
-    /// Push every scalar field back to the daemon. Used by both the CLI's
-    /// Ctrl-S handler and the viewer's debounced autosave.
+    /// Push the scalar fields the user actually changed back to the daemon.
+    /// Used by both the CLI's Ctrl-S handler and the viewer's debounced
+    /// autosave.
     ///
     /// Creates the todo first when this is a new form (no id yet) and the
-    /// title is non-empty; otherwise saves only the existing scalar fields.
+    /// title is non-empty. Only fields that differ from [`Self::baseline`]
+    /// are sent in the follow-up `todo_update`; untouched fields are
+    /// omitted, which the daemon treats as "leave unchanged." This is the
+    /// guard against an idle form clobbering a concurrent write (a CLI
+    /// `todo_complete`, an agent's MCP edit, the same todo open in a
+    /// second pane).
     pub fn flush(&mut self) -> Result<()> {
         let title = self.title.lines().join(" ").trim().to_string();
         if title.is_empty() {
@@ -589,6 +649,8 @@ impl TodoForm {
             .filter(|t| !t.is_empty())
             .map(String::from)
             .collect();
+        let status = STATUSES[self.status].to_string();
+        let priority = PRIORITIES[self.priority].to_string();
 
         let client = Client::connect(&self.url)?;
         let outcome = (|| -> Result<()> {
@@ -600,25 +662,43 @@ impl TodoForm {
                         .as_u64()
                         .ok_or_else(|| anyhow!("daemon returned no todo id"))?;
                     self.id = Some(id);
+                    // `todo_create` accepts only `title`; the daemon initialises
+                    // every other scalar to its default. Record that in the
+                    // baseline so the diff below sends whichever non-defaults
+                    // the user typed in the new-todo form.
+                    self.baseline.title = title.clone();
                     id
                 }
             };
-            client.call(
-                "todo_update",
-                json!({
-                    "todo_id": id,
-                    "title": title,
-                    "body": body,
-                    "status": STATUSES[self.status],
-                    "priority": PRIORITIES[self.priority],
-                    "assignee": assignee,
-                    "tags": tags,
-                }),
-            )?;
+            let current = Baseline {
+                title: title.clone(),
+                body: body.clone(),
+                status: status.clone(),
+                priority: priority.clone(),
+                assignee: assignee.clone(),
+                tags: tags.clone(),
+            };
+            let payload = build_update_payload(id, &self.baseline, &current);
+            // Skip the round-trip when nothing changed - this is the common
+            // shape of a debounced autosave fired by an unrelated edit
+            // (e.g. typing in the comment-input row).
+            if payload.len() > 1 {
+                client.call("todo_update", Value::Object(payload))?;
+            }
             Ok(())
         })();
         client.close();
         outcome?;
+        // Refresh the baseline so future flushes diff against what the daemon
+        // now holds, not what was loaded an edit ago.
+        self.baseline = Baseline {
+            title,
+            body,
+            status,
+            priority,
+            assignee,
+            tags,
+        };
         self.dirty = false;
         self.dirty_since = None;
         self.can_quit = true;
@@ -1152,6 +1232,38 @@ pub(crate) fn index_of(options: &[&str], value: &str) -> usize {
     options.iter().position(|o| *o == value).unwrap_or(0)
 }
 
+/// Build the JSON payload for a `todo_update` call, including only the
+/// scalar fields that differ between `baseline` and `current`. The result
+/// always contains `todo_id`; a caller that finds it carries only
+/// `todo_id` should skip the round-trip.
+fn build_update_payload(
+    id: u64,
+    baseline: &Baseline,
+    current: &Baseline,
+) -> serde_json::Map<String, Value> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("todo_id".into(), json!(id));
+    if current.title != baseline.title {
+        payload.insert("title".into(), json!(current.title));
+    }
+    if current.body != baseline.body {
+        payload.insert("body".into(), json!(current.body));
+    }
+    if current.status != baseline.status {
+        payload.insert("status".into(), json!(current.status));
+    }
+    if current.priority != baseline.priority {
+        payload.insert("priority".into(), json!(current.priority));
+    }
+    if current.assignee != baseline.assignee {
+        payload.insert("assignee".into(), json!(current.assignee));
+    }
+    if current.tags != baseline.tags {
+        payload.insert("tags".into(), json!(current.tags));
+    }
+    payload
+}
+
 /// The non-empty strings of a JSON array value.
 pub(crate) fn string_list(v: &Value) -> Vec<String> {
     v.as_array()
@@ -1309,6 +1421,63 @@ mod tests {
     /// `j`, or `k` used to delete an existing comment or move the cursor
     /// instead of typing a character. After the fix, those keys land in the
     /// textarea like any other letter.
+    /// Regression: an idle form whose user only edits one field must not push
+    /// the other (stale) scalar fields back to the daemon. Before the fix,
+    /// `flush` always wrote every scalar wholesale, so any local edit would
+    /// clobber a concurrent `todo_complete` from the CLI or an MCP agent.
+    #[test]
+    fn flush_payload_includes_only_changed_scalars() {
+        let baseline = Baseline {
+            title: "wire up auth".to_string(),
+            body: "details".to_string(),
+            status: "open".to_string(),
+            priority: "medium".to_string(),
+            assignee: String::new(),
+            tags: Vec::new(),
+        };
+        // The user only changed the body; every other scalar is unchanged.
+        let current = Baseline {
+            title: "wire up auth".to_string(),
+            body: "details with a fresh line".to_string(),
+            status: "open".to_string(),
+            priority: "medium".to_string(),
+            assignee: String::new(),
+            tags: Vec::new(),
+        };
+        let payload = build_update_payload(7, &baseline, &current);
+        assert_eq!(payload.get("todo_id"), Some(&json!(7)));
+        assert_eq!(
+            payload.get("body"),
+            Some(&json!("details with a fresh line"))
+        );
+        // The clobber prevention: untouched fields are absent, so the daemon's
+        // "omitted = leave unchanged" semantics protect a concurrent edit.
+        assert!(!payload.contains_key("title"));
+        assert!(!payload.contains_key("status"));
+        assert!(!payload.contains_key("priority"));
+        assert!(!payload.contains_key("assignee"));
+        assert!(!payload.contains_key("tags"));
+        assert_eq!(payload.len(), 2);
+    }
+
+    /// When the form has no diff against its baseline, the payload should
+    /// carry only `todo_id`, signalling the caller to skip the round-trip.
+    #[test]
+    fn flush_payload_is_empty_when_form_matches_baseline() {
+        let baseline = Baseline {
+            title: "t".to_string(),
+            body: "b".to_string(),
+            status: "open".to_string(),
+            priority: "high".to_string(),
+            assignee: "alex".to_string(),
+            tags: vec!["x".to_string()],
+        };
+        let current = baseline.clone();
+        let payload = build_update_payload(3, &baseline, &current);
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload.get("todo_id"), Some(&json!(3)));
+    }
+
     #[test]
     fn new_comment_row_accepts_d_j_k_as_typed_chars() {
         let mut form = TodoForm::blank("http://localhost/?ws=/x");

@@ -432,7 +432,9 @@ fn require_lock_name(name: String) -> Result<String, McpError> {
 fn parse_status(s: &str) -> Result<TodoStatus, McpError> {
     TodoStatus::parse(s).ok_or_else(|| {
         McpError::invalid_params(
-            format!("invalid status '{s}': expected open, in_progress, backlog, or completed"),
+            format!(
+                "invalid status '{s}': expected open, in_progress, backlog, completed, or not_done"
+            ),
             None,
         )
     })
@@ -759,8 +761,8 @@ impl Handler {
 
     #[tool(description = "Edit a todo's fields. Every argument but todo_id is optional; an \
                           omitted field is left unchanged. status is one of open/in_progress/\
-                          backlog/completed, priority one of high/medium/low; tags replaces \
-                          the whole tag list.")]
+                          backlog/completed/not_done, priority one of high/medium/low; tags \
+                          replaces the whole tag list.")]
     async fn todo_update(
         &self,
         Extension(parts): Extension<Parts>,

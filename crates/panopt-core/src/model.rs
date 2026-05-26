@@ -39,9 +39,12 @@ pub struct ScratchpadPatch {
 
 /// Lifecycle state of a [`Todo`].
 ///
-/// The four variants mirror Solo's `todos.status` column (DESIGN.md Section
-/// 6.1): `Backlog` is not yet scheduled, `Open` is ready to pick up,
-/// `InProgress` is being worked, `Completed` is done.
+/// The variants mirror Solo's `todos.status` column (DESIGN.md Section
+/// 6.1) plus a panopt-specific `NotDone`: `Backlog` is not yet scheduled,
+/// `Open` is ready to pick up, `InProgress` is being worked, `Completed`
+/// is done, and `NotDone` records that the todo was closed without being
+/// done (cancelled, won't-fix, superseded). Both `Completed` and `NotDone`
+/// are terminal; only `Completed` sets `completed_at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TodoStatus {
     #[default]
@@ -49,6 +52,7 @@ pub enum TodoStatus {
     InProgress,
     Backlog,
     Completed,
+    NotDone,
 }
 
 impl TodoStatus {
@@ -59,6 +63,7 @@ impl TodoStatus {
             TodoStatus::InProgress => "in_progress",
             TodoStatus::Backlog => "backlog",
             TodoStatus::Completed => "completed",
+            TodoStatus::NotDone => "not_done",
         }
     }
 
@@ -69,6 +74,7 @@ impl TodoStatus {
             "in_progress" => Some(TodoStatus::InProgress),
             "backlog" => Some(TodoStatus::Backlog),
             "completed" => Some(TodoStatus::Completed),
+            "not_done" => Some(TodoStatus::NotDone),
             _ => None,
         }
     }
