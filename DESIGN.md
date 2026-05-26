@@ -1,7 +1,7 @@
 # PANopt - Design Document
 
 Status: Draft
-Date: 2026-05-21
+Date: 2026-05-26
 Location: `~/p/panopt`
 
 ## 1. Overview
@@ -34,8 +34,8 @@ core plus a web frontend in a system webview). It does three things:
 The user runs Linux and wants this workflow there. PANopt itself is not
 platform-bound, though: it is portable Rust, verified end-to-end on macOS, with
 Linux as its primary deployment target. PANopt is a personal tool: no licensing,
-telemetry, hosted backend, auto-update, built-in chat, or pipelines. It does not need to be a polished, shippable product - it needs to
-deliver the workflow.
+telemetry, hosted backend, auto-update, built-in chat, or pipelines. It does not 
+need to be a polished, shippable product - it needs to deliver the workflow.
 
 This project was originally conceived as "solow", a pinned fork of the Ghostty
 terminal emulator in Zig. That approach has been superseded. Section 4 records
@@ -74,12 +74,6 @@ rejected. It is deliberately the longest section.
 
 To replicate Solo's behavior, PANopt needs Solo's MCP surface, its on-disk
 formats for todos and scratchpads, and its process model.
-
-Static binary analysis (for example, angr) was considered for this and
-rejected. angr is a symbolic-execution framework built for vulnerability
-discovery in small, self-contained binaries. Solo is a large Rust/Tauri GUI
-application: symbolic execution state-explodes immediately, and angr models
-neither the Rust runtime nor the Tauri/webview layer. It is the wrong tool.
 
 The correct approach is dynamic, black-box observation, which is cheap because
 Tauri apps expose almost everything:
@@ -198,36 +192,43 @@ files and browse code - a tool reached for, not the frame.
   server.
 - **Projected files** - `.panopt/` markdown files mirroring daemon state into
   the workspace, readable by any editor.
-- **PANopt Zellij plugin** - a Rust-to-WASM Zellij plugin that renders the
-  coordination sidebar: five collapsible sections (todos, agents, terminals,
-  commands, scratchpads), pinned as a pane in the Zellij layout. Selecting an
-  item swaps its pane into the single content slot on the right (Section 5.5).
+- **PANopt Zellij plugin** - a Rust-to-WASM Zellij plugin. The cockpit runs
+  five instances of the same wasm stacked in the left column, keyed off a
+  `mode` configuration value (`todos`, `agents`, `terminals`, `commands`,
+  `scratchpads`), so each pane renders exactly one kind. Selecting an item
+  swaps its pane into the single content slot on the right (Section 5.5). The
+  Todos pane doubles as the cockpit gatekeeper, owning the close-gate and
+  blank-pane spawn pipes (Section 5.5).
 - **Viewer panes** - long-lived `panopt _viewer` panes that display a todo,
   scratchpad, or section list, re-pointed by the sidebar through a routing file.
 - **Agents** - external CLIs (Claude Code and similar), run as Zellij panes or
   tabs, each configured with the daemon as an MCP server.
 - **`panopt`** - the launcher CLI. Starts `panoptd` on demand and opens agent
   panes in Zellij, each with a stable per-agent identity (Section 9). Its
-  `todo` and `roster` subcommands are small MCP clients for editing a project's
-  todos and roster from a shell; the cockpit's todo form and viewer panes are
-  also `panopt` subcommands.
+  `todo`, `agent-tool`, and `process` subcommands are small MCP clients for
+  editing a project's todos and roster (the two-layer agent_tools / processes
+  split, Section 6.6) from a shell; the cockpit's todo form and viewer panes
+  are also `panopt` subcommands.
 
 ### 5.2 Diagram
 
 ```
         Zellij  (terminal multiplexer - the cockpit, one window)
   +-------------------------------------------------------+
-  |  one content pane         PANopt plugin pane          |
-  |  (viewer / agent / ...)   (coordination sidebar)      |
-  +------|---------|-------------------|------------------+
-         |  MCP    |  MCP              | reads .panopt/*.md
-         | (HTTP)  | (HTTP)           | + focuses panes
-         v         v                   |
+  |  five PANopt plugin panes   one content pane          |
+  |  (todos / agents /          (viewer / agent / ...)    |
+  |   terminals / commands /                              |
+  |   scratchpads, stacked)                               |
+  +------|--------------------|------|-------------------+
+         | reads .panopt/*.md |  MCP |  MCP
+         | + focuses panes    | (HTTP)|(HTTP)
+         |                    v       v
   +------------------------------------------------------+
   |                   panoptd  (daemon)                  |
   |                                                      |
-  |   MCP server  ->  state: todos, scratchpads,         |
-  |                   locks, agent registry              |
+  |   MCP server  ->  state: todos, scratchpads, locks,  |
+  |                   agent registry, agent_tools,       |
+  |                   processes                          |
   |                        |                             |
   |                        +-> filesystem projector ---> .panopt/*.md
   |                        +-> SQLite (persistence)      |
@@ -295,37 +296,44 @@ Zellij-native:
    pinned tabs. This needs zero host integration and is the reliable backbone
    of the design - it works under Zellij, a bare editor, or anything else.
 
-2. **The Zellij plugin (the cockpit sidebar).** A Rust-to-WASM Zellij plugin,
-   pinned as a sidebar pane in the layout, renders five collapsible sections -
-   todos, agents, terminals, commands, scratchpads - read from the projected
-   `.panopt/` files and Zellij's own live pane state. A caret collapses each
-   section; the mouse and the arrow keys both drive it.
+2. **The Zellij plugin (the cockpit sidebar).** The same Rust-to-WASM plugin
+   is instantiated five times in the layout, stacked vertically in the left
+   column. Each instance is keyed by a `mode` configuration value
+   (`todos`, `agents`, `terminals`, `commands`, `scratchpads`) and renders
+   exactly one kind, read from the projected `.panopt/` files and Zellij's
+   own live pane state. Zellij treats distinct configurations as distinct
+   plugins, so the five panes share code but not state. Each pane carries its
+   own keyboard cursor; the mouse and the arrow keys both drive it.
 
    Selecting an item shows it in one content pane on the right. The cockpit
-   starts with the sidebar and a single empty `panopt _viewer`; selecting an
-   item swaps its pane into that one slot and suppresses whatever was there - a
-   suppressed pane keeps running, hidden, with no stack and no title bar. Todos,
-   scratchpads, and section lists all share the one re-pointable viewer pane,
-   which the plugin re-points by writing a small routing file the viewer polls;
-   an agent, command, or terminal is its own pane, swapped in whole. Moving the
-   cursor previews the selected item in the slot without taking focus off the
-   sidebar; Enter or a click swaps it in and focuses it. If the user splits the
-   content pane, a selection swaps into whichever pane was focused last before
-   the sidebar took focus.
+   starts with the five sidebar panes and a single empty `panopt _viewer`;
+   selecting an item swaps its pane into that one slot and suppresses whatever
+   was there - a suppressed pane keeps running, hidden, with no stack and no
+   title bar. Todos, scratchpads, and section lists all share the one
+   re-pointable viewer pane, which the plugin re-points by writing a small
+   routing file the viewer polls; an agent, command, or terminal is its own
+   pane, swapped in whole. Moving the cursor previews the selected item in the
+   slot without taking focus off the sidebar pane; Enter or a click swaps it in
+   and focuses it. If the user splits the content pane, a selection swaps into
+   whichever pane was focused last before any sidebar pane took focus.
 
-   The plugin is also the policy gate for every destructive Zellij action. The
-   cockpit's generated Zellij config rewrites the keybinds for `CloseFocus`,
-   `CloseTab`, and `Quit` to `Run "zellij" "action" "pipe"` invocations that
-   reach the sidebar plugin instead of acting directly. The plugin then decides:
-   the sidebar itself is absolutely un-closeable - the gate has no override
-   there - and any other action that would lose active work (a roster agent or
-   command with a live pane, a roster terminal or ad-hoc shell whose
-   foreground command is not the user's shell) opens a floating `panopt
-   _close-gate` confirmation dialog that lists the affected items and offers a
-   `close anyway` override. On override the plugin invokes the matching
-   zellij-tile API call directly, which bypasses the rewritten keybinds so the
-   gate is not re-triggered. Outside that, the plugin still does not close a
-   pane the user did not explicitly confirm.
+   The Todos pane doubles as the cockpit gatekeeper: it is the only instance
+   that handles the close-gate pipe and the `panopt:spawn-blank-pane` pipe,
+   delivered with `--plugin-configuration mode=todos` so the other four panes
+   (running the same wasm) cannot accidentally answer. The plugin is the
+   policy gate for every destructive Zellij action. The cockpit's generated
+   Zellij config rewrites the keybinds for `CloseFocus`, `CloseTab`, and
+   `Quit` to `Run "zellij" "action" "pipe"` invocations that reach the Todos
+   pane instead of acting directly. The plugin then decides: any of the five
+   sidebar panes is absolutely un-closeable - the gate has no override there -
+   and any other action that would lose active work (an agent or command
+   `process` with a live pane, a terminal `process` or ad-hoc shell whose
+   foreground command is not the user's shell) opens a floating
+   `panopt _close-gate` confirmation dialog that lists the affected items and
+   offers a `close anyway` override. On override the plugin invokes the
+   matching zellij-tile API call directly, which bypasses the rewritten
+   keybinds so the gate is not re-triggered. Outside that, the plugin still
+   does not close a pane the user did not explicitly confirm.
 
    It is still the cockpit's launcher, not an editor: creating and quick-editing
    a todo open `panopt todo edit`, a `ratatui` form, in a floating pane. A WASM
@@ -388,9 +396,9 @@ The registry is in-memory only, never persisted: it describes *currently
 connected* agents, so a daemon restart correctly forgets it and lets it refill
 as agents reconnect. An agent that has made no tool call for five minutes is
 pruned as gone; a background sweep in the daemon runs that prune every 30
-seconds, so a closed agent leaves the roster even when no other agent is active
-to trigger one. The roster is projected to `.panopt/agents.md` like every other
-piece of state.
+seconds, so a closed agent leaves the registry even when no other agent is
+active to trigger one. The registry is projected to `.panopt/agents.md` like
+every other piece of state.
 
 Locks are advisory: a lock is a named claim one agent holds so others
 coordinate exclusive work voluntarily - the daemon records the holder but
