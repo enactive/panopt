@@ -20,7 +20,7 @@ use anyhow::{anyhow, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use serde_json::{json, Value};
@@ -141,9 +141,15 @@ pub struct TodoForm {
 
     /// The blockers the daemon last reported, with their titles resolved.
     blockers: Vec<BlockerEntry>,
-    /// Selected row in the blockers section.
+    /// Position of the focus within the single-line Blockers row. Indices
+    /// `0..blockers.len()` point at a chip; `blockers.len()` points at the
+    /// trailing `+ id:` input.
     blocker_cursor: usize,
-    /// Input row that adds a new blocker via `todo_add_blocker` on Enter.
+    /// Character offset of the first visible column of the chip strip. Kept
+    /// aligned to a chip boundary so a partial chip never anchors the left
+    /// edge; advanced when the focused chip would otherwise scroll off-screen.
+    blocker_scroll: usize,
+    /// Input field that adds a new blocker via `todo_add_blocker` on Enter.
     new_blocker: TextArea<'static>,
 
     /// Last-seen `created_at` / `updated_at` from the daemon, for the context line.
@@ -195,6 +201,7 @@ impl TodoForm {
             new_comment: text_area(""),
             blockers: Vec::new(),
             blocker_cursor: 0,
+            blocker_scroll: 0,
             new_blocker: text_area(""),
             created: String::new(),
             updated: String::new(),
@@ -289,6 +296,7 @@ impl TodoForm {
             new_comment: text_area(""),
             blockers,
             blocker_cursor: 0,
+            blocker_scroll: 0,
             new_blocker: text_area(""),
             created: todo["created_at"].as_str().unwrap_or("").to_string(),
             updated: todo["updated_at"].as_str().unwrap_or("").to_string(),
@@ -534,12 +542,12 @@ impl TodoForm {
         }
     }
 
-    /// Keys handled when the blockers section has focus. Mirrors the
-    /// comments-section split: navigation/`d`-delete only apply over existing
-    /// blocker rows; the input row routes everything to the textarea so an
-    /// id like `12` can be typed without `j` or `k` hijacking the keys.
+    /// Keys handled when the Blockers row has focus. The row is a horizontal
+    /// strip of chips followed by a `+ id:` input; navigation cycles left and
+    /// right between them. On a chip, `d` removes that blocker. The input row
+    /// routes printable keys to the textarea so a number like `12` can be
+    /// typed without the chip-navigation bindings hijacking the keystrokes.
     fn blockers_section_key(&mut self, key: KeyEvent) -> TodoFormAction {
-        let total_rows = self.blockers.len() + 1;
         let on_input_row = self.blocker_cursor == self.blockers.len();
 
         if on_input_row {
@@ -547,14 +555,15 @@ impl TodoForm {
         }
 
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Left => {
                 if self.blocker_cursor > 0 {
                     self.blocker_cursor -= 1;
                 }
                 TodoFormAction::Idle
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.blocker_cursor + 1 < total_rows {
+            KeyCode::Right => {
+                // Right past the last chip lands on the input row.
+                if self.blocker_cursor < self.blockers.len() {
                     self.blocker_cursor += 1;
                 }
                 TodoFormAction::Idle
@@ -571,18 +580,31 @@ impl TodoForm {
         }
     }
 
-    /// Keys for the new-blocker input row. `Enter` parses the typed id and
-    /// adds the blocker; `Up` walks back into the read rows; everything else
-    /// types into the textarea.
+    /// Keys for the new-blocker input. `Enter` parses the typed id and adds
+    /// the blocker; `Backspace` on an empty input removes the rightmost chip
+    /// (the Gmail-recipients pattern); `Left` walks back into the chip strip;
+    /// every other key types into the textarea.
     fn blockers_input_row_key(&mut self, key: KeyEvent) -> TodoFormAction {
+        let input_empty = self.new_blocker.lines().join("").is_empty();
         match key.code {
-            KeyCode::Up => {
+            KeyCode::Left => {
                 if self.blocker_cursor > 0 {
                     self.blocker_cursor -= 1;
                 }
                 TodoFormAction::Idle
             }
-            KeyCode::Down => TodoFormAction::Idle,
+            KeyCode::Right => TodoFormAction::Idle,
+            KeyCode::Backspace if input_empty && !self.blockers.is_empty() => {
+                // Pop the rightmost chip. `remove_blocker` clamps the cursor
+                // back into range when the list shrinks, so we land on the
+                // (new) input row again ready for the next id.
+                let bid = self.blockers[self.blockers.len() - 1].id;
+                match self.remove_blocker(bid) {
+                    Ok(()) => self.message = format!("removed blocker #{bid}"),
+                    Err(e) => self.message = format!("remove failed: {e:#}"),
+                }
+                TodoFormAction::Idle
+            }
             KeyCode::Enter => {
                 let typed = self.new_blocker.lines().join("");
                 let trimmed = typed.trim_start_matches('#').trim();
@@ -814,18 +836,20 @@ impl TodoForm {
     /// Render the form into `area`. The host is responsible for clearing the
     /// rect first if it needs to.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        // Rows: header / title / status+priority / assignee / tags / body /
+        // Rows: header / title / status+priority / assignee+tags / body /
         // comments / blockers / context / message.
-        // Body is 3x the size of comments and blockers (which are equal).
+        // Body is 3x the size of comments. Blockers is a single-line chip
+        // strip; Status, Priority, Assignee, and Tags are also single-line
+        // inline fields - together they free six rows of vertical space for
+        // the body and comments blocks.
         let rows = Layout::vertical([
             Constraint::Length(1),   // header (incl. locked-by banner)
             Constraint::Length(3),   // title
             Constraint::Length(1),   // status + priority
-            Constraint::Length(3),   // assignee
-            Constraint::Length(3),   // tags
-            Constraint::Ratio(3, 5), // body (3/5 of flexible space)
-            Constraint::Ratio(1, 5), // comments (1/5 of flexible space)
-            Constraint::Ratio(1, 5), // blockers (1/5 of flexible space)
+            Constraint::Length(1),   // assignee + tags
+            Constraint::Ratio(3, 4), // body (3/4 of flexible space)
+            Constraint::Ratio(1, 4), // comments (1/4 of flexible space)
+            Constraint::Length(1),   // blockers chip strip
             Constraint::Length(1),   // context (created/updated)
             Constraint::Length(1),   // message + help
         ])
@@ -846,9 +870,9 @@ impl TodoForm {
         self.style_field(Field::Title, "Title");
         frame.render_widget(&self.title, rows[1]);
 
+        let focus = FIELDS[self.focus];
         let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(rows[2]);
-        let focus = FIELDS[self.focus];
         frame.render_widget(
             enum_line("Status", STATUSES[self.status], focus == Field::Status),
             cols[0],
@@ -862,14 +886,29 @@ impl TodoForm {
             cols[1],
         );
 
-        self.style_field(Field::Assignee, "Assignee");
-        frame.render_widget(&self.assignee, rows[3]);
-        self.style_field(Field::Tags, "Tags (comma-separated)");
-        frame.render_widget(&self.tags, rows[4]);
-        self.draw_body(frame, rows[5]);
+        self.style_inline_field(Field::Assignee);
+        self.style_inline_field(Field::Tags);
+        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[3]);
+        let assignee_cols =
+            Layout::horizontal([Constraint::Length(11), Constraint::Min(1)]).split(cols[0]);
+        frame.render_widget(
+            Paragraph::new(" Assignee: ").style(label_style(focus == Field::Assignee)),
+            assignee_cols[0],
+        );
+        frame.render_widget(&self.assignee, assignee_cols[1]);
+        let tags_cols =
+            Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).split(cols[1]);
+        frame.render_widget(
+            Paragraph::new(" Tags: ").style(label_style(focus == Field::Tags)),
+            tags_cols[0],
+        );
+        frame.render_widget(&self.tags, tags_cols[1]);
 
-        self.draw_comments(frame, rows[6]);
-        self.draw_blockers(frame, rows[7]);
+        self.draw_body(frame, rows[4]);
+
+        self.draw_comments(frame, rows[5]);
+        self.draw_blockers(frame, rows[6]);
 
         let context = if !self.created.is_empty() {
             format!(" created {}   updated {}", self.created, self.updated)
@@ -878,18 +917,33 @@ impl TodoForm {
         };
         frame.render_widget(
             Paragraph::new(context).style(Style::default().fg(Color::DarkGray)),
-            rows[8],
+            rows[7],
         );
 
         let help = "Tab field  Left/Right cycle  Enter add/edit  d delete  Ctrl-C close";
-        let line = if self.message.is_empty() {
+        // When focus is on a blocker chip, prefer showing that blocker's title
+        // over `self.message` - chips render as ID-only to save horizontal
+        // space, so the title needs a surface somewhere the user can always
+        // see it.
+        let displayed_message =
+            if focus == Field::Blockers && self.blocker_cursor < self.blockers.len() {
+                let b = &self.blockers[self.blocker_cursor];
+                if b.title.is_empty() {
+                    format!("#{}", b.id)
+                } else {
+                    format!("#{} {}", b.id, b.title)
+                }
+            } else {
+                self.message.clone()
+            };
+        let line = if displayed_message.is_empty() {
             format!(" {help}")
         } else {
-            format!(" {}   |   {help}", self.message)
+            format!(" {displayed_message}   |   {help}")
         };
         frame.render_widget(
             Paragraph::new(line).style(Style::default().fg(Color::Yellow)),
-            rows[9],
+            rows[8],
         );
     }
 
@@ -1026,70 +1080,136 @@ impl TodoForm {
         frame.render_widget(&self.new_comment, prefix_cols[1]);
     }
 
+    /// Render the Blockers row as `Blockers: #3 #7 #12   + id: ___` on one
+    /// line. The focused chip's title rides in the form's bottom message line
+    /// (computed in [`Self::draw`]), so chips here stay ID-only to keep the
+    /// strip narrow. Long strips scroll horizontally; the scroll always lands
+    /// on a chip boundary so the leading chip never appears half-clipped.
     fn draw_blockers(&mut self, frame: &mut Frame, area: Rect) {
         let focused = FIELDS[self.focus] == Field::Blockers;
-        let border = if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
-        let block = Block::bordered()
-            .title(format!("Blockers ({})", self.blockers.len()))
-            .border_style(Style::default().fg(border));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let on_input_row = self.blocker_cursor == self.blockers.len();
 
-        let inner_rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+        // Three columns: label / chip strip / input. The input width is fixed
+        // so the chip strip always knows how much room it has to scroll into.
+        let cols = Layout::horizontal([
+            Constraint::Length(11),
+            Constraint::Min(0),
+            Constraint::Length(16),
+        ])
+        .split(area);
 
-        let lines: Vec<Line> = self
-            .blockers
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let label = if b.title.is_empty() {
-                    format!(" #{}", b.id)
-                } else {
-                    format!(" #{} {}", b.id, b.title)
-                };
-                if focused && i == self.blocker_cursor {
-                    Line::styled(label, Style::default().add_modifier(Modifier::REVERSED))
-                } else {
-                    Line::from(label)
-                }
-            })
-            .collect();
-        let body = if lines.is_empty() {
-            Paragraph::new(" (no blockers)").style(Style::default().fg(Color::DarkGray))
-        } else {
-            Paragraph::new(lines)
-        };
-        frame.render_widget(body, inner_rows[0]);
+        frame.render_widget(
+            Paragraph::new(" Blockers: ").style(label_style(focused)),
+            cols[0],
+        );
 
-        let add_focused = focused && self.blocker_cursor == self.blockers.len();
-        let prefix_style = if add_focused {
+        self.draw_blocker_chips(frame, cols[1], focused);
+
+        let input_focused = focused && on_input_row;
+        let prefix_style = if input_focused {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let prefix_cols =
-            Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).split(inner_rows[1]);
-        frame.render_widget(Paragraph::new("+ id: ").style(prefix_style), prefix_cols[0]);
-        frame.render_widget(&self.new_blocker, prefix_cols[1]);
+        let input_cols =
+            Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).split(cols[2]);
+        frame.render_widget(Paragraph::new(" + id: ").style(prefix_style), input_cols[0]);
+        self.new_blocker.set_cursor_style(if input_focused {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        });
+        frame.render_widget(&self.new_blocker, input_cols[1]);
     }
 
-    /// Set a text field's border and cursor styling for the current focus.
-    /// Body is excluded - it has its own wrapped render in [`Self::draw_body`].
+    /// Render the chip strip into `area`, scrolling so the focused chip stays
+    /// fully visible. Chips are separated by a single space; the scroll offset
+    /// is held in `self.blocker_scroll` and aligned to a chip's leading edge.
+    fn draw_blocker_chips(&mut self, frame: &mut Frame, area: Rect, section_focused: bool) {
+        let width = area.width as usize;
+        if width == 0 || self.blockers.is_empty() {
+            // Reset scroll when there is nothing to display - otherwise a
+            // stale offset survives across deletions and the next render
+            // starts mid-chip.
+            self.blocker_scroll = 0;
+            return;
+        }
+
+        // Compute per-chip widths (incl. the leading separator space for all
+        // but the first chip) and the cumulative offsets used both to choose
+        // the scroll position and to drive `Paragraph::scroll`.
+        let mut chip_widths: Vec<usize> = Vec::with_capacity(self.blockers.len());
+        for (i, b) in self.blockers.iter().enumerate() {
+            let sep = usize::from(i > 0);
+            chip_widths.push(sep + format!("#{}", b.id).len());
+        }
+        let mut offsets: Vec<usize> = Vec::with_capacity(self.blockers.len() + 1);
+        offsets.push(0);
+        for w in &chip_widths {
+            offsets.push(offsets.last().unwrap() + w);
+        }
+
+        // Slide the strip so the focused chip lands inside the visible window
+        // by anchoring it to the leftmost column - same offset whether the
+        // focus came from the right (chip would be cut off on the right) or
+        // from the left (chip would be cut off on the left), which keeps the
+        // leading chip from ever appearing half-clipped. When the input row
+        // is focused we leave scroll where it last sat so returning to a
+        // chip does not jump the view.
+        if section_focused && self.blocker_cursor < self.blockers.len() {
+            let start = offsets[self.blocker_cursor];
+            let end = offsets[self.blocker_cursor + 1];
+            if start < self.blocker_scroll || end > self.blocker_scroll + width {
+                self.blocker_scroll = start;
+            }
+        }
+        // Don't scroll past the end of the strip - if the user just removed
+        // the rightmost blocker, the previous scroll value may be too large.
+        let total = *offsets.last().unwrap();
+        let max_scroll = total.saturating_sub(width);
+        if self.blocker_scroll > max_scroll {
+            self.blocker_scroll = max_scroll;
+        }
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, b) in self.blockers.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let style = if section_focused && i == self.blocker_cursor {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else if section_focused {
+                Style::default().fg(Color::Gray)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(format!("#{}", b.id), style));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).scroll((0, self.blocker_scroll as u16)),
+            area,
+        );
+    }
+
+    /// Set a bordered text field's border and cursor styling for the current
+    /// focus. Used for the Title field; Body has its own wrapped render in
+    /// [`Self::draw_body`]; Assignee and Tags are inline single-line fields
+    /// styled by [`Self::style_inline_field`].
     fn style_field(&mut self, field: Field, label: &'static str) {
         let focused = FIELDS[self.focus] == field;
         let area = match field {
             Field::Title => &mut self.title,
-            Field::Assignee => &mut self.assignee,
-            Field::Tags => &mut self.tags,
-            Field::Status | Field::Priority | Field::Body | Field::Comments | Field::Blockers => {
-                return
-            }
+            Field::Status
+            | Field::Priority
+            | Field::Assignee
+            | Field::Tags
+            | Field::Body
+            | Field::Comments
+            | Field::Blockers => return,
         };
         let border = if focused {
             Color::Yellow
@@ -1101,6 +1221,23 @@ impl TodoForm {
                 .title(label)
                 .border_style(Style::default().fg(border)),
         );
+        area.set_cursor_style(if focused {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        });
+    }
+
+    /// Cursor styling for an inline single-line field (Assignee, Tags). These
+    /// render without a block; their label sits to the left and the cursor
+    /// itself indicates focus.
+    fn style_inline_field(&mut self, field: Field) {
+        let focused = FIELDS[self.focus] == field;
+        let area = match field {
+            Field::Assignee => &mut self.assignee,
+            Field::Tags => &mut self.tags,
+            _ => return,
+        };
         area.set_cursor_style(if focused {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
@@ -1131,14 +1268,19 @@ pub(crate) fn text_area(initial: &str) -> TextArea<'static> {
 
 /// Render a cyclable enum field as a one-line `Label: < value >`.
 fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
-    let style = if focused {
+    Paragraph::new(format!(" {label}: < {value} >")).style(label_style(focused))
+}
+
+/// Style for an inline field's leading label. Matches `enum_line`'s palette so
+/// Status, Priority, Assignee, and Tags read as one band of inline fields.
+fn label_style(focused: bool) -> Style {
+    if focused {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
-    };
-    Paragraph::new(format!(" {label}: < {value} >")).style(style)
+    }
 }
 
 /// Feed a key to a multi-line text field. We forward almost everything
@@ -1493,5 +1635,67 @@ mod tests {
             form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
         }
         assert_eq!(form.new_comment.lines(), vec!["djk"]);
+    }
+
+    /// Helper for the chip-strip tests: tabs to the Blockers field and seeds
+    /// the local blocker list without going through the daemon.
+    fn form_on_blockers_with(ids_and_titles: &[(u64, &str)]) -> TodoForm {
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        for _ in 0..7 {
+            form.handle_key(tab);
+        }
+        assert_eq!(FIELDS[form.focus], Field::Blockers);
+        for (id, title) in ids_and_titles {
+            form.blockers.push(BlockerEntry {
+                id: *id,
+                title: (*title).to_string(),
+            });
+        }
+        form.blocker_cursor = 0;
+        form
+    }
+
+    /// Left/Right cycle through chips and then onto the trailing input row;
+    /// Right past the input is a no-op, Left at the start is a no-op.
+    #[test]
+    fn blocker_chip_strip_cycles_with_left_and_right() {
+        let mut form = form_on_blockers_with(&[(3, "wire up auth"), (7, "deploy")]);
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::empty());
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
+
+        form.handle_key(right);
+        assert_eq!(form.blocker_cursor, 1);
+        form.handle_key(right);
+        assert_eq!(form.blocker_cursor, 2); // input row
+        form.handle_key(right);
+        assert_eq!(form.blocker_cursor, 2); // no further right
+        form.handle_key(left);
+        assert_eq!(form.blocker_cursor, 1);
+        form.handle_key(left);
+        assert_eq!(form.blocker_cursor, 0);
+        form.handle_key(left);
+        assert_eq!(form.blocker_cursor, 0); // no further left
+    }
+
+    /// On the input row, Backspace with non-empty content edits the textarea;
+    /// only an empty input triggers the Gmail-recipients pattern (and would
+    /// pop the rightmost chip, but here we just confirm the no-pop path).
+    #[test]
+    fn blocker_input_backspace_with_text_edits_the_textarea() {
+        let mut form = form_on_blockers_with(&[(3, "wire up auth")]);
+        // Move to the input row.
+        form.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()));
+        assert_eq!(form.blocker_cursor, 1);
+        // Type some characters, then Backspace - the textarea should lose
+        // the last character and the chip list should stay intact.
+        for c in ['1', '2'] {
+            form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert_eq!(form.new_blocker.lines(), vec!["12"]);
+        form.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(form.new_blocker.lines(), vec!["1"]);
+        assert_eq!(form.blockers.len(), 1);
     }
 }
