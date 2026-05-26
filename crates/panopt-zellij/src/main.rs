@@ -413,38 +413,44 @@ impl ZellijPlugin for PanoptPane {
         // lives in Zellij's frame title (set by `sync_frame_title` from
         // `update`); the pane body is just the item list.
         //
-        // Cursor handling matters here. Zellij does not reset the cursor
-        // position between renders, and a `\r\n` after the LAST line moves
-        // the cursor one row past the visible area - the terminal then
-        // scrolls up to keep the cursor on-screen, pushing the first item
-        // off the top. So:
-        //   1. Home the cursor + clear the pane on every render, so any
-        //      stale rows (or leaked stdout chatter) cannot pile up.
-        //   2. Separate items with `\r\n` but do not emit one after the
-        //      final item, so the cursor stays inside the visible area.
-        print!("\u{1b}[H\u{1b}[2J");
+        // Each row is written with absolute cursor positioning (`\x1b[r;1H`)
+        // and the line is cleared (`\x1b[2K`) before the new content lands.
+        // We never advance the cursor with `\r\n`, so it cannot cross the
+        // bottom edge of the visible area - which is what was growing the
+        // pane's scrollback (and the "n/m" indicator Zellij overlays on the
+        // frame) by one row per render.
         let total = self.items.len();
         let visible = rows.max(1);
         let max_scroll = total.saturating_sub(visible);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
+        // Wipe every visible row first, so a shrinking list (or stale
+        // content from a previous render) cannot leak through. `\x1b[3J`
+        // also drops anything sitting in the pane's scrollback buffer -
+        // pane resizes (and any stray newline that leaks past the visible
+        // bottom) push rows into scrollback, and Zellij overlays that row
+        // count on the frame as `n/m`; clearing it each render keeps the
+        // indicator at zero.
+        print!("\u{1b}[3J");
+        for row in 1..=visible {
+            print!("\u{1b}[{row};1H\u{1b}[2K");
+        }
         if total == 0 {
-            print!("{}", paint("  (none)", cols, Style::Dim, false));
+            print!("\u{1b}[1;1H{}", paint("  (none)", cols, Style::Dim, false));
             return;
         }
         let end = (self.scroll + visible).min(total);
-        let mut first = true;
-        for idx in self.scroll..end {
-            if !first {
-                print!("\r\n");
-            }
-            first = false;
+        for (slot, idx) in (self.scroll..end).enumerate() {
             let item = &self.items[idx];
             let marker = if item.live { '*' } else { ' ' };
             let line = format!(" {marker}{}", item.label);
             let focused = idx == self.cursor;
-            print!("{}", paint(&line, cols, Style::Normal, focused));
+            print!(
+                "\u{1b}[{};1H{}",
+                slot + 1,
+                paint(&line, cols, Style::Normal, focused)
+            );
         }
     }
 }
