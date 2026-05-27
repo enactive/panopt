@@ -7,6 +7,7 @@
 //! a future stdio transport) can drive the exact same state with correct
 //! persistence and projection for free.
 
+pub mod auth;
 mod db;
 mod error;
 mod locks;

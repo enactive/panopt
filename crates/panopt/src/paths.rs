@@ -32,6 +32,13 @@ pub fn daemon_log() -> Result<PathBuf> {
     Ok(data_dir()?.join("panoptd.log"))
 }
 
+/// The shared bearer-token file. The daemon writes it on first boot (0600);
+/// every panopt client reads it to authenticate. Path matches the one the
+/// daemon resolves at startup so both ends agree without a flag.
+pub fn token() -> Result<PathBuf> {
+    Ok(data_dir()?.join("token"))
+}
+
 /// The cockpit layout `panopt up` generates and hands to Zellij.
 pub fn cockpit_layout() -> Result<PathBuf> {
     Ok(config_dir()?.join("cockpit.kdl"))

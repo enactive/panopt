@@ -1084,6 +1084,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "libc",
+ "panopt-core",
  "percent-encoding",
  "ratatui",
  "serde_json",

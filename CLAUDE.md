@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Four crates under `crates/`:
 
 - `panopt-core` — transport-agnostic state, persistence (SQLite), filesystem projection. **Must not depend on `rmcp`, `axum`, or `tokio`** — this boundary is the reason core is reusable. Verify with `cargo tree -p panopt-core` if you add a dep.
-- `panoptd` — MCP daemon over Streamable HTTP on `127.0.0.1:7600`. Wraps `panopt-core` in a `Mutex`.
+- `panoptd` — MCP daemon over Streamable HTTP. Defaults to `127.0.0.1:7600`; bind is configurable via `--host` and every request is gated by a bearer token at `~/.local/share/panopt/token` (`Authorization: Bearer <token>` or `?token=<token>`). Wraps `panopt-core` in a `Mutex`.
 - `panopt` — CLI launcher and viewer. Starts `panoptd` on demand, drives Zellij, spawns agent panes.
 - `panopt-zellij` — Zellij sidebar plugin. **Excluded from the cargo workspace** because it only builds for `wasm32-wasip1`.
 
@@ -43,6 +43,16 @@ Logs: `~/.local/share/panopt/panoptd.log` (tail with `just logs`). Database: `~/
 ## Coordination plane (MCP)
 
 The daemon exposes todos, scratchpads, locks, agent registry, and roster as MCP tools. Each MCP connection is scoped to one project via `?ws=<absolute-path>` on the URL. State mirrors to `.panopt/*.md` on every mutation — those files are read-mostly for humans and the Zellij plugin, not a write surface.
+
+## Hand-launching a first-class agent
+
+Cockpit-spawned panes are first-class automatically (the launcher injects `PANOPT_AGENT`, `PANOPT_NAME`, `PANOPT_TOKEN` into the pane env). For a Claude Code session started outside the cockpit — or on another machine — use `panopt agent-config` so the session lands with a stable id, a friendly display name, and the bearer token in one shot:
+
+```
+claude --mcp-config "$(panopt agent-config --name greg-main)"
+```
+
+Without this, the session falls back to the rotating `mcp-session-id` HTTP header as its agent key. The key churns on every reconnect, locks held under old keys get reaped by the 30s idle sweep, and other agents see the connection as a series of unreferenceable UUIDs. See `crates/panopt/src/agent_config.rs` for the resolver defaults (id = `$USER-$HOSTNAME`).
 
 ## Working a panopt todo
 

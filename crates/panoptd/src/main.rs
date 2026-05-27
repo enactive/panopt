@@ -1,9 +1,14 @@
 //! `panoptd` - the PANopt coordination daemon.
 //!
-//! Runs one MCP server over Streamable HTTP on localhost. Every connected agent
-//! shares one SQLite-backed store; each connection is scoped to a project by
-//! the `ws` query parameter on its MCP URL, and that project's state is
-//! mirrored to `.panopt/*.md` under the project root.
+//! Runs one MCP server over Streamable HTTP. Every connected agent shares one
+//! SQLite-backed store; each connection is scoped to a project by the `ws`
+//! query parameter on its MCP URL, and that project's state is mirrored to
+//! `.panopt/*.md` under the project root.
+//!
+//! The bind address is configurable (`--host`) so the daemon can serve agents
+//! on other machines, and every request must carry a bearer token - the same
+//! one regardless of bind, so loopback and remote callers go through the
+//! exact same gate.
 
 mod handler;
 mod params;
@@ -12,6 +17,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+};
 use clap::Parser;
 use panopt_core::Store;
 use rmcp::transport::streamable_http_server::{
@@ -28,7 +40,13 @@ struct Cli {
     #[arg(long)]
     db: Option<PathBuf>,
 
-    /// Localhost TCP port for the MCP server.
+    /// Address to bind the MCP server to. Defaults to loopback; pass
+    /// `0.0.0.0` (or a specific interface IP) to accept connections from
+    /// other hosts. Bearer-token auth is always required regardless of host.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// TCP port for the MCP server.
     #[arg(long, default_value_t = 7600)]
     port: u16,
 }
@@ -39,6 +57,56 @@ fn default_db_path() -> anyhow::Result<PathBuf> {
     let dir = dirs::data_dir()
         .context("could not locate a per-user data directory; pass --db explicitly")?;
     Ok(dir.join("panopt").join("panopt.db"))
+}
+
+/// The token file path: `<data-dir>/panopt/token`. Daemon and launcher agree
+/// on this so both can locate the shared bearer token without a flag.
+fn default_token_path() -> anyhow::Result<PathBuf> {
+    let dir = dirs::data_dir()
+        .context("could not locate a per-user data directory; cannot place the token file")?;
+    Ok(dir.join("panopt").join("token"))
+}
+
+/// Bearer-token gate around every MCP request.
+///
+/// Accepts the token via `Authorization: Bearer <token>` (preferred) or via
+/// a `?token=<token>` query parameter (a fallback for MCP clients that
+/// cannot set custom headers). Always required, including on loopback - the
+/// token file is 0600, so any process able to read it is already running as
+/// the same user, and a uniform gate is simpler than per-host policy.
+async fn require_token(
+    State(token): State<Arc<String>>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if has_valid_token(&req, &token) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn has_valid_token(req: &Request<Body>, token: &str) -> bool {
+    if let Some(h) = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        if h.trim() == token {
+            return true;
+        }
+    }
+    let query = req.uri().query().unwrap_or("");
+    for kv in query.split('&') {
+        if let Some(v) = kv.strip_prefix("token=") {
+            let decoded = percent_encoding::percent_decode_str(v).decode_utf8_lossy();
+            if decoded == token {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[tokio::main]
@@ -69,8 +137,8 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(db = %db_path.display(), "panoptd starting");
     tracing::info!(
-        "MCP endpoint: http://127.0.0.1:{}/mcp?ws=<project path>",
-        cli.port
+        "MCP endpoint: http://{}:{}/mcp?ws=<project path>",
+        cli.host, cli.port
     );
 
     // Drop agents that have gone silent, every 30s, so a closed agent leaves
@@ -95,6 +163,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let token_path = default_token_path()?;
+    let token = panopt_core::auth::ensure_token(&token_path)
+        .with_context(|| format!("ensuring panopt token at {}", token_path.display()))?;
+    tracing::info!(token = %token_path.display(), "panopt token ready");
+
     let factory_state = shared.clone();
     let service = StreamableHttpService::new(
         move || Ok(Handler::new(factory_state.clone())),
@@ -102,10 +175,16 @@ async fn main() -> anyhow::Result<()> {
         StreamableHttpServerConfig::default(),
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", cli.port))
+    let token_for_auth = Arc::new(token);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn_with_state(
+            token_for_auth,
+            require_token,
+        ));
+    let listener = tokio::net::TcpListener::bind((cli.host.as_str(), cli.port))
         .await
-        .with_context(|| format!("failed to bind 127.0.0.1:{}", cli.port))?;
+        .with_context(|| format!("failed to bind {}:{}", cli.host, cli.port))?;
 
     let shutdown_state = shared.clone();
     axum::serve(listener, router)

@@ -137,7 +137,9 @@ clean:
     cargo clean
     cargo clean --manifest-path crates/panopt-zellij/Cargo.toml
 
-# run a 'connected' agent externally (outside of panopt). this is for connecting a dev-time agent to the built system
+# run a 'connected' agent externally (outside of panopt). this is for connecting a dev-time agent to the built system.
+# Uses `panopt agent-config` so the launched session gets a stable agent id,
+# a friendly display name, and the bearer token the daemon requires.
 devagent:
-    claude --mcp-config '{"mcpServers":{"panopt":{"type":"http","url":"http://127.0.0.1:7600/mcp?ws='$PWD'"}}}'
+    claude --mcp-config "$(cargo run -q -p panopt -- agent-config)"
 

@@ -4,6 +4,7 @@
 //! opens agent panes - each with a stable per-agent identity (DESIGN.md §9).
 
 mod agent;
+mod agent_config;
 mod agent_tool;
 mod close_gate;
 mod daemon;
@@ -52,6 +53,29 @@ enum Cmd {
     Agent {
         /// Optional readable name for the agent.
         name: Option<String>,
+    },
+    /// Print a `--mcp-config` JSON for a hand-launched Claude Code session.
+    ///
+    /// The emitted config gives the session a stable agent id, a friendly
+    /// display name, and the bearer token, so a manually started agent is
+    /// indistinguishable from a cockpit-spawned one in the coordination plane.
+    ///
+    /// Example:
+    ///   claude --mcp-config "$(panopt agent-config --name greg-main)"
+    #[command(name = "agent-config")]
+    AgentConfig {
+        /// Friendly display name shown to other agents (default: the id).
+        #[arg(long)]
+        name: Option<String>,
+        /// Stable agent id put on the MCP URL (default: $USER-$HOSTNAME).
+        #[arg(long)]
+        id: Option<String>,
+        /// Daemon host (default: 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Project root (default: the current directory).
+        #[arg(long)]
+        ws: Option<PathBuf>,
     },
     /// Inspect and edit the project's shared todos.
     Todo {
@@ -163,6 +187,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Up { plugin } => up::run(plugin, cli.port),
         Cmd::Agent { name } => agent::spawn(name),
+        Cmd::AgentConfig { name, id, host, ws } => agent_config::run(host, cli.port, id, name, ws),
         Cmd::Todo { ws, action } => todo::run(ws, action, cli.port),
         Cmd::AgentTool { ws, action } => agent_tool::run(ws, action, cli.port),
         Cmd::Process { ws, action } => process::run(ws, action, cli.port),

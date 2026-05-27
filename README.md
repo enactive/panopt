@@ -164,36 +164,48 @@ auto-starts the daemon if needed.
 
 ## Connecting your own agents
 
-The daemon speaks the standard Model Context Protocol over Streamable HTTP.
-To connect an agent yourself, from inside the project directory:
+The daemon speaks the standard Model Context Protocol over Streamable HTTP
+and gates every request on a bearer token. The easiest way to point a
+hand-launched Claude Code at it is `panopt agent-config`, which emits the
+full `--mcp-config` JSON - stable agent id, friendly display name, token -
+in one shot:
 
 ```sh
-claude mcp add --transport http panopt "http://127.0.0.1:7600/mcp?ws=$PWD"
+claude --mcp-config "$(panopt agent-config --name my-name)"
 ```
 
-The `ws` query parameter is the absolute project path; it scopes the
-connection to that project. Any MCP-capable client works the same way - point
-it at `http://127.0.0.1:7600/mcp?ws=<absolute-project-path>`. State is shared
-live across every agent connected with the same `ws`.
+The emitted URL has the shape
+`http://<host>:<port>/mcp?ws=<abs-path>&agent=<id>&name=<friendly>&token=<token>`.
+The `ws` parameter is the absolute project path; it scopes the connection to
+that project. State is shared live across every agent connected with the
+same `ws`. The `agent` parameter is a stable per-agent key (`name` is its
+display label, applied as an implicit `identify` on first sight), so an
+agent keeps one identity across reconnects.
 
-The MCP surface includes `todo_*`, `scratchpad_*`, `lock_*`, `agent_tool_*`,
-`process_*`, and the agent registry (`identify`, `whoami`, `agent_list`). The
-full tool list is in [DESIGN.md](DESIGN.md).
+For any MCP client that lets you set request headers, `Authorization: Bearer
+<token>` is preferred over the `?token=` query parameter; the token file is
+at `~/.local/share/panopt/token` (mode 0600). The MCP surface includes
+`todo_*`, `scratchpad_*`, `lock_*`, `agent_tool_*`, `process_*`, and the
+agent registry (`identify`, `whoami`, `agent_list`). The full tool list is
+in [DESIGN.md](DESIGN.md).
 
 ## Running the daemon by hand
 
-`panopt up` and `panopt todo` both auto-start the daemon. If you would rather
-run it yourself:
+`panopt up` and `panopt todo` both auto-start the daemon. If you would
+rather run it yourself:
 
 ```sh
 panoptd --port 7600
 ```
 
 One daemon serves every project at once. The MCP endpoint is
-`http://127.0.0.1:<port>/mcp`. Useful flags:
+`http://<host>:<port>/mcp`. Useful flags:
 
 - `--db <path>` - override the SQLite database location.
-- `--port <n>` - localhost TCP port (default 7600).
+- `--host <addr>` - bind address (default `127.0.0.1`). Pass `0.0.0.0` to
+  accept connections from other hosts; the bearer-token gate applies
+  uniformly to local and remote callers.
+- `--port <n>` - TCP port (default 7600).
 
 ## Going deeper
 

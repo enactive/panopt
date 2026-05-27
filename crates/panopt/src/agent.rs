@@ -8,7 +8,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::mcp;
+use crate::{mcp, paths};
 
 /// `panopt agent [name]` - open a new agent pane in the running cockpit.
 ///
@@ -39,11 +39,17 @@ pub fn spawn(name: Option<String>) -> Result<()> {
 /// `panopt _agent` - the entrypoint that runs inside an agent pane.
 ///
 /// Sets the per-agent environment and replaces this process with `claude`, so
-/// the pane *is* the agent with no PANopt wrapper around it.
+/// the pane *is* the agent with no PANopt wrapper around it. The MCP template
+/// at `mcp.rs` expands these env vars in the `--mcp-config` URL, giving the
+/// pane a stable agent id, a friendly display name, and the bearer token.
 pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Result<()> {
     let config = mcp::ensure()?;
     let ws = resolve_ws(ws)?;
     let id = id.unwrap_or_else(|| mint_id(None));
+    let token_path = paths::token()?;
+    let token = panopt_core::auth::read_token(&token_path)
+        .with_context(|| format!("reading panopt token from {}", token_path.display()))?;
+    let host = std::env::var("PANOPT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
 
     // `exec` replaces this process image, so it returns only on failure.
     let err = Command::new("claude")
@@ -51,7 +57,10 @@ pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Resul
         .arg(&config)
         .env("PANOPT_WS", &ws)
         .env("PANOPT_AGENT", &id)
+        .env("PANOPT_NAME", &id)
         .env("PANOPT_PORT", port.to_string())
+        .env("PANOPT_HOST", &host)
+        .env("PANOPT_TOKEN", &token)
         .exec();
     Err(err).context("could not exec `claude` (is it installed and on PATH?)")
 }

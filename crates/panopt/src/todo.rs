@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 
 use crate::daemon;
 use crate::mcpclient::Client;
+use crate::paths;
 
 /// What to do to the project's todos.
 #[derive(Subcommand)]
@@ -103,12 +104,22 @@ pub fn run(ws: Option<PathBuf>, cmd: TodoCmd, port: u16) -> Result<()> {
 }
 
 /// The daemon MCP endpoint for project `ws`, scoped to a non-registering
-/// `observer` connection. Shared by the `panopt todo` tools and the form.
+/// `observer` connection and carrying the bearer token as a query parameter.
+/// Shared by every `panopt` subcommand that talks to the daemon (todo,
+/// scratchpad, agent-tool, process, id-kind, viewer panes, the form).
+///
+/// The token sits on the URL rather than in a header because the minimal
+/// `mcpclient` we ship only knows how to set the session-id header; pinning
+/// auth to a header would mean teaching every internal client to set it.
+/// Logs of these URLs are local-only.
 pub(crate) fn observer_url(ws: Option<PathBuf>, port: u16) -> Result<String> {
     let ws = resolve_ws(ws)?;
-    let encoded = utf8_percent_encode(&ws.to_string_lossy(), NON_ALPHANUMERIC).to_string();
+    let encoded_ws = utf8_percent_encode(&ws.to_string_lossy(), NON_ALPHANUMERIC).to_string();
+    let token = panopt_core::auth::read_token(&paths::token()?)
+        .context("reading the panopt token (start the daemon with `panopt up`)")?;
+    let encoded_token = utf8_percent_encode(&token, NON_ALPHANUMERIC).to_string();
     Ok(format!(
-        "http://127.0.0.1:{port}/mcp?ws={encoded}&observer=1"
+        "http://127.0.0.1:{port}/mcp?ws={encoded_ws}&observer=1&token={encoded_token}"
     ))
 }
 

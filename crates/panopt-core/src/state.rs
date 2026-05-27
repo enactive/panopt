@@ -27,7 +27,7 @@ use crate::registry::Registry;
 
 /// How long an agent may go without any tool call before the registry treats
 /// it as gone and prunes it (releasing its locks).
-const AGENT_MAX_IDLE: Duration = Duration::from_secs(300);
+const AGENT_MAX_IDLE: Duration = Duration::from_secs(1800);
 
 /// All of PANopt's coordination state.
 ///
