@@ -326,12 +326,12 @@ struct PanoptPane {
     /// view as the projection changes underneath. Ignored by every other
     /// mode.
     todo_filter: TodoFilter,
-    /// Primary sort axis for the Todos pane. Cycled with `s` / `S`; default
+    /// Primary sort axis for the Todos pane. Cycled with `1` / `!`; default
     /// [`TodoSort::PriorityDesc`]. Held in-memory only - reset to the
     /// default on every Zellij restart, same as [`Self::todo_filter`].
     todo_sort_1: TodoSort,
     /// Secondary sort axis, applied as a stable tiebreaker. Cycled with
-    /// `d` / `D`. Defaults to [`TodoSort::CreatedAsc`] (oldest first) which
+    /// `2` / `@`. Defaults to [`TodoSort::CreatedAsc`] (oldest first) which
     /// together with the priority-desc level 1 surfaces the highest-priority
     /// oldest-open todo at the top.
     todo_sort_2: TodoSort,
@@ -409,6 +409,11 @@ struct PanoptPane {
     initial_preview_done: bool,
     /// Counter for delaying the initial preview until the UI is ready.
     initial_preview_delay: u32,
+    /// When `true`, the pane body shows the per-mode key cheat-sheet instead
+    /// of the item list. Toggled by `?`; any other keypress dismisses it.
+    /// Holds the same set of keys across modes so the UI never carries
+    /// per-mode hint clutter - the help is the only place keys are listed.
+    show_help: bool,
 }
 
 /// A parsed `.panopt/processes.md` line. The line format is preserved from
@@ -650,12 +655,21 @@ impl ZellijPlugin for PanoptPane {
         // (and any stray newline that leaks past the visible bottom) push
         // rows into scrollback, and Zellij overlays that row count on the
         // frame as `n/m`; clearing it each render keeps the indicator at
-        // zero. We wipe `rows` rows (the full body) so the reserved
-        // status-line row also starts clean.
+        // zero.
         print!("\u{1b}[3J");
         let body_rows = rows.max(1);
         for row in 1..=body_rows {
             print!("\u{1b}[{row};1H\u{1b}[2K");
+        }
+        if self.show_help {
+            for (i, line) in self.help_lines().iter().take(body_rows).enumerate() {
+                print!(
+                    "\u{1b}[{};1H{}",
+                    i + 1,
+                    paint(line, cols, Style::Dim, false)
+                );
+            }
+            return;
         }
         if total == 0 {
             print!("\u{1b}[1;1H{}", paint("  (none)", cols, Style::Dim, false));
@@ -707,12 +721,12 @@ impl PanoptPane {
         }
         let total = self.items.len();
         let visible = self.list_rows();
-        // Todos pane: advertise the `n` create-new binding and the `f/F`
-        // filter cycle inline with their current values. Sort axes live in
-        // the bottom status line (no bottom-border API in Zellij). Other
-        // modes keep the bare label until they get their own action hints.
-        let action_seg = if self.mode == Mode::Todos {
-            format!(": (n)ew, (fF):{}", self.todo_filter.label())
+        // Todos pane: surface the current filter value in the title (no
+        // key hint - those live in `?` help) so the user always knows
+        // which slice of the projection they're looking at. The sort axes
+        // ride along on the bottom status line.
+        let filter_seg = if self.mode == Mode::Todos {
+            format!(" [{}]", self.todo_filter.label())
         } else {
             String::new()
         };
@@ -725,7 +739,7 @@ impl PanoptPane {
             let end = (self.scroll + visible).min(total);
             format!(" ({start}-{end}/{total})")
         };
-        let full = format!("{base}{action_seg}{counts_seg}");
+        let full = format!("{base}{filter_seg}{counts_seg}");
         // Zellij decorates the frame title with a couple of chars on each
         // side (`┤ ... ├` plus padding); a small margin keeps us from
         // tripping the host's mid-string truncation right at the boundary.
@@ -736,25 +750,78 @@ impl PanoptPane {
         if self.last_cols == 0 || full.chars().count() <= budget {
             full
         } else {
-            // Drop the counts; keep the action/filter hints intact. The
-            // user wants the keys advertised - the counts are recoverable
-            // from the body.
-            format!("{base}{action_seg}")
+            // Drop the counts; keep the filter value so the user always
+            // sees the slice they're on. The counts are recoverable from
+            // the body itself.
+            format!("{base}{filter_seg}")
         }
     }
 
     /// The status-line text drawn on the reserved bottom row of the Todos
-    /// pane body. Currently shows the two-level sort axes; the filter stays
-    /// in the top frame title where it has always lived. Zellij gives
-    /// plugins no API to write the bottom *border* (only the top frame
-    /// title via `rename_plugin_pane`), so this is the closest we can get
-    /// to a "bottom title" - a dim status line at the foot of the body.
+    /// pane body. Shows the two sort axes' current values, no key hints
+    /// (those live in `?` help). Zellij gives plugins no API to write the
+    /// bottom *border* (only the top frame title via `rename_plugin_pane`),
+    /// so this is the closest we can get to a "bottom title" - a dim status
+    /// line at the foot of the body.
     fn status_line(&self) -> String {
         format!(
-            " (sS):{} (dD):{}",
+            " [{}] [{}]",
             self.todo_sort_1.label(),
             self.todo_sort_2.label(),
         )
+    }
+
+    /// Lines for the `?` help overlay, tailored to the active mode. The
+    /// navigation block and the always-available `a` / `?` are shown
+    /// everywhere; per-mode bindings are listed only where they actually
+    /// do something so the cheat-sheet matches the handler.
+    fn help_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(" Keys - {}", self.mode.label()), String::new()];
+        lines.push("  up/down       move cursor".to_string());
+        lines.push("  PgUp/PgDn     page".to_string());
+        lines.push("  Home/End      first/last".to_string());
+        lines.push("  Enter         open / focus".to_string());
+        lines.push(String::new());
+        match self.mode {
+            Mode::Todos => {
+                lines.push("  n             new todo".to_string());
+                lines.push("  e             edit (open + focus)".to_string());
+                lines.push("  x             delete todo".to_string());
+                lines.push(format!(
+                    "  f / F         filter forward / back  [{}]",
+                    self.todo_filter.label()
+                ));
+                lines.push(format!(
+                    "  1 / !         sort 1 forward / back  [{}]",
+                    self.todo_sort_1.label()
+                ));
+                lines.push(format!(
+                    "  2 / @         sort 2 forward / back  [{}]",
+                    self.todo_sort_2.label()
+                ));
+            }
+            Mode::Scratchpads => {
+                lines.push("  n             new scratchpad".to_string());
+            }
+            Mode::Agents => {
+                lines.push("  n             new agent".to_string());
+                lines.push("  u             start / focus".to_string());
+                lines.push("  d             stop (close pane)".to_string());
+                lines.push("  x             delete agent".to_string());
+            }
+            Mode::Commands => {
+                lines.push("  u             start / focus".to_string());
+                lines.push("  d             stop (close pane)".to_string());
+                lines.push("  x             delete command".to_string());
+            }
+            Mode::Terminals => {
+                lines.push("  x / d         close terminal".to_string());
+            }
+        }
+        lines.push(String::new());
+        lines.push("  a             spawn agent".to_string());
+        lines.push("  ?             toggle this help".to_string());
+        lines
     }
 
     /// Push the current [`Self::frame_title`] to Zellij as the pane's frame
@@ -1065,7 +1132,7 @@ impl PanoptPane {
     }
 
     /// Step one sort level forward or backward and refresh. `level` is 1
-    /// (`s` / `S`) or 2 (`d` / `D`); other values are no-ops. The cursor
+    /// (`1` / `!`) or 2 (`2` / `@`); other values are no-ops. The cursor
     /// resets to the top so the user lands on the head of the new ordering
     /// rather than wherever the previously-selected todo wound up.
     fn cycle_todo_sort(&mut self, level: u8, forward: bool) {
@@ -1228,6 +1295,13 @@ impl PanoptPane {
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
         self.clear_gate_refusal();
+        // While the help overlay is up, every key dismisses it - including
+        // a second `?`. The key still counts as handled so the dismissal
+        // alone is not also interpreted as an action.
+        if self.show_help {
+            self.show_help = false;
+            return true;
+        }
         match key.bare_key {
             BareKey::Up => {
                 if self.move_cursor(-1) {
@@ -1273,18 +1347,32 @@ impl PanoptPane {
             BareKey::Char('n') if self.mode == Mode::Scratchpads => {
                 self.open_document("new-scratchpad", None, true)
             }
+            BareKey::Char('n') if self.mode == Mode::Agents => self.spawn_agent_pane(None),
             BareKey::Char('L') => self.open_mode_list(true),
-            // Cycle the todo filter forward (`f`) or backward (`F`). Only
-            // meaningful in the Todos pane; for other modes the keys fall
-            // through to the no-op stubs below.
+            // Filter (Todos only). Forward = `f`, backward = `F`.
             BareKey::Char('f') if self.mode == Mode::Todos => self.cycle_todo_filter(true),
             BareKey::Char('F') if self.mode == Mode::Todos => self.cycle_todo_filter(false),
-            // Two-level sort: `s`/`S` cycles level 1, `d`/`D` cycles level 2.
-            // Only meaningful in the Todos pane.
-            BareKey::Char('s') if self.mode == Mode::Todos => self.cycle_todo_sort(1, true),
-            BareKey::Char('S') if self.mode == Mode::Todos => self.cycle_todo_sort(1, false),
-            BareKey::Char('d') if self.mode == Mode::Todos => self.cycle_todo_sort(2, true),
-            BareKey::Char('D') if self.mode == Mode::Todos => self.cycle_todo_sort(2, false),
+            // Two-level sort (Todos only). Forward = `1`/`2`, backward =
+            // `!`/`@` (the shifted versions of the same digit). This keeps
+            // the sort and filter bindings disjoint from any letter key so
+            // the per-mode letter actions (`u` / `d` / `x`) never have to
+            // be qualified by mode.
+            BareKey::Char('1') if self.mode == Mode::Todos => self.cycle_todo_sort(1, true),
+            BareKey::Char('!') if self.mode == Mode::Todos => self.cycle_todo_sort(1, false),
+            BareKey::Char('2') if self.mode == Mode::Todos => self.cycle_todo_sort(2, true),
+            BareKey::Char('@') if self.mode == Mode::Todos => self.cycle_todo_sort(2, false),
+            // Delete the focused item. Dispatches by mode; see [`delete_focused`].
+            BareKey::Char('x') => self.delete_focused(),
+            // Start / focus the focused runnable. Identical to Enter for
+            // process-backed and pane-backed items; no-op for docs.
+            BareKey::Char('u') => self.start_focused(),
+            // Stop the focused runnable: close its pane. The process row
+            // (if any) stays - the user can `u` to relaunch it.
+            BareKey::Char('d') => self.stop_focused(),
+            // Help overlay: any subsequent key dismisses it. Handled above
+            // the match so `?` falls through the dismissal path on a second
+            // press.
+            BareKey::Char('?') => self.show_help = true,
             // `/` is a stub - the key is reserved for future filter behavior
             // but does nothing today.
             BareKey::Char('/') => {}
@@ -1332,11 +1420,11 @@ impl PanoptPane {
     }
 
     /// Number of body rows available for items. In the Todos pane the
-    /// bottom body row is reserved as a status line (sort indicator), so
-    /// the list area is one row shorter than what Zellij hands us. Every
-    /// scroll / clamp / page-step computation goes through this single
-    /// source of truth so the status-line row never gets covered by an
-    /// item or counted toward the visible window.
+    /// bottom body row is reserved as a status line showing the two sort
+    /// axes' current values, so the list area is one row shorter than what
+    /// Zellij hands us. Every scroll / clamp / page-step computation goes
+    /// through this single source of truth so the status-line row never
+    /// gets covered by an item or counted toward the visible window.
     fn list_rows(&self) -> usize {
         let reserve = if self.mode == Mode::Todos { 1 } else { 0 };
         self.last_rows.saturating_sub(reserve).max(1)
@@ -1382,6 +1470,77 @@ impl PanoptPane {
         if let Some(ItemTarget::Todo(id)) = self.focused_target() {
             self.open_document("todo", Some(id), true);
         }
+    }
+
+    /// Delete the focused item. Todos and process rows go through the
+    /// `panopt` CLI (the daemon owns the durable state); ad-hoc agent panes
+    /// and plain shell terminals are just closed via the host. Scratchpad
+    /// delete has no CLI yet - surface a refusal so the user knows the
+    /// keypress was seen.
+    fn delete_focused(&mut self) {
+        let Some(target) = self.focused_target() else {
+            return;
+        };
+        let Some(cwd) = self.launch_cwd() else {
+            return;
+        };
+        match target {
+            ItemTarget::Todo(id) => {
+                self.run_panopt(&["todo", "rm", &id.to_string(), "--port", &self.port], cwd)
+            }
+            ItemTarget::Scratchpad(_) => {
+                self.refuse_gate("scratchpad delete not yet supported");
+            }
+            ItemTarget::Process(id) => {
+                if let Some(pane) = self.process_pane(id) {
+                    close_pane_with_id(pane);
+                }
+                self.run_panopt(
+                    &["process", "delete", &id.to_string(), "--port", &self.port],
+                    cwd,
+                );
+            }
+            ItemTarget::Pane(pane) => {
+                close_pane_with_id(pane);
+            }
+        }
+    }
+
+    /// Start (or focus) the focused runnable. Same effect as Enter but
+    /// without shifting keyboard focus onto the content pane - the user
+    /// stays on the sidebar so the next key still drives the list.
+    fn start_focused(&mut self) {
+        if let Some(idx) = self.items.get(self.cursor).map(|_| self.cursor) {
+            self.activate_item(idx, false);
+        }
+    }
+
+    /// Stop the focused runnable: close its content pane. The underlying
+    /// process row (when any) is left intact so `u` can spawn it again. For
+    /// docs (todos / scratchpads) this is a no-op since they have nothing
+    /// to stop.
+    fn stop_focused(&mut self) {
+        match self.focused_target() {
+            Some(ItemTarget::Process(id)) => {
+                if let Some(pane) = self.process_pane(id) {
+                    close_pane_with_id(pane);
+                }
+            }
+            Some(ItemTarget::Pane(pane)) => {
+                close_pane_with_id(pane);
+            }
+            _ => {}
+        }
+    }
+
+    /// Run `panopt <args>` in the background, scoped to the project cwd.
+    /// The plugin does not subscribe to `RunCommandResult` - the 1-second
+    /// reload timer picks up the mutated projection within a tick.
+    fn run_panopt(&self, args: &[&str], cwd: PathBuf) {
+        let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
+        full.push(self.panopt_bin.as_str());
+        full.extend_from_slice(args);
+        run_command_with_env_variables_and_cwd(&full, BTreeMap::new(), cwd, BTreeMap::new());
     }
 
     // --- slot routing ---
