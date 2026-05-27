@@ -570,6 +570,13 @@ impl ZellijPlugin for PanoptPane {
                 }
                 self.reload_data();
                 self.rebuild_items();
+                // PaneUpdate-driven `sync_pane_titles` only fires when Zellij
+                // sends a pane manifest - typing into the form does not. Without
+                // this call, every right-pane title (most visibly a freshly
+                // promoted "Todo #N - ...") would freeze at whatever value it
+                // held when the last PaneUpdate landed, even after autosaves
+                // have refreshed `self.todos` from the projection.
+                self.sync_pane_titles();
                 set_timeout(1.0);
                 true
             }
