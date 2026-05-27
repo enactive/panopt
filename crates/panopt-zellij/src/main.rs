@@ -201,6 +201,90 @@ fn parse_status_suffix(label: &str) -> Option<&str> {
     .then_some(token)
 }
 
+/// Extract the wire priority token from a projection-index label suffix
+/// like `wire up auth - open, high`. Returns `None` for labels without a
+/// known suffix.
+fn parse_priority_suffix(label: &str) -> Option<&str> {
+    let dash = label.rfind(" - ")?;
+    let rest = &label[dash + 3..];
+    let comma = rest.find(',')?;
+    let token = rest[comma + 1..].trim();
+    matches!(token, "high" | "medium" | "low").then_some(token)
+}
+
+/// One axis of the two-level todo sort. The sidebar carries two of these
+/// (level 1 / level 2) and applies them as a stable two-pass sort, so equal
+/// keys on level 1 are broken by level 2.
+///
+/// The sidebar reads only the projection index, which carries status and
+/// priority but no per-todo timestamps. The created/modified axes therefore
+/// degrade to **id order** (project ids are monotonic, so id asc ≡
+/// creation order asc; modified date falls back to the same proxy). This
+/// mirrors the existing `OpenUnblocked → Open` degradation in
+/// [`TodoFilter::includes_label`]. The viewer pane on the right uses MCP
+/// and applies the full timestamp-aware sort.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum TodoSort {
+    #[default]
+    PriorityDesc,
+    CreatedAsc,
+    CreatedDesc,
+    ModifiedAsc,
+    ModifiedDesc,
+}
+
+const ALL_TODO_SORTS: [TodoSort; 5] = [
+    TodoSort::PriorityDesc,
+    TodoSort::CreatedAsc,
+    TodoSort::CreatedDesc,
+    TodoSort::ModifiedAsc,
+    TodoSort::ModifiedDesc,
+];
+
+impl TodoSort {
+    /// Display label. `/` indicates ascending (low → high), `\` indicates
+    /// descending (high → low); priority is single-direction (high → low)
+    /// so it carries no suffix.
+    fn label(self) -> &'static str {
+        match self {
+            TodoSort::PriorityDesc => "priority",
+            TodoSort::CreatedAsc => "created-/",
+            TodoSort::CreatedDesc => "created-\\",
+            TodoSort::ModifiedAsc => "modified-/",
+            TodoSort::ModifiedDesc => "modified-\\",
+        }
+    }
+
+    fn next(self) -> TodoSort {
+        let i = ALL_TODO_SORTS.iter().position(|x| *x == self).unwrap_or(0);
+        ALL_TODO_SORTS[(i + 1) % ALL_TODO_SORTS.len()]
+    }
+
+    fn prev(self) -> TodoSort {
+        let i = ALL_TODO_SORTS.iter().position(|x| *x == self).unwrap_or(0);
+        ALL_TODO_SORTS[(i + ALL_TODO_SORTS.len() - 1) % ALL_TODO_SORTS.len()]
+    }
+
+    /// Compare two projection rows on this axis. The sidebar's row shape is
+    /// `(id, label)`; priority comes from [`parse_priority_suffix`], and the
+    /// time-based axes degrade to comparing ids (see the type doc).
+    fn cmp_rows(self, a: &(u64, String), b: &(u64, String)) -> std::cmp::Ordering {
+        match self {
+            TodoSort::PriorityDesc => {
+                let rank = |label: &str| match parse_priority_suffix(label) {
+                    Some("high") => 3,
+                    Some("medium") => 2,
+                    Some("low") => 1,
+                    _ => 0,
+                };
+                rank(&b.1).cmp(&rank(&a.1))
+            }
+            TodoSort::CreatedAsc | TodoSort::ModifiedAsc => a.0.cmp(&b.0),
+            TodoSort::CreatedDesc | TodoSort::ModifiedDesc => b.0.cmp(&a.0),
+        }
+    }
+}
+
 #[derive(Default)]
 struct PanoptPane {
     /// Which resource kind this plugin instance renders. Set in
@@ -242,6 +326,15 @@ struct PanoptPane {
     /// view as the projection changes underneath. Ignored by every other
     /// mode.
     todo_filter: TodoFilter,
+    /// Primary sort axis for the Todos pane. Cycled with `s` / `S`; default
+    /// [`TodoSort::PriorityDesc`]. Held in-memory only - reset to the
+    /// default on every Zellij restart, same as [`Self::todo_filter`].
+    todo_sort_1: TodoSort,
+    /// Secondary sort axis, applied as a stable tiebreaker. Cycled with
+    /// `d` / `D`. Defaults to [`TodoSort::CreatedAsc`] (oldest first) which
+    /// together with the priority-desc level 1 surfaces the highest-priority
+    /// oldest-open todo at the top.
+    todo_sort_2: TodoSort,
 
     /// Index of the keyboard-selected item. Stays in `0..items.len()`.
     cursor: usize,
@@ -251,6 +344,12 @@ struct PanoptPane {
     /// Last `rows` value passed to [`PanoptPane::render`]. Cached so the key
     /// and mouse handlers can clamp scroll using a single source of truth.
     last_rows: usize,
+    /// Last `cols` value passed to [`PanoptPane::render`]. Cached so
+    /// [`PanoptPane::frame_title`] can fit the title to the pane's width
+    /// (dropping the counts segment when the pane is too narrow to also
+    /// show the filter/sort label, rather than letting Zellij truncate the
+    /// middle of the label - the part the user most wants to read).
+    last_cols: usize,
 
     /// This plugin's own pane id, learned at load - used to return focus to
     /// the plugin pane after a swap.
@@ -402,6 +501,11 @@ impl ZellijPlugin for PanoptPane {
             .get("port")
             .cloned()
             .unwrap_or_else(|| "7600".to_string());
+        // Override the per-field Default for level 2: `TodoSort::default()`
+        // is `PriorityDesc`, but we want a distinct level-2 default so the
+        // initial sort is "priority desc, then oldest first" rather than
+        // both levels being the same axis.
+        self.todo_sort_2 = TodoSort::CreatedAsc;
         self.plugin_pane = Some(PaneId::Plugin(get_plugin_ids().plugin_id));
         // The Todos pane is the only instance that boots a fresh cockpit (it
         // is the first pane Zellij loads in the layout); have it clear stale
@@ -518,6 +622,11 @@ impl ZellijPlugin for PanoptPane {
 
     fn render(&mut self, rows: usize, cols: usize) {
         self.last_rows = rows;
+        self.last_cols = cols;
+        // A resize can shrink the title budget; re-evaluate so the title
+        // sheds its counts segment (rather than letting Zellij mid-truncate)
+        // when the pane narrows past the filter/sort label width.
+        self.sync_frame_title();
         // The plugin's stdout becomes the pane content. The mode label
         // lives in Zellij's frame title (set by `sync_frame_title` from
         // `update`); the pane body is just the item list.
@@ -529,36 +638,49 @@ impl ZellijPlugin for PanoptPane {
         // pane's scrollback (and the "n/m" indicator Zellij overlays on the
         // frame) by one row per render.
         let total = self.items.len();
-        let visible = rows.max(1);
+        // Item area = body minus the reserved status-line row (Todos only).
+        let visible = self.list_rows();
         let max_scroll = total.saturating_sub(visible);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
-        // Wipe every visible row first, so a shrinking list (or stale
-        // content from a previous render) cannot leak through. `\x1b[3J`
-        // also drops anything sitting in the pane's scrollback buffer -
-        // pane resizes (and any stray newline that leaks past the visible
-        // bottom) push rows into scrollback, and Zellij overlays that row
-        // count on the frame as `n/m`; clearing it each render keeps the
-        // indicator at zero.
+        // Wipe every body row first, so a shrinking list (or stale content
+        // from a previous render) cannot leak through. `\x1b[3J` also drops
+        // anything sitting in the pane's scrollback buffer - pane resizes
+        // (and any stray newline that leaks past the visible bottom) push
+        // rows into scrollback, and Zellij overlays that row count on the
+        // frame as `n/m`; clearing it each render keeps the indicator at
+        // zero. We wipe `rows` rows (the full body) so the reserved
+        // status-line row also starts clean.
         print!("\u{1b}[3J");
-        for row in 1..=visible {
+        let body_rows = rows.max(1);
+        for row in 1..=body_rows {
             print!("\u{1b}[{row};1H\u{1b}[2K");
         }
         if total == 0 {
             print!("\u{1b}[1;1H{}", paint("  (none)", cols, Style::Dim, false));
-            return;
+        } else {
+            let end = (self.scroll + visible).min(total);
+            for (slot, idx) in (self.scroll..end).enumerate() {
+                let item = &self.items[idx];
+                let marker = if item.live { '*' } else { ' ' };
+                let line = format!(" {marker}{}", item.label);
+                let focused = idx == self.cursor;
+                print!(
+                    "\u{1b}[{};1H{}",
+                    slot + 1,
+                    paint(&line, cols, Style::Normal, focused)
+                );
+            }
         }
-        let end = (self.scroll + visible).min(total);
-        for (slot, idx) in (self.scroll..end).enumerate() {
-            let item = &self.items[idx];
-            let marker = if item.live { '*' } else { ' ' };
-            let line = format!(" {marker}{}", item.label);
-            let focused = idx == self.cursor;
+        // Status line: the very bottom body row, reserved by `list_rows()`
+        // in Todos mode. Other modes don't reserve, so don't draw here.
+        if self.mode == Mode::Todos && body_rows >= 2 {
+            let status = self.status_line();
             print!(
                 "\u{1b}[{};1H{}",
-                slot + 1,
-                paint(&line, cols, Style::Normal, focused)
+                body_rows,
+                paint(&status, cols, Style::Dim, false)
             );
         }
     }
@@ -584,24 +706,55 @@ impl PanoptPane {
             }
         }
         let total = self.items.len();
-        let visible = self.last_rows.max(1);
-        // Todos pane carries an extra filter segment so the user can tell at
-        // a glance what slice of todos the list is showing. Other modes keep
-        // the bare title.
-        let filter_seg = if self.mode == Mode::Todos {
-            format!(" [{}]", self.todo_filter.label())
+        let visible = self.list_rows();
+        // Todos pane: advertise the `n` create-new binding and the `f/F`
+        // filter cycle inline with their current values. Sort axes live in
+        // the bottom status line (no bottom-border API in Zellij). Other
+        // modes keep the bare label until they get their own action hints.
+        let action_seg = if self.mode == Mode::Todos {
+            format!(": (n)ew, (fF):{}", self.todo_filter.label())
         } else {
             String::new()
         };
-        if total == 0 {
-            return format!("{base}{filter_seg}");
+        let counts_seg = if total == 0 {
+            String::new()
+        } else if total <= visible {
+            format!(" ({total})")
+        } else {
+            let start = self.scroll + 1;
+            let end = (self.scroll + visible).min(total);
+            format!(" ({start}-{end}/{total})")
+        };
+        let full = format!("{base}{action_seg}{counts_seg}");
+        // Zellij decorates the frame title with a couple of chars on each
+        // side (`┤ ... ├` plus padding); a small margin keeps us from
+        // tripping the host's mid-string truncation right at the boundary.
+        // `last_cols == 0` is the pre-render state - keep the full title in
+        // that case rather than aggressively trimming on hypothetical width.
+        const FRAME_MARGIN: usize = 4;
+        let budget = self.last_cols.saturating_sub(FRAME_MARGIN);
+        if self.last_cols == 0 || full.chars().count() <= budget {
+            full
+        } else {
+            // Drop the counts; keep the action/filter hints intact. The
+            // user wants the keys advertised - the counts are recoverable
+            // from the body.
+            format!("{base}{action_seg}")
         }
-        if total <= visible {
-            return format!("{base}{filter_seg} ({total})");
-        }
-        let start = self.scroll + 1;
-        let end = (self.scroll + visible).min(total);
-        format!("{base}{filter_seg} ({start}-{end}/{total})")
+    }
+
+    /// The status-line text drawn on the reserved bottom row of the Todos
+    /// pane body. Currently shows the two-level sort axes; the filter stays
+    /// in the top frame title where it has always lived. Zellij gives
+    /// plugins no API to write the bottom *border* (only the top frame
+    /// title via `rename_plugin_pane`), so this is the closest we can get
+    /// to a "bottom title" - a dim status line at the foot of the body.
+    fn status_line(&self) -> String {
+        format!(
+            " (sS):{} (dD):{}",
+            self.todo_sort_1.label(),
+            self.todo_sort_2.label(),
+        )
     }
 
     /// Push the current [`Self::frame_title`] to Zellij as the pane's frame
@@ -911,20 +1064,48 @@ impl PanoptPane {
         self.sync_frame_title();
     }
 
+    /// Step one sort level forward or backward and refresh. `level` is 1
+    /// (`s` / `S`) or 2 (`d` / `D`); other values are no-ops. The cursor
+    /// resets to the top so the user lands on the head of the new ordering
+    /// rather than wherever the previously-selected todo wound up.
+    fn cycle_todo_sort(&mut self, level: u8, forward: bool) {
+        if self.mode != Mode::Todos {
+            return;
+        }
+        let slot = match level {
+            1 => &mut self.todo_sort_1,
+            2 => &mut self.todo_sort_2,
+            _ => return,
+        };
+        *slot = if forward { slot.next() } else { slot.prev() };
+        self.cursor = 0;
+        self.scroll = 0;
+        self.rebuild_items();
+        self.sync_frame_title();
+    }
+
     /// Rebuild this pane's item list from parsed data + live panes. The list
     /// is always a single flat sequence for the pane's mode.
     fn rebuild_items(&mut self) {
         let items: Vec<Item> = match self.mode {
-            Mode::Todos => self
-                .todos
-                .iter()
-                .filter(|(_, label)| self.todo_filter.includes_label(label))
-                .map(|(id, label)| Item {
-                    label: format!("#{id} {label}"),
-                    target: ItemTarget::Todo(*id),
-                    live: false,
-                })
-                .collect(),
+            Mode::Todos => {
+                let mut rows: Vec<&(u64, String)> = self
+                    .todos
+                    .iter()
+                    .filter(|(_, label)| self.todo_filter.includes_label(label))
+                    .collect();
+                // Stable two-pass sort: level 2 first, then level 1, so
+                // ties on level 1 keep the level-2 ordering.
+                rows.sort_by(|a, b| self.todo_sort_2.cmp_rows(a, b));
+                rows.sort_by(|a, b| self.todo_sort_1.cmp_rows(a, b));
+                rows.into_iter()
+                    .map(|(id, label)| Item {
+                        label: format!("#{id} {label}"),
+                        target: ItemTarget::Todo(*id),
+                        live: false,
+                    })
+                    .collect()
+            }
             Mode::Scratchpads => self
                 .scratchpads
                 .iter()
@@ -991,7 +1172,7 @@ impl PanoptPane {
         if self.cursor >= self.items.len() {
             self.cursor = self.items.len() - 1;
         }
-        let visible = self.last_rows.max(1);
+        let visible = self.list_rows();
         let max_scroll = self.items.len().saturating_sub(visible);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
@@ -1008,7 +1189,7 @@ impl PanoptPane {
             return false;
         }
         let count = self.items.len();
-        let visible = self.last_rows.max(1);
+        let visible = self.list_rows();
         let new = (self.cursor as i64 + delta).clamp(0, count as i64 - 1) as usize;
         let moved = new != self.cursor;
         self.cursor = new;
@@ -1082,10 +1263,13 @@ impl PanoptPane {
             }
             BareKey::Enter => self.activate_cursor(),
             BareKey::Char('a') => self.spawn_agent_pane(None),
-            BareKey::Char('c') if self.mode == Mode::Todos => {
+            BareKey::Char('e') if self.mode == Mode::Todos => self.edit_focused_todo(),
+            // `n` creates a new item of the current pane type. The kind
+            // tracks the mode so a single binding gives the user "new"
+            // semantics everywhere it makes sense.
+            BareKey::Char('n') if self.mode == Mode::Todos => {
                 self.open_document("new-todo", None, true)
             }
-            BareKey::Char('e') if self.mode == Mode::Todos => self.edit_focused_todo(),
             BareKey::Char('n') if self.mode == Mode::Scratchpads => {
                 self.open_document("new-scratchpad", None, true)
             }
@@ -1095,9 +1279,15 @@ impl PanoptPane {
             // through to the no-op stubs below.
             BareKey::Char('f') if self.mode == Mode::Todos => self.cycle_todo_filter(true),
             BareKey::Char('F') if self.mode == Mode::Todos => self.cycle_todo_filter(false),
-            // `/` (filter) and `s` (sort) are stubs - the keys are reserved
-            // for future sort/filter behavior but do nothing today.
-            BareKey::Char('/') | BareKey::Char('s') => {}
+            // Two-level sort: `s`/`S` cycles level 1, `d`/`D` cycles level 2.
+            // Only meaningful in the Todos pane.
+            BareKey::Char('s') if self.mode == Mode::Todos => self.cycle_todo_sort(1, true),
+            BareKey::Char('S') if self.mode == Mode::Todos => self.cycle_todo_sort(1, false),
+            BareKey::Char('d') if self.mode == Mode::Todos => self.cycle_todo_sort(2, true),
+            BareKey::Char('D') if self.mode == Mode::Todos => self.cycle_todo_sort(2, false),
+            // `/` is a stub - the key is reserved for future filter behavior
+            // but does nothing today.
+            BareKey::Char('/') => {}
             _ => return false,
         }
         true
@@ -1138,7 +1328,18 @@ impl PanoptPane {
 
     /// Step size for PageUp/PageDown - one screenful of visible items.
     fn page_step(&self) -> usize {
-        self.last_rows.max(1)
+        self.list_rows()
+    }
+
+    /// Number of body rows available for items. In the Todos pane the
+    /// bottom body row is reserved as a status line (sort indicator), so
+    /// the list area is one row shorter than what Zellij hands us. Every
+    /// scroll / clamp / page-step computation goes through this single
+    /// source of truth so the status-line row never gets covered by an
+    /// item or counted toward the visible window.
+    fn list_rows(&self) -> usize {
+        let reserve = if self.mode == Mode::Todos { 1 } else { 0 };
+        self.last_rows.saturating_sub(reserve).max(1)
     }
 
     /// Act on the cursor's row from the keyboard (Enter): focus moves onto
@@ -2160,26 +2361,26 @@ mod tests {
 
     #[test]
     fn scroll_pages_when_cursor_passes_the_visible_window() {
-        // last_rows = 10 -> visible = 10 items (the mode label lives in the
-        // pane's frame title, so the body uses every row for items).
+        // last_rows = 10, Todos pane reserves the bottom row for the sort
+        // status line, so list_rows() = 9 items visible.
         let mut pane = todos_pane(20);
-        // Move cursor down through the visible window; the 10th step lands
-        // on cursor 9, which is the last row still in view (scroll stays).
-        for _ in 0..9 {
+        // Move cursor down through the visible window; the 9th step lands
+        // on cursor 8, which is the last row still in view (scroll stays).
+        for _ in 0..8 {
             pane.move_cursor(1);
         }
-        assert_eq!(pane.cursor, 9);
+        assert_eq!(pane.cursor, 8);
         assert_eq!(pane.scroll, 0, "scroll: {}", pane.scroll);
         // The next step pushes cursor past the bottom edge, scroll jumps to 1.
         pane.move_cursor(1);
-        assert_eq!(pane.cursor, 10);
+        assert_eq!(pane.cursor, 9);
         assert_eq!(pane.scroll, 1);
         // Continue past the end: scroll keeps pace.
-        for _ in 0..9 {
+        for _ in 0..10 {
             pane.move_cursor(1);
         }
         assert_eq!(pane.cursor, 19);
-        assert_eq!(pane.scroll, 10); // cursor(19) + 1 - visible(10) = 10
+        assert_eq!(pane.scroll, 11); // cursor(19) + 1 - visible(9) = 11
     }
 
     #[test]

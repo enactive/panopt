@@ -143,11 +143,12 @@ enum Content {
 }
 
 /// One row of a list view: where selecting it routes, its display label, and
-/// the metadata the filter needs.
+/// the metadata the filter and sort need.
 ///
-/// `status` and `is_blocked` are only populated for todo entries; scratchpad
-/// entries leave them at their defaults and the [`TodoFilter`] simply never
-/// hides scratchpad entries.
+/// `status`, `is_blocked`, `priority`, `created_at`, and `updated_at` are only
+/// populated for todo entries loaded via MCP; scratchpad entries and the
+/// fallback projection-reader leave them at `None`/default, and the
+/// [`TodoFilter`] / [`TodoSort`] simply never hide or reorder them.
 struct ListEntry {
     target: Target,
     label: String,
@@ -157,6 +158,16 @@ struct ListEntry {
     /// True when this todo has at least one blocker. Always false for non-todo
     /// entries.
     is_blocked: bool,
+    /// The todo's priority token (one of "high", "medium", "low"). `None`
+    /// for non-todo entries and for projection-fallback rows that don't
+    /// carry priority.
+    priority: Option<String>,
+    /// SQLite-formatted timestamp ("YYYY-MM-DD HH:MM:SS"); lexicographic
+    /// order matches chronological order, so the sort comparator can compare
+    /// the strings directly. `None` for non-todo entries.
+    created_at: Option<String>,
+    /// SQLite-formatted timestamp; see [`Self::created_at`].
+    updated_at: Option<String>,
 }
 
 /// What subset of todos the list view shows. Applied to a todo `ListEntry`'s
@@ -250,6 +261,124 @@ const ALL_FILTERS: [TodoFilter; 7] = [
     TodoFilter::NotDone,
 ];
 
+/// One axis of the two-level todo sort. The list view carries two of these
+/// (level 1 / level 2) and applies them as a stable two-pass sort, so equal
+/// keys on level 1 are broken by level 2. Each axis maps a [`ListEntry`] to
+/// an `Ordering` via [`Self::cmp_entries`].
+///
+/// `PriorityDesc` is the only priority axis - low → high is rarely useful.
+/// Created and modified date each get both directions because either makes
+/// sense depending on what the user is hunting for (newest activity vs.
+/// oldest unfinished).
+/// Level 1's default is `PriorityDesc`; level 2 defaults to
+/// [`TodoSort::CreatedAsc`] in [`Viewer::new`] - the two levels have
+/// different defaults, so the `Default` value alone doesn't tell the whole
+/// story.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum TodoSort {
+    #[default]
+    PriorityDesc,
+    CreatedAsc,
+    CreatedDesc,
+    ModifiedAsc,
+    ModifiedDesc,
+}
+
+impl TodoSort {
+    /// Display label. `/` indicates ascending (low → high), `\` indicates
+    /// descending (high → low); priority is single-direction (high → low)
+    /// so it carries no suffix. Also the viewstate-stored token via
+    /// [`Self::as_key`] - the display form doubles as the persistence
+    /// form, so a label tweak invalidates any persisted prefs and falls
+    /// back to the default through [`Self::parse`].
+    fn label(self) -> &'static str {
+        match self {
+            TodoSort::PriorityDesc => "priority",
+            TodoSort::CreatedAsc => "created-/",
+            TodoSort::CreatedDesc => "created-\\",
+            TodoSort::ModifiedAsc => "modified-/",
+            TodoSort::ModifiedDesc => "modified-\\",
+        }
+    }
+
+    /// The serialised form used by viewstate, identical to [`Self::label`].
+    fn as_key(self) -> &'static str {
+        self.label()
+    }
+
+    /// Parse a viewstate-stored token, defaulting to [`TodoSort::default`]
+    /// on an unrecognised value.
+    fn parse(s: &str) -> TodoSort {
+        ALL_SORTS
+            .iter()
+            .copied()
+            .find(|x| x.as_key() == s)
+            .unwrap_or_default()
+    }
+
+    /// Next sort in the cycle, wrapping at the end.
+    fn next(self) -> TodoSort {
+        let i = ALL_SORTS.iter().position(|x| *x == self).unwrap_or(0);
+        ALL_SORTS[(i + 1) % ALL_SORTS.len()]
+    }
+
+    /// Previous sort in the cycle, wrapping at the start.
+    fn prev(self) -> TodoSort {
+        let i = ALL_SORTS.iter().position(|x| *x == self).unwrap_or(0);
+        ALL_SORTS[(i + ALL_SORTS.len() - 1) % ALL_SORTS.len()]
+    }
+
+    /// Compare two entries on this axis. Entries that lack the field this
+    /// axis reads sort after entries that have it (so missing data lands at
+    /// the end of the list rather than mixed in).
+    fn cmp_entries(self, a: &ListEntry, b: &ListEntry) -> std::cmp::Ordering {
+        match self {
+            TodoSort::PriorityDesc => {
+                let rank = |p: &Option<String>| match p.as_deref() {
+                    Some("high") => 3,
+                    Some("medium") => 2,
+                    Some("low") => 1,
+                    _ => 0,
+                };
+                rank(&b.priority).cmp(&rank(&a.priority))
+            }
+            TodoSort::CreatedAsc => cmp_opt_str(&a.created_at, &b.created_at, true),
+            TodoSort::CreatedDesc => cmp_opt_str(&a.created_at, &b.created_at, false),
+            TodoSort::ModifiedAsc => cmp_opt_str(&a.updated_at, &b.updated_at, true),
+            TodoSort::ModifiedDesc => cmp_opt_str(&a.updated_at, &b.updated_at, false),
+        }
+    }
+}
+
+/// Compare two `Option<String>` slots. `Some` always orders before `None`
+/// (data first, missing data sinks to the end) regardless of direction; the
+/// `ascending` flag only affects the `Some`/`Some` case.
+fn cmp_opt_str(a: &Option<String>, b: &Option<String>, ascending: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            if ascending {
+                x.cmp(y)
+            } else {
+                y.cmp(x)
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Every [`TodoSort`] variant in cycle order, used by the `s` / `S` and
+/// `d` / `D` keys and by [`TodoSort::parse`].
+const ALL_SORTS: [TodoSort; 5] = [
+    TodoSort::PriorityDesc,
+    TodoSort::CreatedAsc,
+    TodoSort::CreatedDesc,
+    TodoSort::ModifiedAsc,
+    TodoSort::ModifiedDesc,
+];
+
 /// Run the viewer. `slot` is the routing token the plugin assigned this pane;
 /// `kind`/`id` are the initial item. The MCP URL is built from `ws` + `port`
 /// so the form modes can call the daemon.
@@ -323,6 +452,15 @@ struct Viewer {
     /// kept around but ignored, so leaving the list and coming back lands on
     /// the same filter the user last set.
     todo_filter: TodoFilter,
+    /// Primary sort axis for the todo list. Restored from viewstate with the
+    /// same scoping as [`Self::todo_filter`]. Default is
+    /// [`TodoSort::PriorityDesc`].
+    todo_sort_1: TodoSort,
+    /// Secondary sort axis, used as a stable tiebreaker for level 1.
+    /// Default is [`TodoSort::CreatedAsc`] (oldest first), which together
+    /// with the priority-desc level 1 surfaces the highest-priority
+    /// oldest-open todo at the top - the most likely thing to pick up next.
+    todo_sort_2: TodoSort,
     last_refresh: Instant,
     needs_draw: bool,
 }
@@ -341,6 +479,18 @@ impl Viewer {
             .and_then(Value::as_str)
             .map(TodoFilter::parse)
             .unwrap_or_default();
+        let todo_sort_1 = vs
+            .extras
+            .get("todo_sort_1")
+            .and_then(Value::as_str)
+            .map(TodoSort::parse)
+            .unwrap_or(TodoSort::PriorityDesc);
+        let todo_sort_2 = vs
+            .extras
+            .get("todo_sort_2")
+            .and_then(Value::as_str)
+            .map(TodoSort::parse)
+            .unwrap_or(TodoSort::CreatedAsc);
         let mut viewer = Viewer {
             ws,
             url,
@@ -353,6 +503,8 @@ impl Viewer {
             cursor: vs.cursor,
             viewport: 1,
             todo_filter,
+            todo_sort_1,
+            todo_sort_2,
             last_refresh: Instant::now(),
             needs_draw: true,
         };
@@ -442,6 +594,12 @@ impl Viewer {
                     // other targets so the binding does not collide there.
                     KeyCode::Char('f') => self.cycle_filter(true),
                     KeyCode::Char('F') => self.cycle_filter(false),
+                    // Two-level sort: `s`/`S` cycles level 1, `d`/`D` cycles
+                    // level 2. Same target-scoping as the filter keys above.
+                    KeyCode::Char('s') => self.cycle_sort(1, true),
+                    KeyCode::Char('S') => self.cycle_sort(1, false),
+                    KeyCode::Char('d') => self.cycle_sort(2, true),
+                    KeyCode::Char('D') => self.cycle_sort(2, false),
                     _ => return false,
                 }
                 self.needs_draw = true;
@@ -543,25 +701,35 @@ impl Viewer {
         }
     }
 
-    /// The indices of `Content::List` entries that pass the current filter.
-    /// For non-todo lists (and for non-list content), the filter is the
-    /// identity, so this returns every index.
+    /// The indices of `Content::List` entries that pass the current filter,
+    /// in display order. For [`Target::TodoList`] the indices are reordered
+    /// by [`Self::todo_sort_1`] then [`Self::todo_sort_2`] (a stable sort,
+    /// so equal level-1 keys keep their level-2 ordering). For other targets
+    /// the filter is the identity and no sort is applied, so this returns
+    /// every index in source order.
     fn visible_indices(&self) -> Vec<usize> {
         let Content::List(entries) = &self.content else {
             return Vec::new();
         };
-        let apply_filter = matches!(self.target, Target::TodoList);
-        entries
+        let is_todo_list = matches!(self.target, Target::TodoList);
+        let mut visible: Vec<usize> = entries
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
-                if !apply_filter || self.todo_filter.includes(e) {
+                if !is_todo_list || self.todo_filter.includes(e) {
                     Some(i)
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect();
+        if is_todo_list {
+            // Stable sort by level 2 first, then by level 1: ties on level 1
+            // preserve the level-2 ordering established by the first pass.
+            visible.sort_by(|&i, &j| self.todo_sort_2.cmp_entries(&entries[i], &entries[j]));
+            visible.sort_by(|&i, &j| self.todo_sort_1.cmp_entries(&entries[i], &entries[j]));
+        }
+        visible
     }
 
     /// Cycle the todo filter forward (`f`) or backward (`F`). No-op when the
@@ -581,6 +749,27 @@ impl Viewer {
         if self.cursor >= visible_len {
             self.cursor = visible_len.saturating_sub(1);
         }
+        self.persist_viewstate();
+        self.needs_draw = true;
+    }
+
+    /// Cycle one sort level forward or backward. `level` is 1 (`s` / `S`)
+    /// or 2 (`d` / `D`); any other value is a no-op. No-op when the active
+    /// target isn't the todo list. Reordering does not change which entries
+    /// are visible, but the selected row may now point at a different todo;
+    /// reset the cursor to the top so the user sees the new ordering from
+    /// its head rather than scrolled into the middle.
+    fn cycle_sort(&mut self, level: u8, forward: bool) {
+        if !matches!(self.target, Target::TodoList) {
+            return;
+        }
+        let slot = match level {
+            1 => &mut self.todo_sort_1,
+            2 => &mut self.todo_sort_2,
+            _ => return,
+        };
+        *slot = if forward { slot.next() } else { slot.prev() };
+        self.cursor = 0;
         self.persist_viewstate();
         self.needs_draw = true;
     }
@@ -613,18 +802,38 @@ impl Viewer {
             .and_then(Value::as_str)
             .map(TodoFilter::parse)
             .unwrap_or_default();
+        self.todo_sort_1 = vs
+            .extras
+            .get("todo_sort_1")
+            .and_then(Value::as_str)
+            .map(TodoSort::parse)
+            .unwrap_or(TodoSort::PriorityDesc);
+        self.todo_sort_2 = vs
+            .extras
+            .get("todo_sort_2")
+            .and_then(Value::as_str)
+            .map(TodoSort::parse)
+            .unwrap_or(TodoSort::CreatedAsc);
         self.reload_content();
         self.needs_draw = true;
     }
 
-    /// Persist the current target's scroll, cursor, and filter so reopening
-    /// the same item or list lands on the same row and view.
+    /// Persist the current target's scroll, cursor, filter, and sort so
+    /// reopening the same item or list lands on the same row and view.
     fn persist_viewstate(&self) {
         let mut extras = serde_json::Map::new();
         if matches!(self.target, Target::TodoList) {
             extras.insert(
                 "todo_filter".into(),
                 Value::String(self.todo_filter.as_key().to_string()),
+            );
+            extras.insert(
+                "todo_sort_1".into(),
+                Value::String(self.todo_sort_1.as_key().to_string()),
+            );
+            extras.insert(
+                "todo_sort_2".into(),
+                Value::String(self.todo_sort_2.as_key().to_string()),
             );
         }
         viewstate::set(
@@ -864,8 +1073,10 @@ impl Viewer {
             Target::TodoList => {
                 let (visible, total) = self.list_counts();
                 format!(
-                    " Todos  ·  {} ({visible}/{total})",
-                    self.todo_filter.label()
+                    " Todos  ·  {}  ·  {}/{}  ({visible}/{total})",
+                    self.todo_filter.label(),
+                    self.todo_sort_1.label(),
+                    self.todo_sort_2.label(),
                 )
             }
             Target::ScratchpadList => " Scratchpads".to_string(),
@@ -888,7 +1099,7 @@ impl Viewer {
             // in form mode, but we still produce a string for the type's sake.
             String::new()
         } else if matches!(self.target, Target::TodoList) {
-            " j/k move   Enter open   f/F filter   q close".to_string()
+            " j/k move   Enter open   f/F filter   s/S sort1   d/D sort2   q close".to_string()
         } else if self.target.is_list() {
             " j/k move   Enter open   q close".to_string()
         } else {
@@ -941,6 +1152,9 @@ fn read_index(path: Option<&Path>, into_target: impl Fn(u64) -> Target) -> Vec<L
             label: format!("#{id} {title}"),
             status: None,
             is_blocked: false,
+            priority: None,
+            created_at: None,
+            updated_at: None,
         })
         .collect()
 }
@@ -964,6 +1178,13 @@ fn read_todo_index(path: Option<&Path>) -> Vec<ListEntry> {
                 label: format!("#{id} {label}"),
                 status,
                 is_blocked: false,
+                // Projection fallback path: priority and timestamps aren't
+                // recorded per row in the index. Sort axes that read these
+                // fields will treat all entries as missing-data and leave
+                // them in id order from the projection.
+                priority: None,
+                created_at: None,
+                updated_at: None,
             }
         })
         .collect()
@@ -1000,13 +1221,18 @@ fn load_todo_list(url: &str) -> Result<Vec<ListEntry>> {
             let id = t["id"].as_u64()?;
             let title = t["title"].as_str().unwrap_or("");
             let status = t["status"].as_str().unwrap_or("open").to_string();
-            let priority = t["priority"].as_str().unwrap_or("medium");
+            let priority = t["priority"].as_str().unwrap_or("medium").to_string();
             let blockers = t["blockers"].as_array().map(|a| a.len()).unwrap_or(0);
+            let created_at = t["created_at"].as_str().map(str::to_string);
+            let updated_at = t["updated_at"].as_str().map(str::to_string);
             Some(ListEntry {
                 target: Target::Todo(id),
                 label: format!("#{id} {title} - {status}, {priority}"),
                 status: Some(status),
                 is_blocked: blockers > 0,
+                priority: Some(priority),
+                created_at,
+                updated_at,
             })
         })
         .collect())
@@ -1143,6 +1369,9 @@ mod tests {
                 // so every entry is visible regardless of status.
                 status: Some("open".to_string()),
                 is_blocked: false,
+                priority: None,
+                created_at: None,
+                updated_at: None,
             })
             .collect();
         Viewer {
@@ -1157,6 +1386,8 @@ mod tests {
             cursor,
             viewport,
             todo_filter: TodoFilter::All,
+            todo_sort_1: TodoSort::PriorityDesc,
+            todo_sort_2: TodoSort::CreatedAsc,
             last_refresh: Instant::now(),
             needs_draw: false,
         }
@@ -1212,6 +1443,9 @@ mod tests {
                 label: format!("#{} t", i + 1),
                 status: Some((*status).to_string()),
                 is_blocked: *blocked,
+                priority: None,
+                created_at: None,
+                updated_at: None,
             })
             .collect();
         Viewer {
@@ -1226,6 +1460,8 @@ mod tests {
             cursor: 0,
             viewport: 5,
             todo_filter: filter,
+            todo_sort_1: TodoSort::PriorityDesc,
+            todo_sort_2: TodoSort::CreatedAsc,
             last_refresh: Instant::now(),
             needs_draw: false,
         }

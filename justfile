@@ -60,11 +60,14 @@ logs:
 # debug daemon, or `just restart-daemon` to swap the daemon out without
 # touching the cockpit.
 #
-# Launch the cockpit in the current project (debug binaries). `cargo build`
-# runs first so `panoptd` reflects the latest sources; without it,
-# `cargo run -p panopt` would happily re-spawn yesterday's `panoptd` from
-# `target/debug/`.
-up:
+# Launch the cockpit in the current project (debug binaries). Build the
+# workspace AND the release wasm plugin first so `panoptd` and the sidebar
+# plugin both reflect the latest sources; without these, `cargo run -p
+# panopt` would happily re-spawn yesterday's `panoptd` from `target/debug/`
+# and Zellij would load yesterday's plugin from
+# `crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm`
+# (the path `panopt up` auto-detects in `default_plugin_wasm`).
+up: plugin-release
     cargo build --workspace
     cargo run -p panopt -- up
 

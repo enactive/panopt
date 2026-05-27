@@ -89,6 +89,8 @@ struct TodoSummaryDto {
     tags: Vec<String>,
     blockers: Vec<u64>,
     comment_count: usize,
+    created_at: String,
+    updated_at: String,
 }
 
 impl TodoSummaryDto {
@@ -102,6 +104,8 @@ impl TodoSummaryDto {
             tags: todo.tags.clone(),
             blockers: todo.blockers.clone(),
             comment_count: todo.comments.len(),
+            created_at: todo.created_at.clone(),
+            updated_at: todo.updated_at.clone(),
         }
     }
 }
@@ -723,8 +727,8 @@ impl Handler {
     }
 
     #[tool(description = "List all todos as a JSON array of {id, title, status, priority, \
-                          assignee, tags, blockers, comment_count}. Use todo_get for a todo's \
-                          body and comment thread.")]
+                          assignee, tags, blockers, comment_count, created_at, updated_at}. \
+                          Use todo_get for a todo's body and comment thread.")]
     async fn todo_list(
         &self,
         Extension(parts): Extension<Parts>,
