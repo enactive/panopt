@@ -77,6 +77,28 @@ stop:
     @sleep 1
     -pkill -TERM -x panoptd
 
+# Nuke EVERYTHING and start over: kill every panopt-* Zellij session (which
+# tears down the loaded wasm plugin and every `_viewer` / `_agent` /
+# `_process-run` subprocess), kill the daemon, rebuild workspace + release
+# wasm, then `panopt up`. Use when a code change spans the daemon, the
+# binaries, and/or the plugin and you want the running cockpit to actually
+# reflect HEAD. Must be run from a plain shell (not inside Zellij).
+refresh:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${ZELLIJ:-}" ]; then
+        echo "run \`just refresh\` from a plain shell, not inside Zellij" >&2
+        exit 1
+    fi
+    zellij list-sessions -sn 2>/dev/null | grep '^panopt-' | while read -r s; do
+        zellij kill-session "$s" 2>/dev/null || true
+        zellij delete-session "$s" 2>/dev/null || true
+    done
+    pkill -TERM -x panoptd 2>/dev/null || true
+    sleep 1
+    pkill -TERM -x panoptd 2>/dev/null || true
+    just up
+
 # Rebuild panoptd, stop the running daemon, and re-launch it detached. The
 # cockpit's MCP clients reconnect on the next call, so this is the
 # ergonomic path while a cockpit is open: edit handler code, `just

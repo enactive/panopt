@@ -10,11 +10,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Subcommand;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 use crate::daemon;
 use crate::mcpclient::Client;
-use crate::todo::observer_url;
+use crate::todo::{insert_opt, observer_url};
 
 /// What to do to the project's scratchpads.
 #[derive(Subcommand)]
@@ -23,6 +23,15 @@ pub enum ScratchpadCmd {
     Rm {
         /// Numeric id of the scratchpad to delete.
         id: u64,
+    },
+    /// Edit a scratchpad's title or body. Omitted options are left unchanged.
+    Set {
+        /// Numeric id of the scratchpad to edit.
+        id: u64,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
     },
 }
 
@@ -40,6 +49,14 @@ fn dispatch(client: &Client, cmd: ScratchpadCmd) -> Result<()> {
         ScratchpadCmd::Rm { id } => {
             client.call("scratchpad_delete", json!({ "scratchpad_id": id }))?;
             println!("deleted scratchpad #{id}");
+        }
+        ScratchpadCmd::Set { id, title, body } => {
+            let mut args = Map::new();
+            args.insert("scratchpad_id".into(), json!(id));
+            insert_opt(&mut args, "title", title);
+            insert_opt(&mut args, "body", body);
+            client.call("scratchpad_update", Value::Object(args))?;
+            println!("updated scratchpad #{id}");
         }
     }
     Ok(())

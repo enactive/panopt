@@ -153,7 +153,7 @@ struct ListEntry {
     target: Target,
     label: String,
     /// The todo's status token (one of "open", "in_progress", "backlog",
-    /// "completed", "not_done"). `None` for non-todo entries.
+    /// "draft", "completed", "not_done"). `None` for non-todo entries.
     status: Option<String>,
     /// True when this todo has at least one blocker. Always false for non-todo
     /// entries.
@@ -184,6 +184,7 @@ enum TodoFilter {
     OpenUnblocked,
     InProgress,
     Backlog,
+    Draft,
     Completed,
     NotDone,
 }
@@ -197,6 +198,7 @@ impl TodoFilter {
             TodoFilter::OpenUnblocked => "open-unblocked",
             TodoFilter::InProgress => "in_progress",
             TodoFilter::Backlog => "backlog",
+            TodoFilter::Draft => "draft",
             TodoFilter::Completed => "completed",
             TodoFilter::NotDone => "not_done",
         }
@@ -243,6 +245,7 @@ impl TodoFilter {
             TodoFilter::OpenUnblocked => status == "open" && !entry.is_blocked,
             TodoFilter::InProgress => status == "in_progress",
             TodoFilter::Backlog => status == "backlog",
+            TodoFilter::Draft => status == "draft",
             TodoFilter::Completed => status == "completed",
             TodoFilter::NotDone => status == "not_done",
         }
@@ -251,12 +254,13 @@ impl TodoFilter {
 
 /// Every [`TodoFilter`] variant in cycle order, used by the `f` / `F` keys
 /// and by [`TodoFilter::parse`].
-const ALL_FILTERS: [TodoFilter; 7] = [
+const ALL_FILTERS: [TodoFilter; 8] = [
     TodoFilter::All,
     TodoFilter::Open,
     TodoFilter::OpenUnblocked,
     TodoFilter::InProgress,
     TodoFilter::Backlog,
+    TodoFilter::Draft,
     TodoFilter::Completed,
     TodoFilter::NotDone,
 ];
@@ -887,15 +891,24 @@ impl Viewer {
             return;
         }
         // No projection file - form targets refresh through the daemon.
-        if let Content::TodoForm(form) = &mut self.content {
-            match form.refresh_from_daemon() {
+        match &mut self.content {
+            Content::TodoForm(form) => match form.refresh_from_daemon() {
                 Ok(true) => self.needs_draw = true,
                 Ok(false) => {}
                 Err(e) => {
                     form.message = format!("refresh failed: {e:#}");
                     self.needs_draw = true;
                 }
-            }
+            },
+            Content::ScratchpadForm(form) => match form.refresh_from_daemon() {
+                Ok(true) => self.needs_draw = true,
+                Ok(false) => {}
+                Err(e) => {
+                    form.message = format!("refresh failed: {e:#}");
+                    self.needs_draw = true;
+                }
+            },
+            _ => {}
         }
     }
 
@@ -1250,7 +1263,7 @@ fn parse_status_suffix(label: &str) -> Option<String> {
     let token = rest[..comma].trim();
     matches!(
         token,
-        "open" | "in_progress" | "backlog" | "completed" | "not_done"
+        "open" | "in_progress" | "backlog" | "draft" | "completed" | "not_done"
     )
     .then(|| token.to_string())
 }

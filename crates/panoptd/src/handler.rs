@@ -23,13 +23,13 @@ use rmcp::{
 use serde::Serialize;
 
 use crate::params::{
-    AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdentifyArgs,
-    LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs, ProcessGetArgs,
-    ProcessUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs, ScratchpadDeleteArgs,
-    ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs, TodoBlockerArgs,
-    TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs, TodoCompleteArgs,
-    TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs, TodoSetBlockersArgs, TodoUnlockArgs,
-    TodoUpdateArgs,
+    AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
+    IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs,
+    ProcessGetArgs, ProcessUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
+    ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs,
+    TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs,
+    TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs,
+    TodoSetBlockersArgs, TodoUnlockArgs, TodoUpdateArgs,
 };
 
 /// Per-session MCP handler.
@@ -75,6 +75,16 @@ impl ScratchpadDetailDto {
             updated_at: pad.updated_at.clone(),
         }
     }
+}
+
+/// Wire shape for `id_kind`: the resource kind and a short human label
+/// (title for todos/scratchpads, `display_name` falling back to `name` for
+/// agent tools and processes - the same fallback the cockpit's projection
+/// uses).
+#[derive(Serialize)]
+struct IdKindDto {
+    kind: &'static str,
+    label: String,
 }
 
 /// Wire shape for a todo in `todo_list` output: every field but the body and
@@ -306,6 +316,72 @@ impl LockDto {
     }
 }
 
+/// Probe the four resource tables in turn for `id`, returning the first hit
+/// as an [`IdKindDto`].
+///
+/// Per-table `NotFound` is treated as "miss, try next"; any other `CoreError`
+/// (DB, projection, project-not-found) short-circuits as a real failure. If
+/// no table matches, emits `invalid_params` with a generic "id N not found"
+/// (the caller doesn't have a kind to attribute the miss to). Soft-deleted
+/// rows are already invisible to the underlying `*_get` helpers (V7), so
+/// they look the same as ids that were never allocated.
+fn resolve_id_kind(store: &Store, project: ProjectId, id: u64) -> Result<IdKindDto, McpError> {
+    match store.todo_get(project, id) {
+        Ok(t) => {
+            return Ok(IdKindDto {
+                kind: "todo",
+                label: t.title,
+            })
+        }
+        Err(CoreError::TodoNotFound(_)) => {}
+        Err(e) => return Err(map_core_err(e)),
+    }
+    match store.scratchpad_get(project, id) {
+        Ok(s) => {
+            return Ok(IdKindDto {
+                kind: "scratchpad",
+                label: s.title,
+            })
+        }
+        Err(CoreError::ScratchpadNotFound(_)) => {}
+        Err(e) => return Err(map_core_err(e)),
+    }
+    match store.agent_tool_get(project, id) {
+        Ok(at) => {
+            let label = if at.display_name.is_empty() {
+                at.name
+            } else {
+                at.display_name
+            };
+            return Ok(IdKindDto {
+                kind: "agent-tool",
+                label,
+            });
+        }
+        Err(CoreError::AgentToolNotFound(_)) => {}
+        Err(e) => return Err(map_core_err(e)),
+    }
+    match store.process_get(project, id) {
+        Ok(p) => {
+            let label = if p.display_name.is_empty() {
+                p.name
+            } else {
+                p.display_name
+            };
+            return Ok(IdKindDto {
+                kind: "process",
+                label,
+            });
+        }
+        Err(CoreError::ProcessNotFound(_)) => {}
+        Err(e) => return Err(map_core_err(e)),
+    }
+    Err(McpError::invalid_params(
+        format!("id {id} not found"),
+        None,
+    ))
+}
+
 /// Map a core error onto an MCP error result at the protocol boundary.
 fn map_core_err(e: CoreError) -> McpError {
     match e {
@@ -437,7 +513,7 @@ fn parse_status(s: &str) -> Result<TodoStatus, McpError> {
     TodoStatus::parse(s).ok_or_else(|| {
         McpError::invalid_params(
             format!(
-                "invalid status '{s}': expected open, in_progress, backlog, completed, or not_done"
+                "invalid status '{s}': expected open, in_progress, backlog, draft, completed, or not_done"
             ),
             None,
         )
@@ -765,7 +841,7 @@ impl Handler {
 
     #[tool(description = "Edit a todo's fields. Every argument but todo_id is optional; an \
                           omitted field is left unchanged. status is one of open/in_progress/\
-                          backlog/completed/not_done, priority one of high/medium/low; tags \
+                          backlog/draft/completed/not_done, priority one of high/medium/low; tags \
                           replaces the whole tag list.")]
     async fn todo_update(
         &self,
@@ -1196,6 +1272,27 @@ impl Handler {
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
+
+    #[tool(
+        description = "Given a numeric id, return what kind of resource it is \
+                       and a short label. Resolves across todos, scratchpads, \
+                       agent tools, and processes (ids are unified per project \
+                       so a `#N` reference points to exactly one row). Errors \
+                       `invalid_params` if the id matches no live (non-soft- \
+                       deleted) resource."
+    )]
+    async fn id_kind(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<IdKindArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            resolve_id_kind(&st, project, args.id)?
+        };
+        json_result(&dto)
+    }
 }
 
 #[tool_handler]
@@ -1242,6 +1339,10 @@ impl ServerHandler for Handler {
                  launchable agents, commands, and terminals the cockpit tracks. Deleting an \
                  agent tool nulls the agent_tool_id back-reference of any processes that \
                  referenced it. Projected to .panopt/processes.md.\n\
+                 - Utilities: id_kind resolves a numeric id to its resource kind \
+                 (todo / scratchpad / agent-tool / process) plus a short label. \
+                 Useful since ids are unified per project and a `#N` reference \
+                 points to exactly one row.\n\
                  State is persisted, shared live across every agent on the same project, \
                  and mirrored into .panopt/*.md under the project root."
                     .to_string(),

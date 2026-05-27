@@ -48,7 +48,7 @@ pub enum TodoCmd {
         title: Option<String>,
         #[arg(long)]
         body: Option<String>,
-        /// One of open, in_progress, backlog, completed, not_done.
+        /// One of open, in_progress, backlog, draft, completed, not_done.
         #[arg(long)]
         status: Option<String>,
         /// One of high, medium, low.

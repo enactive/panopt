@@ -10,6 +10,14 @@
 //! `scratchpad_create` on first save, then `scratchpad_update` for every
 //! subsequent flush. The form never reads or writes the `.panopt/scratchpad/`
 //! projection itself.
+//!
+//! The viewer polls [`Self::refresh_from_daemon`] on its `REFRESH` cadence so
+//! a concurrent edit (another agent's `scratchpad_update`, a CLI write)
+//! reconciles into the open form: untouched fields are replayed from the
+//! remote value; fields the user is mid-edit on hold their local text and the
+//! message line flags the conflict. The [`Baseline`] is always advanced to
+//! the remote value so the next [`Self::flush`] sends only the user's still-
+//! pending changes. Mirrors `todo_form.rs`'s refresh wiring (todo #40).
 
 use std::time::Instant;
 
@@ -19,7 +27,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
-use serde_json::json;
+use serde_json::{json, Value};
 use tui_textarea::TextArea;
 
 use crate::mcpclient::Client;
@@ -48,6 +56,19 @@ enum Field {
     Body,
 }
 
+/// Snapshot of the title and body the daemon last reported, captured at load
+/// time and after each successful save/refresh.
+///
+/// `flush` diffs the current field values against this baseline and sends
+/// only the fields that actually changed - so an autosave that fires while
+/// the user has only touched the title doesn't echo back the stale body and
+/// clobber a concurrent edit. Mirrors `todo_form::Baseline`.
+#[derive(Clone, Default)]
+struct Baseline {
+    title: String,
+    body: String,
+}
+
 /// The editable state of the scratchpad form.
 pub struct ScratchpadForm {
     /// The daemon MCP URL with `?ws=...&observer=1`.
@@ -65,8 +86,9 @@ pub struct ScratchpadForm {
     updated: String,
 
     /// Display name of whoever holds an advisory lock on this scratchpad.
-    /// Reserved for the eventual scratchpad-lock surface; today the viewer is
-    /// observer-only and leaves this as `None`.
+    /// Today `scratchpad_get` doesn't yet surface this; the field is kept in
+    /// sync from the response anyway so the eventual scratchpad-lock surface
+    /// (todo #55) has live data the moment the daemon starts emitting it.
     pub(crate) locked_by: Option<String>,
 
     /// True when there are unsaved edits.
@@ -81,6 +103,10 @@ pub struct ScratchpadForm {
     /// First visible visual row of the soft-wrapped Body field. Drives the
     /// `draw_body` scroll so the cursor stays on screen.
     body_scroll: usize,
+
+    /// The daemon's last-observed view of the editable fields. See
+    /// [`Baseline`].
+    baseline: Baseline,
 }
 
 impl ScratchpadForm {
@@ -99,6 +125,7 @@ impl ScratchpadForm {
             dirty_since: None,
             body_scroll: 0,
             message: "new scratchpad - type to begin".to_string(),
+            baseline: Baseline::default(),
         }
     }
 
@@ -125,6 +152,10 @@ impl ScratchpadForm {
             dirty_since: None,
             body_scroll: 0,
             message: format!("scratchpad #{id}"),
+            baseline: Baseline {
+                title: title.to_string(),
+                body: body.to_string(),
+            },
         }
     }
 
@@ -200,14 +231,16 @@ impl ScratchpadForm {
     ///
     /// Creates the scratchpad first when this is a new form (no id yet) and
     /// the title is non-empty; otherwise updates an existing one in place.
+    /// Diffs against [`Self::baseline`] so an idle field is omitted from
+    /// `scratchpad_update` rather than echoed back stale.
     pub fn flush(&mut self) -> Result<()> {
-        let title = self.title.lines().join(" ").trim().to_string();
+        let title = self.current_title();
         if title.is_empty() {
             // Nothing to save against - silently no-op so an autosave on an
             // empty new form does not spam errors.
             return Ok(());
         }
-        let body = self.body.lines().join("\n");
+        let body = self.current_body();
 
         let client = Client::connect(&self.url)?;
         let outcome = (|| -> Result<()> {
@@ -219,25 +252,127 @@ impl ScratchpadForm {
                         .as_u64()
                         .ok_or_else(|| anyhow!("daemon returned no scratchpad id"))?;
                     self.id = Some(id);
+                    // `scratchpad_create` accepts only `title`; the daemon
+                    // initialises the body to "". Record that in the baseline
+                    // so the diff below sends whichever body the user typed
+                    // in the new-scratchpad form.
+                    self.baseline.title = title.clone();
                     id
                 }
             };
-            client.call(
-                "scratchpad_update",
-                json!({
-                    "scratchpad_id": id,
-                    "title": title,
-                    "body": body,
-                }),
-            )?;
+            let mut payload = serde_json::Map::new();
+            payload.insert("scratchpad_id".into(), json!(id));
+            if title != self.baseline.title {
+                payload.insert("title".into(), json!(title));
+            }
+            if body != self.baseline.body {
+                payload.insert("body".into(), json!(body));
+            }
+            // Skip the round-trip when nothing changed - this is the common
+            // shape of a debounced autosave fired by an unrelated event.
+            if payload.len() > 1 {
+                client.call("scratchpad_update", Value::Object(payload))?;
+            }
             Ok(())
         })();
         client.close();
         outcome?;
+        // Refresh the baseline so future flushes diff against what the daemon
+        // now holds, not what was loaded an edit ago.
+        self.baseline = Baseline { title, body };
         self.dirty = false;
         self.dirty_since = None;
         self.message = format!("saved scratchpad #{}", self.id.unwrap_or(0));
         Ok(())
+    }
+
+    /// Pull the daemon's current snapshot and replay it onto the form. Per
+    /// todo #40 / #65: untouched fields are replaced with the remote value;
+    /// fields the user is mid-edit on keep their local text and the message
+    /// line flags the conflict. The [`Baseline`] is always advanced so the
+    /// next [`Self::flush`] sends only fields still divergent from the
+    /// remote.
+    ///
+    /// Returns `Ok(true)` when anything visible changed and the host should
+    /// redraw. Not-yet-saved forms (no id) return `Ok(false)` immediately -
+    /// there is no daemon row to refresh against.
+    pub fn refresh_from_daemon(&mut self) -> Result<bool> {
+        let Some(id) = self.id else {
+            return Ok(false);
+        };
+        let client = Client::connect(&self.url)?;
+        let outcome = client.call("scratchpad_get", json!({ "scratchpad_id": id }));
+        client.close();
+        let pad = outcome?;
+
+        let remote = Baseline {
+            title: pad["title"].as_str().unwrap_or("").to_string(),
+            body: pad["body"].as_str().unwrap_or("").to_string(),
+        };
+        let remote_updated = pad["updated_at"].as_str().unwrap_or("").to_string();
+        let remote_locked_by = pad["locked_by"].as_str().map(str::to_string);
+        Ok(self.replay_remote(remote, remote_updated, remote_locked_by))
+    }
+
+    /// Apply a daemon snapshot. Pure of MCP - takes the already-loaded values
+    /// directly - so the replay rules can be unit-tested. See
+    /// [`Self::refresh_from_daemon`] for the surrounding wire-up.
+    fn replay_remote(
+        &mut self,
+        remote: Baseline,
+        remote_updated: String,
+        remote_locked_by: Option<String>,
+    ) -> bool {
+        let mut changed = false;
+        let mut conflicts: Vec<&'static str> = Vec::new();
+
+        if remote.title != self.baseline.title {
+            if self.current_title() != self.baseline.title {
+                conflicts.push("title");
+            } else {
+                self.title = text_area(&remote.title);
+                changed = true;
+            }
+        }
+        if remote.body != self.baseline.body {
+            if self.current_body() != self.baseline.body {
+                conflicts.push("body");
+            } else {
+                self.body = text_area(&remote.body);
+                changed = true;
+            }
+        }
+
+        if self.updated != remote_updated {
+            self.updated = remote_updated;
+            changed = true;
+        }
+        if self.locked_by != remote_locked_by {
+            self.locked_by = remote_locked_by;
+            changed = true;
+        }
+
+        // Advance the baseline unconditionally so a subsequent flush only
+        // sends fields the user is still mid-edit on.
+        self.baseline = remote;
+
+        if !conflicts.is_empty() {
+            self.message = format!(
+                "remote changed {} - your save will overwrite",
+                conflicts.join(", ")
+            );
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn current_title(&self) -> String {
+        self.title.lines().join(" ").trim().to_string()
+    }
+
+    fn current_body(&self) -> String {
+        self.body.lines().join("\n")
     }
 
     /// Render the form into `area`.
@@ -437,5 +572,116 @@ mod tests {
         let action = form.handle_paste("alpha\nbeta\ngamma");
         assert_eq!(action, ScratchpadFormAction::Dirty);
         assert_eq!(form.body.lines(), vec!["alpha", "beta", "gamma"]);
+    }
+
+    /// An untouched field picks up the remote value on refresh.
+    #[test]
+    fn refresh_replays_remote_into_untouched_fields() {
+        let mut form = ScratchpadForm::from_parts(
+            "http://localhost/?ws=/x",
+            1,
+            "old title",
+            "old body",
+            "2026-05-27 00:00:00",
+            "2026-05-27 00:00:00",
+        );
+        let changed = form.replay_remote(
+            Baseline {
+                title: "new title".to_string(),
+                body: "new body".to_string(),
+            },
+            "2026-05-27 00:00:05".to_string(),
+            None,
+        );
+        assert!(changed);
+        assert_eq!(form.current_title(), "new title");
+        assert_eq!(form.current_body(), "new body");
+        assert_eq!(form.updated, "2026-05-27 00:00:05");
+        assert!(!form.message.contains("overwrite"));
+    }
+
+    /// A locally edited field is kept and the message line flags the
+    /// conflict; the baseline still advances so the next flush only sends
+    /// the still-pending change.
+    #[test]
+    fn refresh_keeps_local_edit_and_flags_conflict() {
+        let mut form = ScratchpadForm::from_parts(
+            "http://localhost/?ws=/x",
+            1,
+            "old title",
+            "old body",
+            "2026-05-27 00:00:00",
+            "2026-05-27 00:00:00",
+        );
+        // Local edit to the title.
+        let key = KeyEvent::new(KeyCode::Char('!'), KeyModifiers::empty());
+        form.handle_key(key);
+        // Remote also changed title and body.
+        let changed = form.replay_remote(
+            Baseline {
+                title: "remote title".to_string(),
+                body: "remote body".to_string(),
+            },
+            "2026-05-27 00:00:05".to_string(),
+            None,
+        );
+        assert!(changed);
+        // Title was being edited - local wins (cursor at the start, so the
+        // typed char goes at column 0).
+        assert!(form.current_title().contains("old title"));
+        assert_ne!(form.current_title(), "old title");
+        // Body wasn't edited - replayed from the remote.
+        assert_eq!(form.current_body(), "remote body");
+        assert!(form.message.contains("title"));
+        assert!(form.message.contains("overwrite"));
+        // Baseline advances to the remote view regardless.
+        assert_eq!(form.baseline.title, "remote title");
+        assert_eq!(form.baseline.body, "remote body");
+    }
+
+    /// A no-op refresh (remote matches baseline) reports no visible change.
+    #[test]
+    fn refresh_with_no_remote_drift_is_a_noop() {
+        let mut form = ScratchpadForm::from_parts(
+            "http://localhost/?ws=/x",
+            1,
+            "t",
+            "b",
+            "2026-05-27 00:00:00",
+            "2026-05-27 00:00:00",
+        );
+        let changed = form.replay_remote(
+            Baseline {
+                title: "t".to_string(),
+                body: "b".to_string(),
+            },
+            "2026-05-27 00:00:00".to_string(),
+            None,
+        );
+        assert!(!changed);
+    }
+
+    /// The lock-holder field follows the remote value so the future
+    /// scratchpad-lock surface (todo #55) has live data.
+    #[test]
+    fn refresh_updates_locked_by_from_remote() {
+        let mut form = ScratchpadForm::from_parts(
+            "http://localhost/?ws=/x",
+            1,
+            "t",
+            "b",
+            "2026-05-27 00:00:00",
+            "2026-05-27 00:00:00",
+        );
+        let changed = form.replay_remote(
+            Baseline {
+                title: "t".to_string(),
+                body: "b".to_string(),
+            },
+            "2026-05-27 00:00:00".to_string(),
+            Some("alice".to_string()),
+        );
+        assert!(changed);
+        assert_eq!(form.locked_by.as_deref(), Some("alice"));
     }
 }

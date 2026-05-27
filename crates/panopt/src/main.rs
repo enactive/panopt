@@ -9,6 +9,7 @@ mod close_gate;
 mod daemon;
 mod delete_gate;
 mod edit;
+mod id_kind;
 mod mcp;
 mod mcpclient;
 mod paths;
@@ -86,6 +87,16 @@ enum Cmd {
         #[command(subcommand)]
         action: scratchpad::ScratchpadCmd,
     },
+    /// Resolve a numeric id to its resource kind (todo / scratchpad /
+    /// agent-tool / process) via the daemon's `id_kind` MCP tool.
+    #[command(name = "id-kind")]
+    IdKind {
+        /// Project root the id belongs to (default: the current directory).
+        #[arg(long)]
+        ws: Option<PathBuf>,
+        /// Numeric id to resolve.
+        id: u64,
+    },
     /// Internal: the entrypoint that runs inside an agent pane.
     #[command(name = "_agent", hide = true)]
     AgentExec {
@@ -156,6 +167,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::AgentTool { ws, action } => agent_tool::run(ws, action, cli.port),
         Cmd::Process { ws, action } => process::run(ws, action, cli.port),
         Cmd::Scratchpad { ws, action } => scratchpad::run(ws, action, cli.port),
+        Cmd::IdKind { ws, id } => id_kind::run(ws, id, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),

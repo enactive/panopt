@@ -120,16 +120,18 @@ enum TodoFilter {
     OpenUnblocked,
     InProgress,
     Backlog,
+    Draft,
     Completed,
     NotDone,
 }
 
-const ALL_TODO_FILTERS: [TodoFilter; 7] = [
+const ALL_TODO_FILTERS: [TodoFilter; 8] = [
     TodoFilter::All,
     TodoFilter::Open,
     TodoFilter::OpenUnblocked,
     TodoFilter::InProgress,
     TodoFilter::Backlog,
+    TodoFilter::Draft,
     TodoFilter::Completed,
     TodoFilter::NotDone,
 ];
@@ -142,6 +144,7 @@ impl TodoFilter {
             TodoFilter::OpenUnblocked => "open-unblocked",
             TodoFilter::InProgress => "in_progress",
             TodoFilter::Backlog => "backlog",
+            TodoFilter::Draft => "draft",
             TodoFilter::Completed => "completed",
             TodoFilter::NotDone => "not_done",
         }
@@ -180,6 +183,7 @@ impl TodoFilter {
             TodoFilter::Open | TodoFilter::OpenUnblocked => status == "open",
             TodoFilter::InProgress => status == "in_progress",
             TodoFilter::Backlog => status == "backlog",
+            TodoFilter::Draft => status == "draft",
             TodoFilter::Completed => status == "completed",
             TodoFilter::NotDone => status == "not_done",
         }
@@ -196,7 +200,7 @@ fn parse_status_suffix(label: &str) -> Option<&str> {
     let token = rest[..comma].trim();
     matches!(
         token,
-        "open" | "in_progress" | "backlog" | "completed" | "not_done"
+        "open" | "in_progress" | "backlog" | "draft" | "completed" | "not_done"
     )
     .then_some(token)
 }

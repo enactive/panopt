@@ -72,6 +72,12 @@ pub struct TodoGetArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IdKindArgs {
+    /// Numeric id to resolve to its resource kind.
+    pub id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TodoDeleteArgs {
     /// Numeric id of the todo to delete. Its comments and blocker links go too.
     pub todo_id: u64,
@@ -87,8 +93,8 @@ pub struct TodoUpdateArgs {
     /// New free-form description body. Omit to leave unchanged.
     #[serde(default)]
     pub body: Option<String>,
-    /// New status: one of open, in_progress, backlog, completed. Omit to leave
-    /// unchanged.
+    /// New status: one of open, in_progress, backlog, draft, completed,
+    /// not_done. Omit to leave unchanged.
     #[serde(default)]
     pub status: Option<String>,
     /// New priority: one of high, medium, low. Omit to leave unchanged.
