@@ -902,6 +902,7 @@ impl Viewer {
     /// If a form edit has been pending for at least [`DEBOUNCE`], flush it.
     /// Errors are surfaced in the form's message line by the form itself.
     fn maybe_autosave(&mut self) {
+        let mut promote: Option<Target> = None;
         match &mut self.content {
             Content::TodoForm(form)
                 if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
@@ -910,6 +911,11 @@ impl Viewer {
                     form.message = format!("autosave failed: {e:#}");
                 }
                 self.needs_draw = true;
+                if matches!(self.target, Target::NewTodo) {
+                    if let Some(id) = form.id {
+                        promote = Some(Target::Todo(id));
+                    }
+                }
             }
             Content::ScratchpadForm(form)
                 if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
@@ -918,9 +924,35 @@ impl Viewer {
                     form.message = format!("autosave failed: {e:#}");
                 }
                 self.needs_draw = true;
+                if matches!(self.target, Target::NewScratchpad) {
+                    if let Some(id) = form.id {
+                        promote = Some(Target::Scratchpad(id));
+                    }
+                }
             }
             _ => {}
         }
+        if let Some(target) = promote {
+            self.promote_form_target(target);
+        }
+    }
+
+    /// Once a new-todo / new-scratchpad form's first save assigns an id,
+    /// rewrite the routing file so the sidebar plugin re-titles the pane from
+    /// "New todo" to "Todo #N - ...". The form content is already in sync with
+    /// the daemon's view, so this only updates the pane title surface - no
+    /// reload, no switch (which would clobber the form state).
+    fn promote_form_target(&mut self, target: Target) {
+        let (kind, id) = match &target {
+            Target::Todo(id) => ("todo", *id),
+            Target::Scratchpad(id) => ("scratchpad", *id),
+            _ => return,
+        };
+        write_routing_to(&self.routing_path, kind, Some(id));
+        // Refresh the mtime we already saw so the next poll_routing doesn't
+        // treat our own write as an external re-point.
+        self.routing_mtime = mtime(&self.routing_path);
+        self.target = target;
     }
 
     /// Load the current target's content. For form targets this calls the
@@ -1281,6 +1313,33 @@ fn list_scroll(cursor: usize, viewport: usize, len: usize) -> usize {
 /// The modification time of `path`, or `None` when it cannot be read.
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Atomically write a viewer routing file. Mirrors the sidebar plugin's
+/// `write_routing` so both writers produce a byte-identical payload; the
+/// viewer reaches this only on the new-todo / new-scratchpad promotion path
+/// to update its own pane title without going through the plugin.
+fn write_routing_to(path: &Path, kind: &str, id: Option<u64>) {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let payload = match id {
+        Some(id) => format!("{{\"kind\":\"{kind}\",\"id\":{id}}}"),
+        None => format!("{{\"kind\":\"{kind}\"}}"),
+    };
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("viewer");
+    let tmp = match path.parent() {
+        Some(p) => p.join(format!(".{name}.tmp")),
+        None => PathBuf::from(format!(".{name}.tmp")),
+    };
+    if std::fs::write(&tmp, payload).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 #[cfg(test)]
