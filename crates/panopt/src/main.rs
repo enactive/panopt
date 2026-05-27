@@ -129,6 +129,18 @@ enum Cmd {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Internal: call `agent_leave` on the daemon as `id`, so its registry
+    /// entry and advisory locks clear immediately. Used by the plugin's
+    /// pane-death hook to tear down a cockpit-spawned agent the moment its
+    /// pane closes, without waiting for the idle sweep.
+    #[command(name = "_agent-leave", hide = true)]
+    AgentLeave {
+        #[arg(long)]
+        ws: Option<PathBuf>,
+        /// Stable agent id (the `?agent=` value the dead pane connected with).
+        #[arg(long)]
+        id: String,
+    },
     /// Internal: start a process in this pane.
     #[command(name = "_process-run", hide = true)]
     ProcessRun {
@@ -194,6 +206,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Scratchpad { ws, action } => scratchpad::run(ws, action, cli.port),
         Cmd::IdKind { ws, id } => id_kind::run(ws, id, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
+        Cmd::AgentLeave { ws, id } => agent::leave(ws, id, cli.port),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
         Cmd::CloseGateExec {

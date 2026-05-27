@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use http::request::Parts;
 use panopt_core::{
-    Agent, AgentTool, AgentToolPatch, CoreError, Lock, Priority, Process, ProcessKind,
+    Agent, AgentTool, AgentToolPatch, CoreError, KeySource, Lock, Priority, Process, ProcessKind,
     ProcessPatch, ProjectId, Scratchpad, ScratchpadPatch, Store, Todo, TodoPatch, TodoStatus,
 };
 use rmcp::{
@@ -271,6 +271,10 @@ struct AgentDto {
     status: String,
     /// Seconds since this agent's last tool call.
     idle_seconds: u64,
+    /// `"declared"` for stable `?agent=<id>` identities, `"session"` for the
+    /// rotating MCP session id. Lets a peer tell whether an idle entry will
+    /// auto-prune (session) or persist until explicit leave (declared).
+    key_source: &'static str,
     /// True for the agent that made this request.
     is_self: bool,
 }
@@ -285,6 +289,7 @@ impl AgentDto {
             name: agent.name.clone(),
             status: agent.status.clone(),
             idle_seconds,
+            key_source: agent.key_source.as_str(),
             is_self,
         }
     }
@@ -437,7 +442,7 @@ fn resolve_project(store: &mut Store, parts: &Parts) -> Result<ProjectId, McpErr
         .map_err(map_core_err)
 }
 
-/// The calling agent's stable key.
+/// The calling agent's stable key and the source it came from.
 ///
 /// Prefers the `agent` query parameter on the MCP URL - a stable per-agent id
 /// the launcher injects, which survives MCP session churn. Falls back to the
@@ -445,16 +450,18 @@ fn resolve_project(store: &mut Store, parts: &Parts) -> Result<ProjectId, McpErr
 /// the client's connection drops and re-initializes, so without an `agent` id
 /// one agent can briefly appear under several keys (see DESIGN.md Section 9).
 /// `None` only for a request that carries neither.
-fn agent_key(parts: &Parts) -> Option<String> {
-    query_param(parts.uri.query(), "agent")
-        .filter(|id| !id.is_empty())
-        .or_else(|| {
-            parts
-                .headers
-                .get("mcp-session-id")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
+///
+/// The returned [`KeySource`] tells the registry how to age the entry:
+/// declared identities never idle-prune, session ids do.
+fn agent_key(parts: &Parts) -> Option<(String, KeySource)> {
+    if let Some(id) = query_param(parts.uri.query(), "agent").filter(|id| !id.is_empty()) {
+        return Some((id, KeySource::Declared));
+    }
+    parts
+        .headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| (s.to_string(), KeySource::Session))
 }
 
 /// Resolve the request's project and register the calling agent in it.
@@ -466,27 +473,37 @@ fn agent_key(parts: &Parts) -> Option<String> {
 /// A request carrying `?observer=1` is a tool, not an agent - the `panopt`
 /// CLI, say - so it resolves the project but is never added to the registry,
 /// and its key is reported as `None`.
+///
+/// On first-sight of a stable `?agent=` key, a `?name=<friendly>` parameter
+/// on the URL is applied as an implicit `agent_identify`. This lets a
+/// hand-launched agent declare its display name once in the MCP URL instead
+/// of needing to call `identify` on every reconnect.
 fn enter(store: &mut Store, parts: &Parts) -> Result<(ProjectId, Option<String>), McpError> {
     let project = resolve_project(store, parts)?;
     if query_param(parts.uri.query(), "observer").as_deref() == Some("1") {
         return Ok((project, None));
     }
-    let key = agent_key(parts);
-    if let Some(key) = &key {
-        let first_seen = store.agent_whoami(project, key).is_none();
-        store.agent_touch(project, key).map_err(map_core_err)?;
-        if first_seen {
-            let from_url = query_param(parts.uri.query(), "agent")
-                .filter(|id| !id.is_empty())
-                .is_some();
-            tracing::info!(
-                agent = %key,
-                key_source = if from_url { "agent= URL parameter" } else { "MCP session id" },
-                "agent connected"
-            );
+    let Some((key, source)) = agent_key(parts) else {
+        return Ok((project, None));
+    };
+    let first_seen = store.agent_whoami(project, &key).is_none();
+    store
+        .agent_touch(project, &key, source)
+        .map_err(map_core_err)?;
+    if first_seen {
+        tracing::info!(
+            agent = %key,
+            key_source = source.as_str(),
+            "agent connected"
+        );
+        if let Some(name) = query_param(parts.uri.query(), "name").filter(|n| !n.is_empty()) {
+            store
+                .agent_identify(project, &key, name.clone(), None)
+                .map_err(map_core_err)?;
+            tracing::info!(agent = %key, %name, "agent identified from URL");
         }
     }
-    Ok((project, key))
+    Ok((project, Some(key)))
 }
 
 /// Require an agent key, failing with a clear message when the request carried
@@ -572,6 +589,26 @@ impl Handler {
             st.agent_identify(project, &key, name.clone(), args.status)
                 .map_err(map_core_err)?;
             tracing::info!(agent = %key, %name, "agent identified");
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Cooperatively leave the project's agent registry. Removes this agent \
+                          from agent_list immediately, releases every advisory lock it holds, \
+                          and re-projects .panopt/agents.md and .panopt/locks.md. Idempotent: \
+                          a second call by an already-gone agent is a silent ok. Intended for \
+                          a clean handoff or shutdown - the idle sweep handles agents that \
+                          just disappear.")]
+    async fn agent_leave(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, key) = enter(&mut st, &parts)?;
+            let key = require_key(key)?;
+            let removed = st.agent_leave(project, &key).map_err(map_core_err)?;
+            tracing::info!(agent = %key, removed, "agent left");
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
@@ -1374,7 +1411,11 @@ impl ServerHandler for Handler {
                  query parameter on the server URL.\n\
                  - Registry: call identify (name, optional status) on startup so others \
                  can see you; whoami returns your own entry; agent_list returns every \
-                 agent on the project. Connecting already registers you.\n\
+                 agent on the project (each entry's key_source is `declared` for stable \
+                 `?agent=<id>` ids or `session` for the rotating MCP session id - only \
+                 session entries idle-prune). Connecting already registers you. \
+                 agent_leave removes your registry entry and releases your locks; the \
+                 idle sweep handles agents that just disappear.\n\
                  - Locks: lock_acquire (name, optional note) takes a named advisory lock \
                  and is non-blocking; lock_release frees it; lock_status lists every held \
                  lock. Locks are advisory - agents cooperate, the daemon does not enforce.\n\

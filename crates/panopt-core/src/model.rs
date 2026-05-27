@@ -308,20 +308,60 @@ pub struct ProcessPatch {
     pub last_seen: Option<Option<String>>,
 }
 
+/// How the registry came to know about an agent.
+///
+/// The two key sources have very different lifetimes, and we treat them
+/// differently for pruning (see [`crate::Store::sweep_idle_agents`]):
+///
+/// - `Declared` keys are stable `?agent=<id>` identifiers the launcher or the
+///   user baked into the MCP URL. They name a *person or process*, not a
+///   connection, and survive every kind of reconnect. Idle pruning would
+///   silently delete a named agent during a quiet stretch, so declared keys
+///   are kept until an explicit `agent_leave` (or daemon restart).
+/// - `Session` keys are the rotating `mcp-session-id` header Claude Code mints
+///   per connection. They really are throwaway - a single Claude Code agent
+///   produces a stream of unrelated session keys over its lifetime - and the
+///   idle sweep is what stops them from accumulating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// Stable id from `?agent=<id>`. Survives idle pruning.
+    Declared,
+    /// Rotating `mcp-session-id` header. Pruned after `AGENT_MAX_IDLE`.
+    Session,
+}
+
+impl KeySource {
+    /// Lowercase wire form used in the MCP `agent_list` JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeySource::Declared => "declared",
+            KeySource::Session => "session",
+        }
+    }
+}
+
 /// A connected agent, as tracked by the in-memory registry.
 ///
-/// Agents are ephemeral - the registry holds only those currently connected -
-/// so an `Agent` is never persisted. `first_seen` / `last_seen` drive both
-/// idle reporting and the pruning of agents that have gone silent.
+/// Registry entries are never persisted, but their lifetimes differ by
+/// [`KeySource`]: declared keys stay until explicit leave or daemon restart,
+/// session keys age out via [`crate::Store::sweep_idle_agents`].
+/// `first_seen` / `last_seen` drive both idle reporting and the pruning of
+/// session-keyed agents.
 #[derive(Debug, Clone)]
 pub struct Agent {
-    /// Opaque per-connection key (the MCP session id). Internal: it is the
-    /// registry's map key, but is neither projected nor sent on the wire.
+    /// Opaque per-connection key (declared id or rotating MCP session id).
+    /// Internal: it is the registry's map key, but is neither projected nor
+    /// sent on the wire.
     pub key: String,
     /// Human-readable name. Defaults to the key until `identify` sets it.
     pub name: String,
     /// Free-form self-reported status, set via `identify`. Empty until then.
     pub status: String,
+    /// Which kind of key the agent connected with. Stamped on first sight and
+    /// never overwritten - a declared agent stays declared even if it later
+    /// reconnects without `?agent=` (the new connection would register under
+    /// a different session key, leaving the declared entry untouched).
+    pub key_source: KeySource,
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
 }

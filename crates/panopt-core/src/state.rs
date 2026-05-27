@@ -19,15 +19,32 @@ use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
 use crate::model::{
-    Agent, AgentTool, AgentToolPatch, Lock, Priority, Process, ProcessKind, ProcessPatch,
-    ProjectId, Scratchpad, ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
+    Agent, AgentTool, AgentToolPatch, KeySource, Lock, Priority, Process, ProcessKind,
+    ProcessPatch, ProjectId, Scratchpad, ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 use crate::projection;
 use crate::registry::Registry;
 
-/// How long an agent may go without any tool call before the registry treats
-/// it as gone and prunes it (releasing its locks).
+/// How long a [`KeySource::Session`] agent may go silent before the registry
+/// treats it as gone and prunes it (releasing its locks).
+///
+/// Only applies to session-keyed agents - [`KeySource::Declared`] entries
+/// survive any idle stretch and only leave via `agent_leave` or daemon
+/// restart, because a stable id names a *process*, not a connection.
+///
+/// Tool calls are the only heartbeat the daemon sees, so 30 minutes covers
+/// the silent gaps in a normal conversation (typing, generation, the user
+/// looking away) without letting orphaned session keys accumulate forever.
 const AGENT_MAX_IDLE: Duration = Duration::from_secs(1800);
+
+/// How recently an agent must have made a tool call to count as having a
+/// *live* MCP connection for the SIGTERM gate. Short on purpose: MCP tool
+/// calls are the only heartbeat the daemon sees, and an HTTP session that
+/// has been silent for several seconds is - from the transport's point of
+/// view - already gone, even if the registry entry persists (a declared
+/// identity that has gone quiet is still in the roster but should not
+/// block a daemon shutdown).
+const ACTIVE_PRESENCE: Duration = Duration::from_secs(5);
 
 /// All of PANopt's coordination state.
 ///
@@ -102,10 +119,19 @@ impl Store {
     // --- agents ---
 
     /// Record activity from agent `key` in `project`, registering it on first
-    /// sight, and prune any agents that have gone silent. Re-projects whatever
-    /// changed.
-    pub fn agent_touch(&mut self, project: ProjectId, key: &str) -> Result<(), CoreError> {
-        let added = self.registry.touch(project.0, key);
+    /// sight, and prune any session-keyed agents that have gone silent.
+    /// Re-projects whatever changed.
+    ///
+    /// `source` controls the entry's lifetime: [`KeySource::Declared`] keys
+    /// (stable `?agent=<id>`) survive idle prunes, [`KeySource::Session`] keys
+    /// (rotating `mcp-session-id` headers) age out at `AGENT_MAX_IDLE`.
+    pub fn agent_touch(
+        &mut self,
+        project: ProjectId,
+        key: &str,
+        source: KeySource,
+    ) -> Result<(), CoreError> {
+        let added = self.registry.touch(project.0, key, source);
         let pruned_any = self.prune_agents(project)?;
         // `prune_agents` re-projects the roster when it prunes; if it did not
         // prune but this call added a new agent, the roster still changed.
@@ -113,6 +139,32 @@ impl Store {
             self.reproject_agents(project)?;
         }
         Ok(())
+    }
+
+    /// Test-only: rewind an agent's `last_seen` for sweep tests.
+    #[cfg(test)]
+    pub fn test_backdate_last_seen(&mut self, project: ProjectId, key: &str, by: Duration) {
+        self.registry.test_backdate_last_seen(project.0, key, by);
+    }
+
+    /// Remove agent `key` from `project`'s roster, release every lock it
+    /// holds, and re-project whatever changed. Idempotent: returns `false`
+    /// when no such entry was registered.
+    ///
+    /// This is the cooperative counterpart to the idle sweep - it lets a
+    /// declared agent leave on its own ([`KeySource::Declared`] entries are
+    /// never auto-pruned), and lets the launcher tear down a cockpit-spawned
+    /// agent the moment its pane closes.
+    pub fn agent_leave(&mut self, project: ProjectId, key: &str) -> Result<bool, CoreError> {
+        let Some(_gone) = self.registry.remove(project.0, key) else {
+            return Ok(false);
+        };
+        let released = self.locks.release_all(project.0, key);
+        self.reproject_agents(project)?;
+        if released > 0 {
+            self.reproject_locks(project)?;
+        }
+        Ok(true)
     }
 
     /// Set agent `key`'s name and, if given, its self-reported status.
@@ -138,21 +190,30 @@ impl Store {
         Ok(self.registry.list(project.0))
     }
 
-    /// Total number of agents currently connected, across every project. The
-    /// daemon's SIGTERM guard uses this to decide whether shutting down
-    /// would drop live MCP clients. Does not prune - the caller is the
-    /// signal handler and a stale count is preferable to running prune
-    /// logic in the signal path.
+    /// Number of agents with a *live* MCP connection right now, across every
+    /// project. The daemon's SIGTERM guard uses this to decide whether
+    /// shutting down would drop a connected client.
+    ///
+    /// Counts only entries touched within [`ACTIVE_PRESENCE`]: a stale
+    /// declared identity (registered minutes ago, no recent tool call) does
+    /// not block a shutdown - there is no live HTTP connection to drop, only
+    /// a registry row, which a daemon restart correctly forgets anyway.
+    /// Without this filter, the gate refuses the first SIGTERM whenever any
+    /// declared agent has ever connected (todo #83), so `just refresh`
+    /// always takes the full two-strike path and the down window blows past
+    /// Claude Code's reconnect budget. Does not prune - this runs from the
+    /// signal handler and stale counts are preferable to mutation there.
     pub fn connected_agent_count(&self) -> usize {
-        self.registry.total()
+        self.registry.active_total(ACTIVE_PRESENCE)
     }
 
     /// `(project_id, agent_count)` for every project with at least one
-    /// connected agent. The daemon logs this on SIGTERM so the operator can
-    /// see what a second SIGTERM would drop.
+    /// agent connected right now, using the same liveness threshold as
+    /// [`Self::connected_agent_count`]. The daemon logs this on SIGTERM so
+    /// the operator can see what a second SIGTERM would drop.
     pub fn connected_agents_by_project(&self) -> Vec<(ProjectId, usize)> {
         self.registry
-            .counts_by_project()
+            .active_counts_by_project(ACTIVE_PRESENCE)
             .into_iter()
             .map(|(pid, n)| (ProjectId(pid), n))
             .collect()
@@ -1339,7 +1400,11 @@ impl Store {
 
     fn reproject_agents(&self, project: ProjectId) -> Result<(), CoreError> {
         let root = self.project_root(project)?;
-        projection::project_agents(&root, &self.registry.list(project.0))?;
+        projection::project_agents(
+            &root,
+            &self.registry.list(project.0),
+            std::time::SystemTime::now(),
+        )?;
         Ok(())
     }
 
@@ -1355,7 +1420,11 @@ impl Store {
         projection::project_todos(root, &self.todo_list(project)?)?;
         projection::project_agent_tools(root, &self.agent_tool_list(project)?)?;
         projection::project_processes(root, &self.process_list(project)?)?;
-        projection::project_agents(root, &self.registry.list(project.0))?;
+        projection::project_agents(
+            root,
+            &self.registry.list(project.0),
+            std::time::SystemTime::now(),
+        )?;
         projection::project_locks(root, &self.lock_list(project))?;
         projection::project_scratchpads_index(root, &self.scratchpad_index_rows(project)?)?;
         for (id, _) in self.scratchpad_list(project)? {
@@ -2231,7 +2300,9 @@ mod tests {
         let agents_md = std::fs::read_to_string(root.join(".panopt/agents.md")).unwrap();
         assert!(agents_md.contains("_(no agents connected)_"), "{agents_md}");
 
-        fx.store.agent_touch(p, "sess-1").unwrap();
+        fx.store
+            .agent_touch(p, "sess-1", KeySource::Session)
+            .unwrap();
         fx.store
             .agent_identify(p, "sess-1", "backend".into(), Some("coding".into()))
             .unwrap();
@@ -2242,7 +2313,22 @@ mod tests {
         assert_eq!(fx.store.agent_list(p).unwrap().len(), 1);
 
         let agents_md = std::fs::read_to_string(root.join(".panopt/agents.md")).unwrap();
-        assert!(agents_md.contains("- backend - coding"), "{agents_md}");
+        assert!(
+            agents_md.contains("- backend - coding (idle 0m)"),
+            "{agents_md}"
+        );
+
+        // Backdate `last_seen` so the next projection shows ticking idle time.
+        fx.store
+            .test_backdate_last_seen(p, "sess-1", Duration::from_secs(900));
+        fx.store
+            .agent_identify(p, "sess-1", "backend".into(), Some("idle".into()))
+            .unwrap();
+        let agents_md = std::fs::read_to_string(root.join(".panopt/agents.md")).unwrap();
+        assert!(
+            agents_md.contains("- backend - idle (idle 15m)"),
+            "{agents_md}"
+        );
     }
 
     #[test]
@@ -2251,9 +2337,9 @@ mod tests {
         let (a, _) = fx.project("alpha");
         let (b, _) = fx.project("beta");
 
-        fx.store.agent_touch(a, "s1").unwrap();
-        fx.store.agent_touch(b, "s2").unwrap();
-        fx.store.agent_touch(b, "s3").unwrap();
+        fx.store.agent_touch(a, "s1", KeySource::Session).unwrap();
+        fx.store.agent_touch(b, "s2", KeySource::Session).unwrap();
+        fx.store.agent_touch(b, "s3", KeySource::Session).unwrap();
 
         assert_eq!(fx.store.agent_list(a).unwrap().len(), 1);
         assert_eq!(fx.store.agent_list(b).unwrap().len(), 2);
@@ -2264,8 +2350,56 @@ mod tests {
     fn sweep_keeps_fresh_agents() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
-        fx.store.agent_touch(p, "fresh").unwrap();
+        fx.store
+            .agent_touch(p, "fresh", KeySource::Session)
+            .unwrap();
         // Nothing is stale, so the sweep removes nothing.
+        assert!(fx.store.sweep_idle_agents().unwrap().is_empty());
+        assert_eq!(fx.store.agent_list(p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_leave_removes_entry_releases_locks_and_reprojects() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        fx.store
+            .agent_touch(p, "stable", KeySource::Declared)
+            .unwrap();
+        fx.store
+            .agent_identify(p, "stable", "greg-main".into(), None)
+            .unwrap();
+        // A lock the agent will leave behind.
+        fx.store
+            .lock_acquire(p, "stable", "auth".into(), None)
+            .unwrap();
+        assert_eq!(fx.store.lock_list(p).len(), 1);
+
+        assert!(fx.store.agent_leave(p, "stable").unwrap());
+
+        assert!(fx.store.agent_list(p).unwrap().is_empty());
+        assert!(fx.store.lock_list(p).is_empty());
+
+        // Projection mirrors the departure.
+        let agents_md = std::fs::read_to_string(root.join(".panopt/agents.md")).unwrap();
+        assert!(agents_md.contains("_(no agents connected)_"), "{agents_md}");
+        let locks_md = std::fs::read_to_string(root.join(".panopt/locks.md")).unwrap();
+        assert!(locks_md.contains("_(no locks held)_"), "{locks_md}");
+
+        // Idempotent: leaving again is a no-op.
+        assert!(!fx.store.agent_leave(p, "stable").unwrap());
+    }
+
+    #[test]
+    fn sweep_keeps_declared_agents_even_when_idle() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        fx.store
+            .agent_touch(p, "stable", KeySource::Declared)
+            .unwrap();
+        // Backdate `last_seen` past AGENT_MAX_IDLE so a session-keyed peer
+        // would have been pruned. The declared entry must still survive.
+        fx.store
+            .test_backdate_last_seen(p, "stable", AGENT_MAX_IDLE * 10);
         assert!(fx.store.sweep_idle_agents().unwrap().is_empty());
         assert_eq!(fx.store.agent_list(p).unwrap().len(), 1);
     }
@@ -2282,11 +2416,11 @@ mod tests {
     fn locks_acquire_release_and_project() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        fx.store.agent_touch(p, "a").unwrap();
+        fx.store.agent_touch(p, "a", KeySource::Session).unwrap();
         fx.store
             .agent_identify(p, "a", "backend".into(), None)
             .unwrap();
-        fx.store.agent_touch(p, "b").unwrap();
+        fx.store.agent_touch(p, "b", KeySource::Session).unwrap();
 
         // `a` acquires; `b` is denied and sees the holder's resolved name.
         assert_eq!(

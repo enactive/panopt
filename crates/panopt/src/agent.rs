@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use serde_json::json;
 
+use crate::mcpclient::Client;
 use crate::{mcp, paths};
 
 /// `panopt agent [name]` - open a new agent pane in the running cockpit.
@@ -63,6 +66,37 @@ pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Resul
         .env("PANOPT_TOKEN", &token)
         .exec();
     Err(err).context("could not exec `claude` (is it installed and on PATH?)")
+}
+
+/// `panopt _agent-leave --id <id>` - tell the daemon that the agent named by
+/// `id` has gone away, so its registry entry and locks clear immediately.
+///
+/// Used by the sidebar plugin's pane-death hook: when a cockpit-spawned agent
+/// pane closes, the plugin runs this command to call the daemon's
+/// `agent_leave` MCP tool on behalf of the dead pane. Without it, a closed
+/// cockpit-spawned agent (which uses a stable `?agent=<id>` key) would
+/// linger in the registry indefinitely because declared identities never
+/// idle-prune.
+///
+/// Connects with `?agent=<id>` so the daemon sees this as a request *from*
+/// that agent, and `agent_leave` removes the entry and releases its locks.
+/// Best-effort: missing daemon or missing agent are no-ops the caller logs
+/// but does not surface.
+pub fn leave(ws: Option<PathBuf>, id: String, port: u16) -> Result<()> {
+    let ws = resolve_ws(ws)?;
+    let token = panopt_core::auth::read_token(&paths::token()?)
+        .context("reading the panopt token (start the daemon with `panopt up`)")?;
+    let encode = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
+    let url = format!(
+        "http://127.0.0.1:{port}/mcp?ws={}&agent={}&token={}",
+        encode(&ws.to_string_lossy()),
+        encode(&id),
+        encode(&token),
+    );
+    let client = Client::connect(&url).context("connecting to the panopt daemon")?;
+    let result = client.call("agent_leave", json!({}));
+    client.close();
+    result.map(|_| ())
 }
 
 /// The project root: the given path, or the current directory, canonicalized.

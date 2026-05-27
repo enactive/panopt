@@ -399,6 +399,15 @@ struct PanoptPane {
     /// order), so a label change cannot reshuffle the list.
     agent_labels: BTreeMap<u32, String>,
 
+    /// Stable PANopt agent id for each cockpit-spawned agent pane, keyed by
+    /// terminal pane id. Populated when [`Self::spawn_agent_pane`] launches
+    /// `_agent --id <id>`; used by [`Self::sync_agent_labels`] to call
+    /// `_agent-leave` on the daemon as that id the moment its pane closes,
+    /// so the registry entry and any advisory locks clear without waiting
+    /// on the idle sweep (todo #83). Independent of `agent_labels`: the
+    /// label is what the human sees, this is what the daemon knows.
+    agent_pane_ids: BTreeMap<u32, String>,
+
     /// Whether any plugin pane is currently the focused pane in its tab.
     /// Updated by [`PanoptPane::ingest_panes`] but only from a non-transient
     /// manifest: a transient `zellij action pipe` pane briefly steals focus
@@ -1112,6 +1121,28 @@ impl PanoptPane {
                 PaneId::Plugin(_) => None,
             })
             .collect();
+
+        // Tell the daemon about every cockpit-spawned agent whose pane just
+        // disappeared, before we drop the local tracking. The launcher
+        // (`panopt _agent-leave --id <id>`) calls the daemon's `agent_leave`
+        // MCP tool on behalf of the dead agent, which releases its locks
+        // and removes its registry entry immediately - no waiting on the
+        // idle sweep, which never fires for declared identities anyway.
+        let departed_ids: Vec<String> = self
+            .agent_pane_ids
+            .iter()
+            .filter(|(tid, _)| !agent_ids.contains(tid))
+            .map(|(_, id)| id.clone())
+            .collect();
+        if !departed_ids.is_empty() {
+            if let Some(cwd) = self.launch_cwd() {
+                for id in &departed_ids {
+                    self.run_panopt(&["_agent-leave", "--id", id.as_str()], cwd.clone());
+                }
+            }
+        }
+        self.agent_pane_ids.retain(|tid, _| agent_ids.contains(tid));
+
         self.agent_labels.retain(|tid, _| agent_ids.contains(tid));
         for tid in agent_ids {
             if !self.agent_labels.contains_key(&tid) {
@@ -1815,22 +1846,24 @@ impl PanoptPane {
     /// reaches this from a pipe; from the keyboard, the Agents pane spawns
     /// an unnamed agent via `n`.
     fn spawn_agent_pane(&mut self, id: Option<&str>) {
-        let mut args = vec!["_agent".to_string()];
-        if let Some(id) = id {
-            args.push("--id".to_string());
-            args.push(id.to_string());
-        }
+        // Mint a stable id when none was given so the plugin owns it and can
+        // call `_agent-leave` for the pane on death. Without this, an
+        // unnamed cockpit agent would generate its own random id inside the
+        // pane and the plugin would have no way to identify it later.
+        let (final_id, label) = match id {
+            Some(given) => (given.to_string(), given.to_string()),
+            None => {
+                self.next_agent += 1;
+                let n = self.next_agent;
+                (format!("cockpit-agent-{n}"), format!("Agent {n}"))
+            }
+        };
+        let args = vec!["_agent".to_string(), "--id".to_string(), final_id.clone()];
         let Some(PaneId::Terminal(tid)) = self.spawn_in_slot(args, true) else {
             return;
         };
-        let label = match id {
-            Some(given) => given.to_string(),
-            None => {
-                self.next_agent += 1;
-                format!("Agent {}", self.next_agent)
-            }
-        };
         self.agent_labels.insert(tid, label);
+        self.agent_pane_ids.insert(tid, final_id);
         // Project labels right away so the other four panes pick up the
         // new agent's name on their next reload tick.
         write_agent_labels(&self.agent_labels);

@@ -13,6 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use crate::model::{Agent, AgentTool, Lock, Process, Scratchpad, Todo, TodoStatus};
 
@@ -280,23 +281,44 @@ pub(crate) fn render_processes_md(processes: &[Process]) -> String {
 
 /// Render the connected-agent roster as a markdown list.
 ///
-/// Each agent is shown as its name and, when set, its self-reported status.
-/// No timestamp is rendered: the file holds the stable facts, and live idle
-/// time is a tool query (`agent_list`).
-pub(crate) fn render_agents_md(agents: &[Agent]) -> String {
+/// Each agent is shown as its name, its self-reported status when set, and
+/// an `(idle X)` annotation computed from `now - last_seen`. The annotation
+/// is always present so a reader can tell at a glance which agents are
+/// actively making tool calls and which have gone quiet; for
+/// [`crate::KeySource::Declared`] entries the annotation is the only signal
+/// that an agent has gone away, since the daemon never auto-prunes them.
+///
+/// `now` is taken as a parameter (rather than reading `SystemTime::now()`
+/// here) so tests can render against a fixed clock.
+pub(crate) fn render_agents_md(agents: &[Agent], now: SystemTime) -> String {
     let mut out = String::from("# Agents\n\n");
     if agents.is_empty() {
         out.push_str("_(no agents connected)_\n");
         return out;
     }
     for agent in agents {
+        let idle = format_idle(now.duration_since(agent.last_seen).unwrap_or_default());
         if agent.status.is_empty() {
-            out.push_str(&format!("- {}\n", agent.name));
+            out.push_str(&format!("- {} (idle {})\n", agent.name, idle));
         } else {
-            out.push_str(&format!("- {} - {}\n", agent.name, agent.status));
+            out.push_str(&format!(
+                "- {} - {} (idle {})\n",
+                agent.name, agent.status, idle
+            ));
         }
     }
     out
+}
+
+/// Compact human-readable idle duration: `Xm` for under an hour, `Xh` past.
+/// Sub-minute durations render as `0m` so every line has a stable shape.
+fn format_idle(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 /// Render the advisory-lock table as a markdown list.
@@ -342,7 +364,11 @@ pub(crate) fn bootstrap(ws: &Path) -> io::Result<()> {
     )?;
     atomic_write(&agent_tools_path(ws), &render_agent_tools_md(&[]))?;
     atomic_write(&processes_path(ws), &render_processes_md(&[]))?;
-    atomic_write(&agents_path(ws), &render_agents_md(&[]))?;
+    // Empty roster - `now` is irrelevant because nothing is rendered.
+    atomic_write(
+        &agents_path(ws),
+        &render_agents_md(&[], SystemTime::UNIX_EPOCH),
+    )?;
     atomic_write(&locks_path(ws), &render_locks_md(&[]))?;
     // Drop any pre-V6 roster.md left behind by an older install; the V6
     // migration removed the table, and the two new files supersede it.
@@ -425,9 +451,11 @@ pub(crate) fn project_processes(ws: &Path, processes: &[Process]) -> io::Result<
     atomic_write(&processes_path(ws), &render_processes_md(processes))
 }
 
-/// Rewrite `.panopt/agents.md` from the current agent roster.
-pub(crate) fn project_agents(ws: &Path, agents: &[Agent]) -> io::Result<()> {
-    atomic_write(&agents_path(ws), &render_agents_md(agents))
+/// Rewrite `.panopt/agents.md` from the current agent roster. `now` is taken
+/// against which to compute each agent's `(idle X)` annotation; callers in
+/// production pass `SystemTime::now()`.
+pub(crate) fn project_agents(ws: &Path, agents: &[Agent], now: SystemTime) -> io::Result<()> {
+    atomic_write(&agents_path(ws), &render_agents_md(agents, now))
 }
 
 /// Rewrite `.panopt/locks.md` from the current advisory-lock table.
@@ -592,19 +620,21 @@ mod tests {
     #[test]
     fn empty_agent_roster_renders_placeholder() {
         assert_eq!(
-            render_agents_md(&[]),
+            render_agents_md(&[], SystemTime::UNIX_EPOCH),
             "# Agents\n\n_(no agents connected)_\n"
         );
     }
 
     #[test]
     fn agents_render_with_and_without_status() {
-        let now = std::time::SystemTime::now();
+        use crate::model::KeySource;
+        let now = SystemTime::now();
         let agents = vec![
             Agent {
                 key: "k1".into(),
                 name: "alpha".into(),
                 status: "working".into(),
+                key_source: KeySource::Declared,
                 first_seen: now,
                 last_seen: now,
             },
@@ -612,13 +642,37 @@ mod tests {
                 key: "k2".into(),
                 name: "beta".into(),
                 status: String::new(),
+                key_source: KeySource::Session,
                 first_seen: now,
                 last_seen: now,
             },
         ];
         assert_eq!(
-            render_agents_md(&agents),
-            "# Agents\n\n- alpha - working\n- beta\n"
+            render_agents_md(&agents, now),
+            "# Agents\n\n- alpha - working (idle 0m)\n- beta (idle 0m)\n"
+        );
+    }
+
+    #[test]
+    fn idle_annotation_uses_minutes_then_hours() {
+        use crate::model::KeySource;
+        let now = SystemTime::now();
+        let mk = |name: &str, idle: Duration| Agent {
+            key: name.into(),
+            name: name.into(),
+            status: String::new(),
+            key_source: KeySource::Declared,
+            first_seen: now - idle,
+            last_seen: now - idle,
+        };
+        let agents = vec![
+            mk("just-now", Duration::from_secs(5)),
+            mk("a-bit", Duration::from_secs(42 * 60)),
+            mk("an-hour", Duration::from_secs(2 * 3600 + 30 * 60)),
+        ];
+        assert_eq!(
+            render_agents_md(&agents, now),
+            "# Agents\n\n- just-now (idle 0m)\n- a-bit (idle 42m)\n- an-hour (idle 2h)\n"
         );
     }
 
