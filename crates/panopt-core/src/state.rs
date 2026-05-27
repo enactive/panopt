@@ -290,9 +290,10 @@ impl Store {
 
     /// List a project's scratchpads as `(id, title)` pairs, id-ascending.
     pub fn scratchpad_list(&self, project: ProjectId) -> Result<Vec<(u64, String)>, CoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, title FROM scratchpads WHERE project_id = ?1 ORDER BY id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title FROM scratchpads
+              WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY id",
+        )?;
         let rows = stmt.query_map([project.0], |r| {
             Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?))
         })?;
@@ -355,10 +356,15 @@ impl Store {
         self.reproject_scratchpad_full(project, id)
     }
 
-    /// Delete a scratchpad and sweep its per-scratchpad projection file.
+    /// Soft-delete a scratchpad: stamp `deleted_at` so list / read / index
+    /// paths skip it. The row stays behind so a later undelete surface has
+    /// something to revive; the per-scratchpad projection file is swept by
+    /// the index reprojection below (its sweep keys off "scratchpad is in the
+    /// live index", which the row no longer is).
     pub fn scratchpad_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let changed = self.conn.execute(
-            "DELETE FROM scratchpads WHERE project_id = ?1 AND id = ?2",
+            "UPDATE scratchpads SET deleted_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
             params![project.0, id as i64],
         )?;
         if changed == 0 {
@@ -371,7 +377,8 @@ impl Store {
     fn scratchpad_body(&self, project: ProjectId, id: u64) -> Result<String, CoreError> {
         self.conn
             .query_row(
-                "SELECT body FROM scratchpads WHERE project_id = ?1 AND id = ?2",
+                "SELECT body FROM scratchpads
+                  WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| r.get(0),
             )
@@ -383,7 +390,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT title, body, created_at, updated_at FROM scratchpads
-                  WHERE project_id = ?1 AND id = ?2",
+                  WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| {
                     Ok(Scratchpad {
@@ -451,7 +458,9 @@ impl Store {
     pub fn agent_tool_list(&self, project: ProjectId) -> Result<Vec<AgentTool>, CoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, display_name, command, cwd, tool_type, enabled, position, created_at
-               FROM agent_tools WHERE project_id = ?1 ORDER BY position, id",
+               FROM agent_tools
+              WHERE project_id = ?1 AND deleted_at IS NULL
+              ORDER BY position, id",
         )?;
         let rows = stmt.query_map([project.0], |r| {
             Ok(AgentTool {
@@ -524,41 +533,29 @@ impl Store {
         self.reproject_agent_tools(project)
     }
 
-    /// Delete an agent tool. Any process rows that reference it keep running -
-    /// only the back-reference is severed (`agent_tool_id` becomes `None`) so a
-    /// live instance survives its source config. SQLite's composite-FK
-    /// `ON DELETE SET NULL` would also try to null the non-nullable
-    /// `project_id`, so the unlinking is handled here in one transaction with
-    /// the delete instead.
+    /// Soft-delete an agent tool. Any process rows that reference it keep
+    /// their `agent_tool_id` pointing at the now-soft-deleted row so a future
+    /// undelete reconstitutes the link as it was; live process queries
+    /// ignore the soft-deleted tool because every read path filters on
+    /// `deleted_at IS NULL`.
     pub fn agent_tool_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
-        let pid = project.0;
-        let changed = {
-            let tx = self.conn.transaction()?;
-            tx.execute(
-                "UPDATE processes SET agent_tool_id = NULL
-                  WHERE project_id = ?1 AND agent_tool_id = ?2",
-                params![pid, id as i64],
-            )?;
-            let deleted = tx.execute(
-                "DELETE FROM agent_tools WHERE project_id = ?1 AND id = ?2",
-                params![pid, id as i64],
-            )?;
-            tx.commit()?;
-            deleted
-        };
+        let changed = self.conn.execute(
+            "UPDATE agent_tools SET deleted_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+            params![project.0, id as i64],
+        )?;
         if changed == 0 {
             return Err(CoreError::AgentToolNotFound(id));
         }
-        // The unlink may have changed processes too; refresh both projections.
-        self.reproject_agent_tools(project)?;
-        self.reproject_processes(project)
+        self.reproject_agent_tools(project)
     }
 
     fn fetch_agent_tool(&self, project: ProjectId, id: u64) -> Result<AgentTool, CoreError> {
         self.conn
             .query_row(
                 "SELECT name, display_name, command, cwd, tool_type, enabled, position, created_at
-                   FROM agent_tools WHERE project_id = ?1 AND id = ?2",
+                   FROM agent_tools
+                  WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| {
                     Ok(AgentTool {
@@ -644,7 +641,9 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, name, display_name, command, cwd, position,
                     agent_tool_id, pid, status, agent_state, last_seen, created_at
-               FROM processes WHERE project_id = ?1 ORDER BY position, id",
+               FROM processes
+              WHERE project_id = ?1 AND deleted_at IS NULL
+              ORDER BY position, id",
         )?;
         let rows = stmt.query_map([project.0], |r| {
             let kind: String = r.get(1)?;
@@ -746,10 +745,12 @@ impl Store {
         self.reproject_processes(project)
     }
 
-    /// Delete a process.
+    /// Soft-delete a process: stamp `deleted_at` and re-project so the row
+    /// drops out of the live listing while staying behind for future undelete.
     pub fn process_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let changed = self.conn.execute(
-            "DELETE FROM processes WHERE project_id = ?1 AND id = ?2",
+            "UPDATE processes SET deleted_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
             params![project.0, id as i64],
         )?;
         if changed == 0 {
@@ -763,7 +764,8 @@ impl Store {
             .query_row(
                 "SELECT kind, name, display_name, command, cwd, position,
                         agent_tool_id, pid, status, agent_state, last_seen, created_at
-                   FROM processes WHERE project_id = ?1 AND id = ?2",
+                   FROM processes
+                  WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| {
                     let kind: String = r.get(0)?;
@@ -816,9 +818,10 @@ impl Store {
     /// id-ascending.
     pub fn todo_list(&self, project: ProjectId) -> Result<Vec<Todo>, CoreError> {
         let ids: Vec<u64> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM todos WHERE project_id = ?1 ORDER BY id")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM todos
+                  WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY id",
+            )?;
             let rows = stmt.query_map([project.0], |r| Ok(r.get::<_, i64>(0)? as u64))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -886,7 +889,7 @@ impl Store {
     pub fn todo_complete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let changed = self.conn.execute(
             "UPDATE todos SET status = 'completed', updated_at = datetime('now')
-              WHERE project_id = ?1 AND id = ?2",
+              WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
             params![project.0, id as i64],
         )?;
         if changed == 0 {
@@ -896,11 +899,14 @@ impl Store {
         self.reproject_todos(project)
     }
 
-    /// Delete a todo and, by foreign-key cascade, its comments and every
-    /// blocker row in which it appears (as the blocked todo or the blocker).
+    /// Soft-delete a todo: stamp `deleted_at` so the live list, fetches, and
+    /// the projection sweep it. Comments and blocker links stay in their side
+    /// tables for the eventual undelete to reattach; cleanup of orphan side
+    /// rows is deferred (see todo #54).
     pub fn todo_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let changed = self.conn.execute(
-            "DELETE FROM todos WHERE project_id = ?1 AND id = ?2",
+            "UPDATE todos SET deleted_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
             params![project.0, id as i64],
         )?;
         if changed == 0 {
@@ -963,7 +969,8 @@ impl Store {
             let tx = self.conn.transaction()?;
             let next: Option<i64> = tx
                 .query_row(
-                    "SELECT next_comment_id FROM todos WHERE project_id = ?1 AND id = ?2",
+                    "SELECT next_comment_id FROM todos
+                      WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                     params![pid, id as i64],
                     |r| r.get(0),
                 )
@@ -1081,7 +1088,7 @@ impl Store {
     pub fn todo_tags_list(&self, project: ProjectId) -> Result<Vec<String>, CoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT tags FROM todos WHERE project_id = ?1")?;
+            .prepare("SELECT tags FROM todos WHERE project_id = ?1 AND deleted_at IS NULL")?;
         let rows = stmt.query_map([project.0], |r| r.get::<_, String>(0))?;
         let mut set: HashSet<String> = HashSet::new();
         for row in rows {
@@ -1136,7 +1143,8 @@ impl Store {
             .query_row(
                 "SELECT title, body, status, priority, assignee, tags,
                         created_at, updated_at, completed_at
-                   FROM todos WHERE project_id = ?1 AND id = ?2",
+                   FROM todos
+                  WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| {
                     let status: String = r.get(2)?;
@@ -1165,11 +1173,20 @@ impl Store {
         Ok(todo)
     }
 
-    /// The ids that block todo `id`, ascending.
+    /// The ids that block todo `id`, ascending. Soft-deleted blockers are
+    /// hidden so the form / projection never surfaces a chip pointing at a
+    /// row that the list otherwise treats as gone.
     fn todo_blockers(&self, project: ProjectId, id: u64) -> Result<Vec<u64>, CoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT blocker_id FROM todo_blockers
-              WHERE project_id = ?1 AND todo_id = ?2 ORDER BY blocker_id",
+            "SELECT b.blocker_id FROM todo_blockers b
+              WHERE b.project_id = ?1 AND b.todo_id = ?2
+                AND EXISTS (
+                    SELECT 1 FROM todos t
+                     WHERE t.project_id = b.project_id
+                       AND t.id = b.blocker_id
+                       AND t.deleted_at IS NULL
+                )
+              ORDER BY b.blocker_id",
         )?;
         let rows = stmt.query_map(params![project.0, id as i64], |r| {
             Ok(r.get::<_, i64>(0)? as u64)
@@ -1246,7 +1263,7 @@ impl Store {
     ) -> Result<Vec<(u64, String, String)>, CoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, updated_at FROM scratchpads
-              WHERE project_id = ?1 ORDER BY id",
+              WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([project.0], |r| {
             Ok((
@@ -1439,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_an_agent_tool_nulls_the_processes_back_reference() {
+    fn deleting_an_agent_tool_preserves_the_processes_back_reference() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
         let tool = fx
@@ -1467,11 +1484,15 @@ mod tests {
             )
             .unwrap();
         fx.store.agent_tool_delete(p, tool).unwrap();
+        // Soft delete keeps the link: the process row still names its source
+        // tool, even though `agent_tool_get` now returns NotFound. That way a
+        // future undelete reconstitutes the relationship as it was.
         let row = fx.store.process_get(p, proc).unwrap();
-        assert_eq!(
-            row.agent_tool_id, None,
-            "ON DELETE SET NULL keeps the live process running but unlinks the tool"
-        );
+        assert_eq!(row.agent_tool_id, Some(tool));
+        assert!(matches!(
+            fx.store.agent_tool_get(p, tool).unwrap_err(),
+            CoreError::AgentToolNotFound(_)
+        ));
     }
 
     #[test]
@@ -2255,5 +2276,58 @@ mod tests {
             "{index}"
         );
         assert!(index.contains("- [#2](scratchpad/2.md) scratch"), "{index}");
+    }
+
+    /// Soft delete keeps the row in SQLite but hides it from every live read
+    /// path: list, get, the projection. The row is the seed for a future
+    /// undelete surface; without it, recovery would have nothing to revive.
+    #[test]
+    fn soft_delete_keeps_the_row_but_hides_it_from_reads() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.todo_create(p, "going away".into()).unwrap();
+        fx.store.todo_delete(p, id).unwrap();
+
+        assert!(fx.store.todo_list(p).unwrap().is_empty());
+        assert!(matches!(
+            fx.store.todo_get(p, id).unwrap_err(),
+            CoreError::TodoNotFound(_)
+        ));
+        // A second delete on the same id reports NotFound because the live
+        // row is gone from the deleter's point of view.
+        assert!(matches!(
+            fx.store.todo_delete(p, id).unwrap_err(),
+            CoreError::TodoNotFound(_)
+        ));
+
+        let surviving: i64 = fx
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM todos WHERE project_id = ?1 AND deleted_at IS NOT NULL",
+                [p.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(surviving, 1, "row stays behind for future undelete");
+    }
+
+    /// A blocker pointing at a soft-deleted todo must not surface in the
+    /// blocked todo's `blockers` list - otherwise the form / projection
+    /// shows a chip for a row the rest of the UI treats as gone.
+    #[test]
+    fn blocker_list_hides_soft_deleted_blockers() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let blocker = fx.store.todo_create(p, "upstream".into()).unwrap();
+        let blocked = fx.store.todo_create(p, "downstream".into()).unwrap();
+        fx.store.todo_add_blocker(p, blocked, blocker).unwrap();
+        assert_eq!(
+            fx.store.todo_get(p, blocked).unwrap().blockers,
+            vec![blocker]
+        );
+
+        fx.store.todo_delete(p, blocker).unwrap();
+        assert!(fx.store.todo_get(p, blocked).unwrap().blockers.is_empty());
     }
 }

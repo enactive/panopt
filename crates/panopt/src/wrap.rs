@@ -34,11 +34,7 @@ pub(crate) struct Wrapped {
 ///
 /// `width == 0` is treated as "no wrap": the input lines pass through and the
 /// visual cursor matches the logical one in row, with col clamped.
-pub(crate) fn wrap_for_display(
-    lines: &[String],
-    cursor: (usize, usize),
-    width: usize,
-) -> Wrapped {
+pub(crate) fn wrap_for_display(lines: &[String], cursor: (usize, usize), width: usize) -> Wrapped {
     if width == 0 {
         return Wrapped {
             lines: lines.to_vec(),

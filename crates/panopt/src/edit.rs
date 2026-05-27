@@ -22,9 +22,9 @@ use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
 use crate::daemon;
-use crate::todo_form::{TodoForm, TodoFormAction};
 use crate::mcpclient::Client;
 use crate::todo::observer_url;
+use crate::todo_form::{TodoForm, TodoFormAction};
 
 /// Run the todo form. Exactly one of `id` (edit that todo) or `new` (create a
 /// fresh one) must be set.
@@ -60,7 +60,9 @@ pub fn run(ws: Option<PathBuf>, id: Option<u64>, new: bool, port: u16) -> Result
     // focus next, or be killed before the request lands. The call typically
     // never returns: closing the pane ends this process.
     if std::env::var_os("ZELLIJ").is_some() {
-        let _ = Command::new("zellij").args(["action", "close-pane"]).status();
+        let _ = Command::new("zellij")
+            .args(["action", "close-pane"])
+            .status();
     }
     outcome
 }

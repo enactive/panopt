@@ -23,7 +23,9 @@ use serde_json::json;
 use tui_textarea::TextArea;
 
 use crate::mcpclient::Client;
-use crate::todo_form::{paste_into, paste_into_single_line, single_line_input, text_area, text_input};
+use crate::todo_form::{
+    paste_into, paste_into_single_line, single_line_input, text_area, text_input,
+};
 
 /// What [`ScratchpadForm::handle_key`] is telling the host to do next.
 ///
@@ -293,7 +295,11 @@ impl ScratchpadForm {
     /// `tui_textarea` limitation drove this widget here.
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Field::Body;
-        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let border = if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
         let block = Block::bordered()
             .title("Body")
             .border_style(Style::default().fg(border));
@@ -329,11 +335,7 @@ impl ScratchpadForm {
             .collect();
         frame.render_widget(Paragraph::new(visible), inner);
 
-        if focused
-            && cvr >= self.body_scroll
-            && cvr < self.body_scroll + height
-            && cvc < width
-        {
+        if focused && cvr >= self.body_scroll && cvr < self.body_scroll + height && cvc < width {
             let cy = inner.y + (cvr - self.body_scroll) as u16;
             let cx = inner.x + cvc as u16;
             frame.set_cursor_position((cx, cy));
@@ -349,7 +351,11 @@ impl ScratchpadForm {
             Field::Title => &mut self.title,
             Field::Body => return,
         };
-        let border = if focused { Color::Yellow } else { Color::DarkGray };
+        let border = if focused {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
         area.set_block(
             Block::bordered()
                 .title(label)

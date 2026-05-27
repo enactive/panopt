@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -282,9 +282,27 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 6 {
         apply_v6(conn)?;
     }
+    if version < 7 {
+        apply_v7(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
+    Ok(())
+}
+
+/// Version 7: soft delete (todo #54).
+///
+/// Each item-bearing table grows a nullable `deleted_at` column. `*_delete`
+/// stamps it with `datetime('now')` instead of issuing a `DELETE FROM`, and
+/// every read path (`*_list`, `*_get`, `fetch_*`, the blocker-resolution helper)
+/// filters on `deleted_at IS NULL`. The row stays behind so a future undelete
+/// surface has something to revive; recovery / cleanup tooling is deferred.
+fn apply_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "todos", "deleted_at", "TEXT")?;
+    add_column_if_missing(conn, "scratchpads", "deleted_at", "TEXT")?;
+    add_column_if_missing(conn, "agent_tools", "deleted_at", "TEXT")?;
+    add_column_if_missing(conn, "processes", "deleted_at", "TEXT")?;
     Ok(())
 }
 
@@ -665,6 +683,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(roster_present, 0);
+    }
+
+    #[test]
+    fn v6_database_upgrades_to_v7_with_soft_delete_columns() {
+        // Stand up a V6 database, populate one row per item-bearing table,
+        // and confirm V7 adds the `deleted_at` column without disturbing the
+        // existing rows. The columns are nullable, so backfill is a no-op.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, next_id) VALUES (1, '/x', 5);
+             INSERT INTO todos (project_id, id, title, status, created_at, updated_at)
+                 VALUES (1, 1, 't', 'open', '2026-01-01', '2026-01-01');
+             INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+                 VALUES (1, 2, 's', '', '2026-01-01', '2026-01-01');
+             INSERT INTO agent_tools
+                 (project_id, id, name, position, created_at)
+                 VALUES (1, 3, 'claude', 1, '2026-01-01');
+             INSERT INTO processes
+                 (project_id, id, kind, name, created_at)
+                 VALUES (1, 4, 'agent', 'claude-1', '2026-01-01');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Every pre-V7 row is live (deleted_at IS NULL) post-migration.
+        for table in ["todos", "scratchpads", "agent_tools", "processes"] {
+            let alive: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE deleted_at IS NULL"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(alive, 1, "{table} row survives V7 migration as live");
+        }
     }
 
     #[test]

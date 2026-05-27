@@ -621,6 +621,10 @@ impl ZellijPlugin for PanoptPane {
                 self.handle_gate_decision(pipe_message.payload.as_deref());
                 true
             }
+            "panopt:delete-gate-decision" => {
+                self.handle_delete_decision(pipe_message.payload.as_deref());
+                true
+            }
             _ => false,
         }
     }
@@ -1476,20 +1480,93 @@ impl PanoptPane {
     /// delete has no CLI yet - surface a refusal so the user knows the
     /// keypress was seen.
     fn delete_focused(&mut self) {
-        let Some(target) = self.focused_target() else {
+        let Some(item) = self.items.get(self.cursor) else {
             return;
         };
+        let target = item.target.clone();
+        let label = item.label.clone();
         let Some(cwd) = self.launch_cwd() else {
             return;
         };
         match target {
-            ItemTarget::Todo(id) => {
-                self.run_panopt(&["todo", "rm", &id.to_string(), "--port", &self.port], cwd)
-            }
+            ItemTarget::Todo(id) => self.spawn_delete_gate_dialog("todo", id, &label, cwd),
             ItemTarget::Scratchpad(_) => {
                 self.refuse_gate("scratchpad delete not yet supported");
             }
-            ItemTarget::Process(id) => {
+            ItemTarget::Process(id) => self.spawn_delete_gate_dialog("process", id, &label, cwd),
+            // A "pane" target is a transient view (a terminal pane, an ad-hoc
+            // agent pane) - closing it does not delete any persistent record,
+            // so no confirmation is needed.
+            ItemTarget::Pane(pane) => {
+                close_pane_with_id(pane);
+            }
+        }
+    }
+
+    /// Float the delete-confirmation dialog (`panopt _delete-gate`). On `y`
+    /// the dialog pipes `panopt:delete-gate-decision` back; the actual delete
+    /// then runs from [`Self::handle_delete_decision`] so the dialog stays
+    /// purely advisory.
+    fn spawn_delete_gate_dialog(&mut self, kind: &str, id: u64, label: &str, cwd: PathBuf) {
+        let args = vec![
+            "_delete-gate".to_string(),
+            "--kind".to_string(),
+            kind.to_string(),
+            "--id".to_string(),
+            id.to_string(),
+            "--label".to_string(),
+            label.to_string(),
+            "--port".to_string(),
+            self.port.clone(),
+        ];
+        open_command_pane_floating(
+            CommandToRun {
+                path: PathBuf::from(&self.panopt_bin),
+                args,
+                cwd: Some(cwd),
+            },
+            None,
+            BTreeMap::new(),
+        );
+    }
+
+    /// Handle the `panopt:delete-gate-decision` pipe: parse `kind`/`id`/
+    /// `decision` and, when the user confirmed, run the matching destructive
+    /// CLI. Mirrors [`Self::handle_gate_decision`] in shape so a reader who
+    /// knows one knows the other.
+    fn handle_delete_decision(&mut self, payload: Option<&str>) {
+        let Some(payload) = payload else { return };
+        let mut kind: Option<&str> = None;
+        let mut id: Option<u64> = None;
+        let mut decision: Option<&str> = None;
+        for kv in payload.split(';') {
+            let (k, v) = match kv.split_once('=') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            match k {
+                "kind" => kind = Some(v),
+                "id" => id = v.parse().ok(),
+                "decision" => decision = Some(v),
+                _ => {}
+            }
+        }
+        if decision != Some("delete") {
+            return;
+        }
+        let (Some(kind), Some(id)) = (kind, id) else {
+            return;
+        };
+        let Some(cwd) = self.launch_cwd() else { return };
+        match kind {
+            "todo" => {
+                self.run_panopt(&["todo", "rm", &id.to_string(), "--port", &self.port], cwd);
+            }
+            "process" => {
+                // Process delete also tears down its live pane (if any), the
+                // same way the pre-gate `delete_focused` used to. The pane
+                // close runs before the daemon delete so the user does not
+                // see a stale row briefly.
                 if let Some(pane) = self.process_pane(id) {
                     close_pane_with_id(pane);
                 }
@@ -1498,9 +1575,10 @@ impl PanoptPane {
                     cwd,
                 );
             }
-            ItemTarget::Pane(pane) => {
-                close_pane_with_id(pane);
-            }
+            // `scratchpad` and `agent-tool` are not yet reachable through the
+            // sidebar's delete keybind, so a stray pipe for them is ignored
+            // rather than executed against a missing CLI.
+            _ => {}
         }
     }
 

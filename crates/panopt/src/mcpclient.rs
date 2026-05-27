@@ -51,10 +51,15 @@ impl Client {
             .header("mcp-session-id")
             .ok_or_else(|| anyhow!("daemon returned no MCP session id"))?
             .to_string();
-        let body = resp.into_string().context("reading the initialize response")?;
+        let body = resp
+            .into_string()
+            .context("reading the initialize response")?;
         parse_rpc(&body).context("initialize failed")?;
 
-        let client = Client { url: url.to_string(), session };
+        let client = Client {
+            url: url.to_string(),
+            session,
+        };
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         client
             .post(&note.to_string())
@@ -82,7 +87,9 @@ impl Client {
 
     /// Best-effort: ask the daemon to drop this session.
     pub fn close(self) {
-        let _ = ureq::delete(&self.url).set("mcp-session-id", &self.session).call();
+        let _ = ureq::delete(&self.url)
+            .set("mcp-session-id", &self.session)
+            .call();
     }
 
     /// POST `body` to the endpoint with the session header; return the response
@@ -145,7 +152,10 @@ fn extract_json(body: &str) -> Result<Value> {
 fn tool_text(result: &Value) -> Result<Value> {
     let text = first_text(result);
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        bail!("{}", text.unwrap_or_else(|| "tool reported an error".into()));
+        bail!(
+            "{}",
+            text.unwrap_or_else(|| "tool reported an error".into())
+        );
     }
     let text = text.ok_or_else(|| anyhow!("tool returned no text content"))?;
     Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))

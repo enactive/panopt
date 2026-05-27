@@ -7,6 +7,7 @@ mod agent;
 mod agent_tool;
 mod close_gate;
 mod daemon;
+mod delete_gate;
 mod edit;
 mod mcp;
 mod mcpclient;
@@ -120,6 +121,20 @@ enum Cmd {
         #[arg(long)]
         target_pane: Option<u32>,
     },
+    /// Internal: the floating delete-confirmation dialog the sidebar plugin
+    /// spawns when the user presses `x` on a row.
+    #[command(name = "_delete-gate", hide = true)]
+    DeleteGateExec {
+        /// Item kind: todo, scratchpad, agent-tool, or process.
+        #[arg(long)]
+        kind: String,
+        /// Numeric id of the item the user wants to delete.
+        #[arg(long)]
+        id: u64,
+        /// Human label for the row (title / name); shown in the dialog.
+        #[arg(long, default_value = "")]
+        label: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -133,8 +148,11 @@ fn main() -> anyhow::Result<()> {
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
-        Cmd::CloseGateExec { scope, items, target_pane } => {
-            close_gate::run(&scope, &items, target_pane, cli.port)
-        }
+        Cmd::CloseGateExec {
+            scope,
+            items,
+            target_pane,
+        } => close_gate::run(&scope, &items, target_pane, cli.port),
+        Cmd::DeleteGateExec { kind, id, label } => delete_gate::run(&kind, id, &label, cli.port),
     }
 }
