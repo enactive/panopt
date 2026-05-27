@@ -1,0 +1,21 @@
+i restarted *this* agent and agent_list shows two agents connected, but an agent running in panopt still sees only itself.
+
+---
+
+i ran it JUST NOW and it says:
+
+---
+
+i ran it JUST NOW and it says one: agent-4dc2f9df
+
+---
+
+file it.  discuss this 'ephemeral by design' BS that you mentioned.
+
+---
+
+what about connection-based?
+
+---
+
+if this is the best approach (sound like), then is 83 really separate?
