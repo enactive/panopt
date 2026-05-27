@@ -7,14 +7,14 @@
 //! agent falls back to the rotating MCP session id and shows up in the
 //! registry as a ghost that other agents cannot pin down (DESIGN.md §9).
 //!
-//! The emitted config bakes the resolved `ws`, `agent`, `name`, and `token`
-//! straight into the URL so a hand-launched session is identical in shape to
-//! a cockpit-spawned one - no PANOPT_* env vars required on the caller.
+//! Emits a stdio config so Claude Code spawns `panopt _mcp-proxy`, which
+//! holds the long-lived MCP session and forwards to panoptd over HTTP -
+//! making the hand-launched session survive panoptd restarts transparently,
+//! the same way cockpit-spawned ones do.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::json;
 
 use crate::paths;
@@ -34,21 +34,20 @@ pub fn run(
     let token = panopt_core::auth::read_token(&paths::token()?)
         .context("reading the panopt token (start the daemon with `panopt up`)")?;
 
-    let encode = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
-    let url = format!(
-        "http://{}:{}/mcp?ws={}&agent={}&name={}&token={}",
-        host,
-        port,
-        encode(&ws.to_string_lossy()),
-        encode(&id),
-        encode(&name),
-        encode(&token),
-    );
     let cfg = json!({
         "mcpServers": {
             "panopt": {
-                "type": "http",
-                "url": url,
+                "type": "stdio",
+                "command": "panopt",
+                "args": [
+                    "--port", port.to_string(),
+                    "_mcp-proxy",
+                    "--host", host,
+                    "--ws", ws.to_string_lossy(),
+                    "--id", id,
+                    "--name", name,
+                    "--token", token,
+                ],
             }
         }
     });

@@ -13,6 +13,14 @@ use serde_json::json;
 use crate::mcpclient::Client;
 use crate::{mcp, paths};
 
+// Note: `_agent` no longer pre-registers against the daemon directly. The
+// stdio MCP proxy that Claude Code spawns from this pane (via the config at
+// `mcp.rs`) initializes its panoptd session as soon as Claude Code sends
+// its first `initialize` over stdio, which both registers the agent and
+// applies its name to the registry entry. The pane-death hook keeps using
+// `_agent-leave` over HTTP because at that point the agent process is gone
+// and there is no proxy to call through.
+
 /// `panopt agent [name]` - open a new agent pane in the running cockpit.
 ///
 /// The cockpit's Zellij plugin is the spawner; this just sends it a
@@ -43,8 +51,9 @@ pub fn spawn(name: Option<String>) -> Result<()> {
 ///
 /// Sets the per-agent environment and replaces this process with `claude`, so
 /// the pane *is* the agent with no PANopt wrapper around it. The MCP template
-/// at `mcp.rs` expands these env vars in the `--mcp-config` URL, giving the
-/// pane a stable agent id, a friendly display name, and the bearer token.
+/// at `mcp.rs` tells claude to spawn `panopt _mcp-proxy` as a stdio MCP
+/// server, which carries the env vars set here into the panoptd URL and
+/// keeps the session alive across daemon restarts.
 pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Result<()> {
     let config = mcp::ensure()?;
     let ws = resolve_ws(ws)?;

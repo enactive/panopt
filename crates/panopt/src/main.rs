@@ -12,6 +12,7 @@ mod delete_gate;
 mod edit;
 mod id_kind;
 mod mcp;
+mod mcp_proxy;
 mod mcpclient;
 mod paths;
 mod process;
@@ -141,6 +142,27 @@ enum Cmd {
         #[arg(long)]
         id: String,
     },
+    /// Internal: long-lived stdio MCP server that forwards to panoptd over
+    /// HTTP. Claude Code spawns this via `--mcp-config` so its connection
+    /// stays up across panoptd restarts.
+    #[command(name = "_mcp-proxy", hide = true)]
+    McpProxy {
+        /// Daemon host (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Project root the agent is scoped to.
+        #[arg(long)]
+        ws: PathBuf,
+        /// Stable agent id (becomes `?agent=` on the panoptd URL).
+        #[arg(long)]
+        id: String,
+        /// Friendly display name (becomes `?name=` on the panoptd URL).
+        #[arg(long)]
+        name: String,
+        /// Bearer token for the daemon's auth gate.
+        #[arg(long)]
+        token: String,
+    },
     /// Internal: start a process in this pane.
     #[command(name = "_process-run", hide = true)]
     ProcessRun {
@@ -207,6 +229,13 @@ fn main() -> anyhow::Result<()> {
         Cmd::IdKind { ws, id } => id_kind::run(ws, id, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
         Cmd::AgentLeave { ws, id } => agent::leave(ws, id, cli.port),
+        Cmd::McpProxy {
+            host,
+            ws,
+            id,
+            name,
+            token,
+        } => mcp_proxy::run(host, cli.port, ws, id, name, token),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
         Cmd::CloseGateExec {

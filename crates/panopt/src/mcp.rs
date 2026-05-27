@@ -1,11 +1,14 @@
 //! The agent MCP config file.
 //!
 //! One static, env-templated MCP server entry that every launched agent shares.
-//! `claude` expands `${PANOPT_HOST}` / `${PANOPT_PORT}` / `${PANOPT_WS}` /
-//! `${PANOPT_AGENT}` / `${PANOPT_NAME}` / `${PANOPT_TOKEN}` from the per-pane
-//! environment when it reads the file, so a single file gives each agent a
-//! distinct stable identity, a friendly display name, and the bearer token the
-//! daemon requires (DESIGN.md Sections 5.3 and 9).
+//! Claude Code spawns `panopt _mcp-proxy` as a stdio MCP server; the proxy
+//! then forwards everything to panoptd over HTTP and reconnects across
+//! daemon restarts so Claude Code's session stays up. `claude` expands
+//! `${PANOPT_HOST}` / `${PANOPT_PORT}` / `${PANOPT_WS}` / `${PANOPT_AGENT}` /
+//! `${PANOPT_NAME}` / `${PANOPT_TOKEN}` from the per-pane environment when
+//! it reads the file, so a single file gives each agent a distinct stable
+//! identity, a friendly display name, and the bearer token the daemon
+//! requires (DESIGN.md Sections 5.3 and 9).
 
 use anyhow::{Context, Result};
 
@@ -15,8 +18,17 @@ use crate::paths;
 const AGENT_MCP_JSON: &str = r#"{
   "mcpServers": {
     "panopt": {
-      "type": "http",
-      "url": "http://${PANOPT_HOST:-127.0.0.1}:${PANOPT_PORT:-7600}/mcp?ws=${PANOPT_WS}&agent=${PANOPT_AGENT}&name=${PANOPT_NAME}&token=${PANOPT_TOKEN}"
+      "type": "stdio",
+      "command": "panopt",
+      "args": [
+        "--port", "${PANOPT_PORT:-7600}",
+        "_mcp-proxy",
+        "--host", "${PANOPT_HOST:-127.0.0.1}",
+        "--ws", "${PANOPT_WS}",
+        "--id", "${PANOPT_AGENT}",
+        "--name", "${PANOPT_NAME}",
+        "--token", "${PANOPT_TOKEN}"
+      ]
     }
   }
 }
@@ -43,8 +55,29 @@ pub fn ensure() -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn agent_mcp_json_is_valid() {
+    fn agent_mcp_json_is_valid_stdio_config() {
         let v: serde_json::Value = serde_json::from_str(super::AGENT_MCP_JSON).unwrap();
-        assert!(v["mcpServers"]["panopt"]["url"].is_string());
+        let server = &v["mcpServers"]["panopt"];
+        assert_eq!(server["type"], "stdio");
+        assert_eq!(server["command"], "panopt");
+        let args = server["args"].as_array().expect("args is an array");
+        // The proxy subcommand has to be present, and every templated env
+        // var the proxy needs has to make it into the args list.
+        let joined: String = args
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("_mcp-proxy"), "{joined}");
+        for needle in [
+            "${PANOPT_PORT",
+            "${PANOPT_HOST",
+            "${PANOPT_WS}",
+            "${PANOPT_AGENT}",
+            "${PANOPT_NAME}",
+            "${PANOPT_TOKEN}",
+        ] {
+            assert!(joined.contains(needle), "missing {needle} in {joined}");
+        }
     }
 }
