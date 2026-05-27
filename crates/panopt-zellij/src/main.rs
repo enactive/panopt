@@ -190,12 +190,31 @@ impl TodoFilter {
     }
 }
 
+/// Find where the trailing " - <suffix>" segment of a projection label
+/// begins. Two shapes need to round-trip cleanly:
+/// - "wire up auth - open, high" - normal case, look for the last " - ".
+/// - "- open, high" - empty-title case (the projection's `{title}` slot was
+///   empty, the parser already stripped one of the surrounding spaces), strip
+///   the leading "- ".
+///
+/// Returns the byte index of the suffix payload's first character, or `None`
+/// when the label has no recognized suffix marker.
+fn suffix_start(label: &str) -> Option<usize> {
+    if let Some(pos) = label.rfind(" - ") {
+        Some(pos + 3)
+    } else if label.starts_with("- ") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 /// Extract the wire status token from a projection-index label suffix like
 /// `wire up auth - open, high`. Returns `None` for labels without a known
 /// suffix; callers treat that as "do not hide."
 fn parse_status_suffix(label: &str) -> Option<&str> {
-    let dash = label.rfind(" - ")?;
-    let rest = &label[dash + 3..];
+    let start = suffix_start(label)?;
+    let rest = &label[start..];
     let comma = rest.find(',').unwrap_or(rest.len());
     let token = rest[..comma].trim();
     matches!(
@@ -209,8 +228,8 @@ fn parse_status_suffix(label: &str) -> Option<&str> {
 /// like `wire up auth - open, high`. Returns `None` for labels without a
 /// known suffix.
 fn parse_priority_suffix(label: &str) -> Option<&str> {
-    let dash = label.rfind(" - ")?;
-    let rest = &label[dash + 3..];
+    let start = suffix_start(label)?;
+    let rest = &label[start..];
     let comma = rest.find(',')?;
     let token = rest[comma + 1..].trim();
     matches!(token, "high" | "medium" | "low").then_some(token)
@@ -2298,9 +2317,15 @@ fn viewer_title_for(
 /// the user typed.
 fn lookup_title(index: &[(u64, String)], id: u64) -> Option<String> {
     let label = index.iter().find(|(i, _)| *i == id).map(|(_, l)| l)?;
-    let trimmed = match label.rfind(" - ") {
-        Some(dash) => label[..dash].trim(),
-        None => label.trim(),
+    // The title is everything BEFORE the suffix marker. " - " (with leading
+    // space) covers the normal case; a label that starts directly with "- "
+    // is the empty-title case, so the title is "".
+    let trimmed = if let Some(dash) = label.rfind(" - ") {
+        label[..dash].trim()
+    } else if label.starts_with("- ") {
+        ""
+    } else {
+        label.trim()
     };
     if trimmed.is_empty() {
         None
@@ -2349,18 +2374,13 @@ fn parse_index_line(line: &str) -> Option<(u64, String)> {
     let close = line[hash..].find(']')? + hash;
     let id: u64 = line[hash..close].parse().ok()?;
     let label_at = line[close..].find(") ")? + close + 2;
-    let raw = line.get(label_at..).unwrap_or("");
-    // The scratchpad/todo projections both render as
-    // `- [#N](path) {title} - <suffix>`, so when the title slot is empty the
-    // raw chunk we just sliced out starts with a space (the projection's
-    // pre-suffix separator). Treat that as "no title": otherwise the leading-
-    // space gets trimmed and `lookup_title` mistakes the orphan `- updated
-    // <ts>` or `- <status>, <priority>` for the title.
-    let label = if raw.starts_with(' ') {
-        String::new()
-    } else {
-        raw.trim().to_string()
-    };
+    // The scratchpad/todo projections render as `- [#N](path) {title} - <sfx>`,
+    // so an empty title leaves the raw chunk starting with a space (one of the
+    // two literal spaces around `{title}`). `.trim()` collapses both the
+    // empty-title case and the non-empty case onto the same shape - a label
+    // like "- open, medium" (no title) or "wire it - open, medium" (with
+    // title); the suffix parsers below detect "no title" via the leading "- ".
+    let label = line.get(label_at..).unwrap_or("").trim().to_string();
     Some((id, label))
 }
 
@@ -2463,31 +2483,49 @@ mod tests {
     }
 
     #[test]
-    fn empty_title_scratchpad_line_returns_an_empty_label() {
+    fn empty_title_scratchpad_line_keeps_the_suffix_in_the_label() {
         // After a user clears the title field, the projection renders
-        // `- [#N](scratchpad/N.md)  - updated <ts>` (double space). Without
-        // the leading-space guard, parse_index_line would trim and surface
-        // `- updated <ts>` as the title - which then appears in the sidebar
-        // entry and the pane title.
+        // `- [#N](scratchpad/N.md)  - updated <ts>` (double space). The
+        // parser strips one of the spaces, leaving the label as
+        // "- updated <ts>" - suffix-only, no title.
         let (id, label) =
             parse_index_line("- [#73](scratchpad/73.md)  - updated 2026-05-27 07:00:00").unwrap();
         assert_eq!(id, 73);
-        assert_eq!(label, "");
-        // lookup_title rolls the empty label up to "no title" so the pane
-        // title falls back to "Scratchpad #N".
+        assert_eq!(label, "- updated 2026-05-27 07:00:00");
+        // lookup_title recognises the leading "- " as the empty-title shape
+        // and returns None so the pane title falls back to "Scratchpad #N".
         let pads = vec![(73u64, label)];
         assert!(lookup_title(&pads, 73).is_none());
     }
 
     #[test]
-    fn empty_title_todo_line_returns_an_empty_label() {
-        // The same shape on the todo side: empty title + " - open, medium"
-        // suffix used to leak the suffix into the sidebar.
+    fn empty_title_todo_line_still_parses_status_and_priority() {
+        // Empty title for a todo: "- [ ] [#75](todos/75.md)  - open, medium".
+        // The sort path needs the priority and the filter path needs the
+        // status; without `suffix_start`'s empty-title branch the label
+        // "- open, medium" would parse as no-suffix and the todo would sort
+        // to the bottom (rank 0) regardless of its real priority.
         let (id, label) = parse_index_line("- [ ] [#75](todos/75.md)  - open, medium").unwrap();
         assert_eq!(id, 75);
-        assert_eq!(label, "");
+        assert_eq!(label, "- open, medium");
+        assert_eq!(parse_status_suffix(&label), Some("open"));
+        assert_eq!(parse_priority_suffix(&label), Some("medium"));
         let todos = vec![(75u64, label)];
         assert!(lookup_title(&todos, 75).is_none());
+    }
+
+    #[test]
+    fn suffix_start_picks_the_right_marker_for_each_shape() {
+        // Normal case: title + suffix, separator is " - " (3 chars).
+        assert_eq!(suffix_start("wire up auth - open, high"), Some(15));
+        // Empty-title case: label is the suffix only, "- " consumed (2 chars).
+        assert_eq!(suffix_start("- open, high"), Some(2));
+        // Title with embedded " - " plus a trailing suffix: rfind picks the
+        // rightmost, which is the projection-level separator.
+        let s = "a - b - open, high";
+        assert_eq!(suffix_start(s), Some(s.rfind(" - ").unwrap() + 3));
+        // No suffix at all.
+        assert!(suffix_start("plain title").is_none());
     }
 
     #[test]
