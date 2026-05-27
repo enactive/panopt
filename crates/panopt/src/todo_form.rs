@@ -1023,14 +1023,15 @@ impl TodoForm {
     /// Render the form into `area`. The host is responsible for clearing the
     /// rect first if it needs to.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        // Rows: header / title / status+priority / assignee+tags / body /
-        // comments / blockers / context / message.
-        // Body is 3x the size of comments. Blockers is a single-line chip
-        // strip; Status, Priority, Assignee, and Tags are also single-line
-        // inline fields - together they free six rows of vertical space for
-        // the body and comments blocks.
+        // Rows: title / status+priority / assignee+tags / body / comments /
+        // blockers / context / message. Body is 3x the size of comments.
+        // Blockers is a single-line chip strip; Status, Priority, Assignee,
+        // and Tags are also single-line inline fields - together they free
+        // six rows of vertical space for the body and comments blocks. The
+        // pane title (set by the Zellij sidebar) already names the todo, so
+        // no in-form header row is needed; locked-by, when set, surfaces in
+        // the message line at the bottom.
         let rows = Layout::vertical([
-            Constraint::Length(1),   // header (incl. locked-by banner)
             Constraint::Length(3),   // title
             Constraint::Length(1),   // status + priority
             Constraint::Length(1),   // assignee + tags
@@ -1042,24 +1043,12 @@ impl TodoForm {
         ])
         .split(area);
 
-        let header_text = match (&self.id, &self.locked_by) {
-            (Some(id), Some(holder)) => format!(" Edit todo #{id}   [locked by {holder}]"),
-            (Some(id), None) => format!(" Edit todo #{id}"),
-            (None, _) => " New todo".to_string(),
-        };
-        let header_style = if self.locked_by.is_some() {
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red)
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        };
-        frame.render_widget(Paragraph::new(header_text).style(header_style), rows[0]);
-
         self.style_field(Field::Title, "Title");
-        frame.render_widget(&self.title, rows[1]);
+        frame.render_widget(&self.title, rows[0]);
 
         let focus = FIELDS[self.focus];
         let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[2]);
+            .split(rows[1]);
         frame.render_widget(
             enum_line("Status", STATUSES[self.status], focus == Field::Status),
             cols[0],
@@ -1076,7 +1065,7 @@ impl TodoForm {
         self.style_inline_field(Field::Assignee);
         self.style_inline_field(Field::Tags);
         let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[3]);
+            .split(rows[2]);
         let assignee_cols =
             Layout::horizontal([Constraint::Length(11), Constraint::Min(1)]).split(cols[0]);
         frame.render_widget(
@@ -1092,10 +1081,10 @@ impl TodoForm {
         );
         frame.render_widget(&self.tags, tags_cols[1]);
 
-        self.draw_body(frame, rows[4]);
+        self.draw_body(frame, rows[3]);
 
-        self.draw_comments(frame, rows[5]);
-        self.draw_blockers(frame, rows[6]);
+        self.draw_comments(frame, rows[4]);
+        self.draw_blockers(frame, rows[5]);
 
         let context = if !self.created.is_empty() {
             format!(" created {}   updated {}", self.created, self.updated)
@@ -1104,7 +1093,7 @@ impl TodoForm {
         };
         frame.render_widget(
             Paragraph::new(context).style(Style::default().fg(Color::DarkGray)),
-            rows[7],
+            rows[6],
         );
 
         let help = "Tab field  Left/Right cycle  Enter add/edit  d delete  Ctrl-C close";
@@ -1123,15 +1112,25 @@ impl TodoForm {
             } else {
                 self.message.clone()
             };
+        // The removed in-form header used to carry the locked-by banner; with
+        // the pane title now naming the todo, fold any lock indicator into
+        // the message line so a held lock still has a visible surface.
+        let lock_prefix = self
+            .locked_by
+            .as_deref()
+            .map(|h| format!("[locked by {h}]   "))
+            .unwrap_or_default();
         let line = if displayed_message.is_empty() {
-            format!(" {help}")
+            format!(" {lock_prefix}{help}")
         } else {
-            format!(" {displayed_message}   |   {help}")
+            format!(" {lock_prefix}{displayed_message}   |   {help}")
         };
-        frame.render_widget(
-            Paragraph::new(line).style(Style::default().fg(Color::Yellow)),
-            rows[8],
-        );
+        let line_style = if self.locked_by.is_some() {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        frame.render_widget(Paragraph::new(line).style(line_style), rows[7]);
     }
 
     /// Render the Body field as a soft-wrapped paragraph plus an overlay

@@ -1590,6 +1590,11 @@ impl PanoptPane {
                     if focus {
                         focus_pane_with_id(slot, false, false);
                     }
+                    // Arrowing through items re-routes the existing viewer in
+                    // place; no PaneUpdate fires, so the pane title would
+                    // otherwise stay frozen on the previously-routed item
+                    // until the next focus change.
+                    self.sync_pane_titles();
                     return;
                 }
             }
@@ -1599,6 +1604,7 @@ impl PanoptPane {
                 write_routing(kind, id, &slot_name);
             }
             self.show_in_slot(viewer, focus);
+            self.sync_pane_titles();
             return;
         }
         let slot_name = self.allocate_viewer_slot();
