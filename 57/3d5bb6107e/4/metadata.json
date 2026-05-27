@@ -1,0 +1,102 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "573d5bb6107e",
+  "session_id": "c43a6957-bc1c-4d96-a471-5cd40e25f52d",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-27T23:02:50.124936963Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CLAUDE.md",
+    "Cargo.lock",
+    "README.md",
+    "crates/panopt-core/src/lib.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt/Cargo.toml",
+    "crates/panopt/src/agent.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/mcp.rs",
+    "crates/panopt/src/paths.rs",
+    "crates/panopt/src/todo.rs",
+    "crates/panoptd/src/main.rs",
+    "justfile"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-7[1m]",
+  "turn_id": "91cad00f38d5",
+  "token_usage": {
+    "input_tokens": 13,
+    "cache_creation_tokens": 41583,
+    "cache_read_tokens": 45889,
+    "output_tokens": 256,
+    "api_call_count": 3
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-27T23:02:50.108365975Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 40,
+    "human_removed": 318,
+    "total_committed": 101,
+    "total_lines_changed": 363,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1148,
+      "user_lines_removed": 172,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/agents/entire-search.md": 25,
+        ".claude/scheduled_tasks.lock": 1,
+        ".claude/settings.json": 81,
+        "CLAUDE.md": 11,
+        "Cargo.lock": 1,
+        "DESIGN.md": 86,
+        "README.md": 26,
+        "crates/panopt-core/src/auth.rs": 141,
+        "crates/panopt-core/src/lib.rs": 3,
+        "crates/panopt-core/src/model.rs": 45,
+        "crates/panopt-core/src/projection.rs": 68,
+        "crates/panopt-core/src/registry.rs": 97,
+        "crates/panopt-core/src/state.rs": 135,
+        "crates/panopt-zellij/src/main.rs": 44,
+        "crates/panopt/Cargo.toml": 1,
+        "crates/panopt/src/agent.rs": 45,
+        "crates/panopt/src/agent_config.rs": 101,
+        "crates/panopt/src/main.rs": 38,
+        "crates/panopt/src/mcp.rs": 17,
+        "crates/panopt/src/paths.rs": 7,
+        "crates/panopt/src/todo.rs": 14,
+        "crates/panoptd/src/handler.rs": 68,
+        "crates/panoptd/src/main.rs": 89,
+        "justfile": 4
+      },
+      "user_removed_per_file": {
+        ".claude/settings.json": 5,
+        "CLAUDE.md": 1,
+        "DESIGN.md": 30,
+        "README.md": 14,
+        "crates/panopt-core/src/lib.rs": 2,
+        "crates/panopt-core/src/model.rs": 5,
+        "crates/panopt-core/src/projection.rs": 14,
+        "crates/panopt-core/src/registry.rs": 19,
+        "crates/panopt-core/src/state.rs": 19,
+        "crates/panopt-zellij/src/main.rs": 11,
+        "crates/panopt/src/agent.rs": 2,
+        "crates/panopt/src/mcp.rs": 8,
+        "crates/panopt/src/todo.rs": 3,
+        "crates/panoptd/src/handler.rs": 27,
+        "crates/panoptd/src/main.rs": 10,
+        "justfile": 2
+      }
+    }
+  ]
+}
