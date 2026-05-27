@@ -819,7 +819,6 @@ impl PanoptPane {
             }
         }
         lines.push(String::new());
-        lines.push("  a             spawn agent".to_string());
         lines.push("  ?             toggle this help".to_string());
         lines
     }
@@ -892,9 +891,9 @@ impl PanoptPane {
         viewer_title_for(kind.as_deref(), id, &self.todos, &self.scratchpads)
     }
 
-    /// Title for an ad-hoc agent pane (one spawned by the `a` key or the
-    /// `panopt:spawn-agent` pipe). Uses the user-supplied label - or the
-    /// `Agent N` fallback assigned by [`Self::sync_agent_labels`] - and
+    /// Title for an ad-hoc agent pane (one spawned by `n` in the Agents pane
+    /// or the `panopt:spawn-agent` pipe). Uses the user-supplied label - or
+    /// the `Agent N` fallback assigned by [`Self::sync_agent_labels`] - and
     /// adds an `Agent:` prefix only when the label does not already carry it.
     fn agent_pane_title(&self, p: &PaneRow) -> String {
         let label = self.agent_label(p);
@@ -1336,7 +1335,6 @@ impl PanoptPane {
                 }
             }
             BareKey::Enter => self.activate_cursor(),
-            BareKey::Char('a') => self.spawn_agent_pane(None),
             BareKey::Char('e') if self.mode == Mode::Todos => self.edit_focused_todo(),
             // `n` creates a new item of the current pane type. The kind
             // tracks the mode so a single binding gives the user "new"
@@ -1701,8 +1699,8 @@ impl PanoptPane {
     }
 
     /// Spawn a new agent pane and label it. Only the Todos (gatekeeper) pane
-    /// reaches this from a pipe; from the keyboard, any of the five panes
-    /// can press `a` and spawn an unnamed agent.
+    /// reaches this from a pipe; from the keyboard, the Agents pane spawns
+    /// an unnamed agent via `n`.
     fn spawn_agent_pane(&mut self, id: Option<&str>) {
         let mut args = vec!["_agent".to_string()];
         if let Some(id) = id {
