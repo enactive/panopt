@@ -867,18 +867,35 @@ impl Viewer {
         }
     }
 
-    /// Re-read the content file if it changed since the last read. Form modes
-    /// have no backing file - their refresh runs through the MCP client and
-    /// is currently load-once-on-switch; see the autosave path for writes.
+    /// Re-read the content file if it changed since the last read. Projection-
+    /// backed targets compare mtimes; form-backed targets (which have no
+    /// projection file) call `refresh_from_daemon` on the form itself, which
+    /// pulls a fresh `todo_get` snapshot, replays the local Baseline-diff
+    /// rules to keep pending edits intact, and updates the Baseline so the
+    /// next [`Self::maybe_autosave`] flushes only what is still divergent.
     fn maybe_refresh(&mut self) {
         if self.last_refresh.elapsed() < REFRESH {
             return;
         }
         self.last_refresh = Instant::now();
-        let current = self.target.content_path(&self.ws).and_then(|p| mtime(&p));
-        if current != self.content_mtime {
-            self.reload_content();
-            self.needs_draw = true;
+        if let Some(path) = self.target.content_path(&self.ws) {
+            let current = mtime(&path);
+            if current != self.content_mtime {
+                self.reload_content();
+                self.needs_draw = true;
+            }
+            return;
+        }
+        // No projection file - form targets refresh through the daemon.
+        if let Content::TodoForm(form) = &mut self.content {
+            match form.refresh_from_daemon() {
+                Ok(true) => self.needs_draw = true,
+                Ok(false) => {}
+                Err(e) => {
+                    form.message = format!("refresh failed: {e:#}");
+                    self.needs_draw = true;
+                }
+            }
         }
     }
 

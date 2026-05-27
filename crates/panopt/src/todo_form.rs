@@ -728,6 +728,193 @@ impl TodoForm {
         Ok(())
     }
 
+    /// Pull the daemon's current snapshot of this todo and replay it onto the
+    /// form. Per #40: untouched scalar fields are replaced with the remote
+    /// value; locally edited fields keep their text and the message line
+    /// flags the conflict so the user knows their save will win. The
+    /// [`Baseline`] is always advanced to the remote value, which is what
+    /// makes [`Self::flush`]'s diff send only the user's pending changes
+    /// after a refresh.
+    ///
+    /// Returns `Ok(true)` when anything visible changed and the host should
+    /// redraw. New-todo forms (no id yet) return `Ok(false)` immediately -
+    /// there is no daemon row to refresh against.
+    pub fn refresh_from_daemon(&mut self) -> Result<bool> {
+        let Some(id) = self.id else {
+            return Ok(false);
+        };
+        let client = Client::connect(&self.url)?;
+        let outcome: Result<(Value, Vec<BlockerEntry>)> = (|| {
+            let todo = client.call("todo_get", json!({ "todo_id": id }))?;
+            // Resolve blocker titles inline; we hold one MCP connection
+            // across the lookups so an N+1 fan-out still costs one session.
+            let blocker_ids: Vec<u64> = todo["blockers"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default();
+            let mut entries = Vec::with_capacity(blocker_ids.len());
+            for bid in blocker_ids {
+                let title = client
+                    .call("todo_get", json!({ "todo_id": bid }))
+                    .ok()
+                    .and_then(|v| v["title"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                entries.push(BlockerEntry { id: bid, title });
+            }
+            Ok((todo, entries))
+        })();
+        client.close();
+        let (todo, remote_blockers) = outcome?;
+
+        let remote = Baseline {
+            title: todo["title"].as_str().unwrap_or("").to_string(),
+            body: todo["body"].as_str().unwrap_or("").to_string(),
+            status: todo["status"].as_str().unwrap_or("open").to_string(),
+            priority: todo["priority"].as_str().unwrap_or("medium").to_string(),
+            assignee: todo["assignee"].as_str().unwrap_or("").to_string(),
+            tags: string_list(&todo["tags"]),
+        };
+        let remote_comments: Vec<CommentEntry> = todo["comments"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        Some(CommentEntry {
+                            id: c["id"].as_u64()?,
+                            author: c["author"].as_str().unwrap_or("").to_string(),
+                            created_at: c["created_at"].as_str().unwrap_or("").to_string(),
+                            body: c["body"].as_str().unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let remote_updated = todo["updated_at"].as_str().unwrap_or("").to_string();
+        Ok(self.replay_remote(remote, remote_comments, remote_blockers, remote_updated))
+    }
+
+    /// Apply a daemon snapshot to the form. Pure of MCP - takes the already-
+    /// loaded values directly - so the replay rules can be unit-tested. See
+    /// [`Self::refresh_from_daemon`] for the surrounding wire-up.
+    fn replay_remote(
+        &mut self,
+        remote: Baseline,
+        remote_comments: Vec<CommentEntry>,
+        remote_blockers: Vec<BlockerEntry>,
+        remote_updated: String,
+    ) -> bool {
+        let mut changed = false;
+        let mut conflicts: Vec<&'static str> = Vec::new();
+
+        if remote.title != self.baseline.title {
+            if self.current_title() != self.baseline.title {
+                conflicts.push("title");
+            } else {
+                self.title = text_area(&remote.title);
+                changed = true;
+            }
+        }
+        if remote.body != self.baseline.body {
+            if self.current_body() != self.baseline.body {
+                conflicts.push("body");
+            } else {
+                self.body = text_area(&remote.body);
+                changed = true;
+            }
+        }
+        if remote.status != self.baseline.status {
+            if STATUSES[self.status] != self.baseline.status {
+                conflicts.push("status");
+            } else {
+                self.status = index_of(&STATUSES, &remote.status);
+                changed = true;
+            }
+        }
+        if remote.priority != self.baseline.priority {
+            if PRIORITIES[self.priority] != self.baseline.priority {
+                conflicts.push("priority");
+            } else {
+                self.priority = index_of(&PRIORITIES, &remote.priority);
+                changed = true;
+            }
+        }
+        if remote.assignee != self.baseline.assignee {
+            if self.current_assignee() != self.baseline.assignee {
+                conflicts.push("assignee");
+            } else {
+                self.assignee = text_area(&remote.assignee);
+                changed = true;
+            }
+        }
+        if remote.tags != self.baseline.tags {
+            if self.current_tags() != self.baseline.tags {
+                conflicts.push("tags");
+            } else {
+                self.tags = text_area(&remote.tags.join(", "));
+                changed = true;
+            }
+        }
+
+        // Comments: the daemon owns the list; the form's only local state
+        // is whichever comment is being edited in place. While an edit is
+        // open we skip the blanket replace (re-indexing under the editor
+        // would yank the edit out from under the user).
+        if self.editing_comment.is_none() && !comments_match(&self.comments, &remote_comments) {
+            self.comments = remote_comments;
+            if self.comment_cursor > self.comments.len() {
+                self.comment_cursor = self.comments.len();
+            }
+            changed = true;
+        }
+
+        if !blockers_match(&self.blockers, &remote_blockers) {
+            self.blockers = remote_blockers;
+            if self.blocker_cursor > self.blockers.len() {
+                self.blocker_cursor = self.blockers.len();
+            }
+            changed = true;
+        }
+
+        self.updated = remote_updated;
+        // Advance the baseline unconditionally so a subsequent flush only
+        // sends fields the user is still mid-edit on (the "replay" half of
+        // #40's plan).
+        self.baseline = remote;
+
+        if !conflicts.is_empty() {
+            self.message = format!(
+                "remote changed {} - your save will overwrite",
+                conflicts.join(", ")
+            );
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn current_title(&self) -> String {
+        self.title.lines().join(" ").trim().to_string()
+    }
+
+    fn current_body(&self) -> String {
+        self.body.lines().join("\n")
+    }
+
+    fn current_assignee(&self) -> String {
+        self.assignee.lines().join(" ").trim().to_string()
+    }
+
+    fn current_tags(&self) -> Vec<String> {
+        self.tags
+            .lines()
+            .join(",")
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
     fn append_comment(&mut self, body: &str) -> Result<()> {
         let id = self.id.ok_or_else(|| anyhow!("save the todo first"))?;
         let client = Client::connect(&self.url)?;
@@ -1374,6 +1561,25 @@ pub(crate) fn index_of(options: &[&str], value: &str) -> usize {
     options.iter().position(|o| *o == value).unwrap_or(0)
 }
 
+/// Whether two comment lists carry the same ids, authors, and bodies in
+/// the same order. Used by [`TodoForm::refresh_from_daemon`] to decide
+/// whether the daemon's snapshot is visibly different from what the form
+/// holds; equality is exact rather than set-equality so a comment-edit
+/// (same id, new body) still counts as a change.
+fn comments_match(a: &[CommentEntry], b: &[CommentEntry]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.id == y.id && x.author == y.author && x.body == y.body)
+}
+
+/// Whether two blocker lists carry the same ids in the same order. Titles
+/// are not compared - a renamed blocker still renders the same id-prefixed
+/// chip, and the title is best-effort metadata anyway.
+fn blockers_match(a: &[BlockerEntry], b: &[BlockerEntry]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.id == y.id)
+}
+
 /// Build the JSON payload for a `todo_update` call, including only the
 /// scalar fields that differ between `baseline` and `current`. The result
 /// always contains `todo_id`; a caller that finds it carries only
@@ -1677,6 +1883,161 @@ mod tests {
         assert_eq!(form.blocker_cursor, 0);
         form.handle_key(left);
         assert_eq!(form.blocker_cursor, 0); // no further left
+    }
+
+    /// Build a TodoForm by piping a synthetic todo through `from_todo`, so
+    /// the baseline and every scalar field land in the same shape they do
+    /// from a live `todo_get`. The blocker resolver returns no titles -
+    /// tests that care about chips wire that themselves.
+    fn form_with_todo(todo: Value) -> TodoForm {
+        let resolver = |_: u64| -> Option<String> { None };
+        TodoForm::from_todo("http://localhost/?ws=/x", &todo, &resolver).unwrap()
+    }
+
+    fn remote_baseline(
+        title: &str,
+        body: &str,
+        status: &str,
+        priority: &str,
+        assignee: &str,
+        tags: &[&str],
+    ) -> Baseline {
+        Baseline {
+            title: title.to_string(),
+            body: body.to_string(),
+            status: status.to_string(),
+            priority: priority.to_string(),
+            assignee: assignee.to_string(),
+            tags: tags.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// A field the user has not touched gets replayed with the daemon's
+    /// current value, and the baseline advances to match - so a subsequent
+    /// flush sees `current == baseline` and produces no payload.
+    #[test]
+    fn refresh_replays_remote_into_untouched_scalar_fields() {
+        let mut form = form_with_todo(json!({
+            "id": 1, "title": "A", "body": "b1",
+            "status": "open", "priority": "medium",
+            "assignee": "", "tags": [],
+        }));
+        let remote = remote_baseline("B", "b2", "completed", "high", "alex", &["x"]);
+        let changed = form.replay_remote(remote, Vec::new(), Vec::new(), String::new());
+        assert!(changed);
+        assert_eq!(form.current_title(), "B");
+        assert_eq!(form.current_body(), "b2");
+        assert_eq!(STATUSES[form.status], "completed");
+        assert_eq!(PRIORITIES[form.priority], "high");
+        assert_eq!(form.current_assignee(), "alex");
+        assert_eq!(form.current_tags(), vec!["x".to_string()]);
+        assert_eq!(form.baseline.title, "B");
+        assert!(form.message.is_empty() || !form.message.contains("remote changed"));
+    }
+
+    /// A field the user is mid-edit on keeps its local text; the baseline
+    /// still advances to the daemon's value so the next `flush` diff sends
+    /// only the user's pending edit. The conflict surfaces in the message.
+    #[test]
+    fn refresh_keeps_local_edit_and_flags_conflict() {
+        let mut form = form_with_todo(json!({
+            "id": 1, "title": "A", "body": "", "status": "open",
+            "priority": "medium", "assignee": "", "tags": [],
+        }));
+        // User typed past the baseline - local edit pending.
+        form.title = text_area("A draft");
+        let remote = remote_baseline("B", "", "open", "medium", "", &[]);
+        form.replay_remote(remote, Vec::new(), Vec::new(), String::new());
+        assert_eq!(form.current_title(), "A draft");
+        assert_eq!(form.baseline.title, "B");
+        assert!(form.message.contains("title"));
+        // The user's pending edit now diverges from the new baseline by
+        // exactly one field, so flush would send only the title.
+        let current = Baseline {
+            title: form.current_title(),
+            body: form.current_body(),
+            status: STATUSES[form.status].to_string(),
+            priority: PRIORITIES[form.priority].to_string(),
+            assignee: form.current_assignee(),
+            tags: form.current_tags(),
+        };
+        let payload = build_update_payload(1, &form.baseline, &current);
+        assert_eq!(payload.len(), 2); // todo_id + title
+        assert_eq!(payload.get("title"), Some(&json!("A draft")));
+    }
+
+    /// Status/priority follow the same rule via their string tokens: an
+    /// untouched status replays, a locally-changed one is preserved.
+    #[test]
+    fn refresh_status_replays_when_untouched_and_holds_when_local() {
+        // Untouched: replays.
+        let mut form = form_with_todo(json!({
+            "id": 1, "title": "t", "body": "", "status": "open",
+            "priority": "medium", "assignee": "", "tags": [],
+        }));
+        let remote = remote_baseline("t", "", "completed", "medium", "", &[]);
+        form.replay_remote(remote, Vec::new(), Vec::new(), String::new());
+        assert_eq!(STATUSES[form.status], "completed");
+
+        // Locally changed: preserved, baseline advances, conflict surfaces.
+        let mut form = form_with_todo(json!({
+            "id": 1, "title": "t", "body": "", "status": "open",
+            "priority": "medium", "assignee": "", "tags": [],
+        }));
+        form.status = index_of(&STATUSES, "in_progress");
+        let remote = remote_baseline("t", "", "completed", "medium", "", &[]);
+        form.replay_remote(remote, Vec::new(), Vec::new(), String::new());
+        assert_eq!(STATUSES[form.status], "in_progress");
+        assert_eq!(form.baseline.status, "completed");
+        assert!(form.message.contains("status"));
+    }
+
+    /// Comment list is owned by the daemon - a refresh blanket-replaces it,
+    /// but only when no in-place edit is active. An active editor pins the
+    /// list so the edit's row index does not shift under it.
+    #[test]
+    fn refresh_replaces_comments_unless_editing_one() {
+        let mut form = form_with_todo(json!({
+            "id": 1, "title": "t", "body": "",
+            "status": "open", "priority": "medium",
+            "assignee": "", "tags": [],
+            "comments": [{ "id": 11, "author": "a", "created_at": "", "body": "first" }],
+        }));
+        let baseline = form.baseline.clone();
+        let remote_comments = vec![
+            CommentEntry {
+                id: 11,
+                author: "a".to_string(),
+                created_at: String::new(),
+                body: "first".to_string(),
+            },
+            CommentEntry {
+                id: 12,
+                author: "b".to_string(),
+                created_at: String::new(),
+                body: "second".to_string(),
+            },
+        ];
+        form.replay_remote(
+            baseline.clone(),
+            remote_comments.clone(),
+            Vec::new(),
+            String::new(),
+        );
+        assert_eq!(form.comments.len(), 2);
+
+        // Now open an in-place edit and re-run with a divergent list - the
+        // editor's index must survive the refresh.
+        form.editing_comment = Some((0, text_area("editing first")));
+        let remote_comments_after = vec![CommentEntry {
+            id: 12,
+            author: "b".to_string(),
+            created_at: String::new(),
+            body: "only second".to_string(),
+        }];
+        form.replay_remote(baseline, remote_comments_after, Vec::new(), String::new());
+        assert_eq!(form.comments.len(), 2);
+        assert!(form.editing_comment.is_some());
     }
 
     /// On the input row, Backspace with non-empty content edits the textarea;
