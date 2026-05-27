@@ -1,0 +1,43 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "fcb221ba7bf1",
+  "session_id": "8d1e8ce7-e6d9-4dcf-ae81-af6eafc9d5f0",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-27T23:05:57.926090536Z",
+  "branch": "main",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt/src/agent.rs",
+    "crates/panopt/src/agent_config.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/mcp.rs",
+    "crates/panopt/src/mcp_proxy.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "bc331be14af3",
+  "checkpoint_transcript_start": 1201,
+  "transcript_lines_at_start": 1201,
+  "token_usage": {
+    "input_tokens": 3,
+    "cache_creation_tokens": 11491,
+    "cache_read_tokens": 1126710,
+    "output_tokens": 1436,
+    "api_call_count": 3
+  },
+  "session_metrics": {
+    "turn_count": 18
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-27T23:05:57.847664322Z",
+    "agent_lines": 495,
+    "agent_removed": 27,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 495,
+    "total_lines_changed": 522,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
