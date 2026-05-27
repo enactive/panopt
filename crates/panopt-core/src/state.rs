@@ -273,8 +273,8 @@ impl Store {
             let tx = self.conn.transaction()?;
             let next = next_id(&tx, pid)?;
             tx.execute(
-                "INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, '', datetime('now'), datetime('now'))",
+                "INSERT INTO scratchpads (project_id, id, title, body, tags, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '', '[]', datetime('now'), datetime('now'))",
                 params![pid, next, title],
             )?;
             tx.execute(
@@ -347,11 +347,17 @@ impl Store {
         if let Some(v) = patch.body {
             pad.body = v;
         }
+        if let Some(v) = patch.tags {
+            pad.tags = v;
+        }
+        // Bad JSON would only fail here on a programmer error (Vec<String> is
+        // always serializable); the fallback keeps the column valid regardless.
+        let tags_json = serde_json::to_string(&pad.tags).unwrap_or_else(|_| "[]".into());
         self.conn.execute(
             "UPDATE scratchpads
-                SET title = ?1, body = ?2, updated_at = datetime('now')
-              WHERE project_id = ?3 AND id = ?4",
-            params![pad.title, pad.body, project.0, id as i64],
+                SET title = ?1, body = ?2, tags = ?3, updated_at = datetime('now')
+              WHERE project_id = ?4 AND id = ?5",
+            params![pad.title, pad.body, tags_json, project.0, id as i64],
         )?;
         self.reproject_scratchpad_full(project, id)
     }
@@ -389,16 +395,20 @@ impl Store {
     fn fetch_scratchpad(&self, project: ProjectId, id: u64) -> Result<Scratchpad, CoreError> {
         self.conn
             .query_row(
-                "SELECT title, body, created_at, updated_at FROM scratchpads
+                "SELECT title, body, tags, created_at, updated_at FROM scratchpads
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| {
+                    let tags: String = r.get(2)?;
                     Ok(Scratchpad {
                         id,
                         title: r.get(0)?,
                         body: r.get(1)?,
-                        created_at: r.get(2)?,
-                        updated_at: r.get(3)?,
+                        // Bad JSON yields an empty tag set so a stray manual
+                        // write to the column never bricks the read path.
+                        tags: serde_json::from_str(&tags).unwrap_or_default(),
+                        created_at: r.get(3)?,
+                        updated_at: r.get(4)?,
                     })
                 },
             )
@@ -1083,12 +1093,17 @@ impl Store {
         self.reproject_todos(project)
     }
 
-    /// The sorted, deduped union of every tag used by any todo in `project`.
-    /// Cheap to recompute on demand; the form uses it for tag autocomplete.
-    pub fn todo_tags_list(&self, project: ProjectId) -> Result<Vec<String>, CoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT tags FROM todos WHERE project_id = ?1 AND deleted_at IS NULL")?;
+    /// The sorted, deduped union of every tag used by any todo *or* scratchpad
+    /// in `project`. The two surfaces share one project-wide vocabulary (todo
+    /// #61) so a tag picked on one offers up on the other; this is the single
+    /// source of truth behind both `todo_tags_list` and `scratchpad_tags_list`
+    /// MCP tools, which return identical output.
+    pub fn tags_list(&self, project: ProjectId) -> Result<Vec<String>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tags FROM todos       WHERE project_id = ?1 AND deleted_at IS NULL
+             UNION ALL
+             SELECT tags FROM scratchpads WHERE project_id = ?1 AND deleted_at IS NULL",
+        )?;
         let rows = stmt.query_map([project.0], |r| r.get::<_, String>(0))?;
         let mut set: HashSet<String> = HashSet::new();
         for row in rows {
@@ -1105,6 +1120,14 @@ impl Store {
         let mut tags: Vec<String> = set.into_iter().collect();
         tags.sort();
         Ok(tags)
+    }
+
+    /// Back-compat alias for [`Self::tags_list`]. Both `todo_tags_list` and
+    /// `scratchpad_tags_list` MCP tools call the unified method now (todo #61),
+    /// so this just exists so callsites that already imported the todo-only
+    /// name keep compiling.
+    pub fn todo_tags_list(&self, project: ProjectId) -> Result<Vec<String>, CoreError> {
+        self.tags_list(project)
     }
 
     /// Set or clear `completed_at` to match `status`: a `Completed` todo keeps
@@ -1553,7 +1576,7 @@ mod tests {
                 id,
                 ScratchpadPatch {
                     title: Some("renamed".into()),
-                    body: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1567,8 +1590,8 @@ mod tests {
                 p,
                 id,
                 ScratchpadPatch {
-                    title: None,
                     body: Some("rewritten".into()),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1590,8 +1613,8 @@ mod tests {
                 p,
                 id,
                 ScratchpadPatch {
-                    title: None,
                     body: Some("new body".into()),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1896,6 +1919,82 @@ mod tests {
             fx.store.todo_tags_list(p).unwrap(),
             vec!["alpha", "beta", "zeta"]
         );
+    }
+
+    #[test]
+    fn tags_list_unions_todos_and_scratchpads() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let t = fx.store.todo_create(p, "t".into()).unwrap();
+        let s = fx.store.scratchpad_create(p, "s".into()).unwrap();
+        fx.store
+            .todo_update(
+                p,
+                t,
+                TodoPatch {
+                    tags: Some(vec!["x".into(), "y".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fx.store
+            .scratchpad_update(
+                p,
+                s,
+                ScratchpadPatch {
+                    tags: Some(vec!["y".into(), "z".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Identical via both the unified core method and the back-compat alias,
+        // and identical to the future `scratchpad_tags_list` MCP tool's source.
+        assert_eq!(fx.store.tags_list(p).unwrap(), vec!["x", "y", "z"]);
+        assert_eq!(fx.store.todo_tags_list(p).unwrap(), vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn scratchpad_update_round_trips_tags() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let id = fx.store.scratchpad_create(p, "n".into()).unwrap();
+        // Fresh pads start with empty tags (V8 column default).
+        assert!(fx.store.scratchpad_get(p, id).unwrap().tags.is_empty());
+
+        fx.store
+            .scratchpad_update(
+                p,
+                id,
+                ScratchpadPatch {
+                    tags: Some(vec!["foo".into(), "bar".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fx.store.scratchpad_get(p, id).unwrap().tags,
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+
+        // Tags land in the per-pad projection frontmatter.
+        let pad_file = std::fs::read_to_string(root.join(".panopt/scratchpad/1.md")).unwrap();
+        assert!(
+            pad_file.contains("\ntags: foo, bar\n"),
+            "projection carries `tags: foo, bar`:\n{pad_file}"
+        );
+
+        // An empty list clears the tags.
+        fx.store
+            .scratchpad_update(
+                p,
+                id,
+                ScratchpadPatch {
+                    tags: Some(vec![]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(fx.store.scratchpad_get(p, id).unwrap().tags.is_empty());
     }
 
     #[test]

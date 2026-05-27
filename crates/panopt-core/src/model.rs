@@ -18,11 +18,15 @@ pub struct ProjectId(pub(crate) i64);
 /// The `id` (not the `title`) is the durable handle and the projected filename,
 /// so renaming a scratchpad never moves its file. The id is unique within its
 /// project and restarts at 1 in each project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Scratchpad {
     pub id: u64,
     pub title: String,
     pub body: String,
+    /// Free-text labels drawn from the project's tag vocabulary, shared with
+    /// todos (todo #61): [`crate::Store::tags_list`] returns the union across
+    /// both kinds, so a tag set on one surface is offered up on the other.
+    pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -35,6 +39,7 @@ pub struct Scratchpad {
 pub struct ScratchpadPatch {
     pub title: Option<String>,
     pub body: Option<String>,
+    pub tags: Option<Vec<String>>,
 }
 
 /// Lifecycle state of a [`Todo`].

@@ -49,14 +49,15 @@ pub enum ScratchpadFormAction {
     Close,
 }
 
-/// Which of the two scratchpad fields currently has focus.
+/// Which scratchpad field currently has focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Field {
     Title,
+    Tags,
     Body,
 }
 
-/// Snapshot of the title and body the daemon last reported, captured at load
+/// Snapshot of the editable fields the daemon last reported, captured at load
 /// time and after each successful save/refresh.
 ///
 /// `flush` diffs the current field values against this baseline and sends
@@ -67,6 +68,7 @@ enum Field {
 struct Baseline {
     title: String,
     body: String,
+    tags: Vec<String>,
 }
 
 /// The editable state of the scratchpad form.
@@ -78,6 +80,10 @@ pub struct ScratchpadForm {
 
     title: TextArea<'static>,
     body: TextArea<'static>,
+    /// Comma-separated, single-line tag input. Shares the project-wide tag
+    /// vocabulary with todos (todo #61). Parsed the same way as the todo
+    /// form's tag input: comma-split, trim, drop empties.
+    tags: TextArea<'static>,
     focus: Field,
 
     /// Last-seen `created_at` / `updated_at` from the daemon, for the context
@@ -117,6 +123,7 @@ impl ScratchpadForm {
             id: None,
             title: text_area(""),
             body: text_area(""),
+            tags: text_area(""),
             focus: Field::Title,
             created: String::new(),
             updated: String::new(),
@@ -129,13 +136,14 @@ impl ScratchpadForm {
         }
     }
 
-    /// A form preloaded from an existing scratchpad's id, title, body, and
-    /// timestamps.
+    /// A form preloaded from an existing scratchpad's id, title, body, tags,
+    /// and timestamps.
     pub fn from_parts(
         url: &str,
         id: u64,
         title: &str,
         body: &str,
+        tags: &[String],
         created_at: &str,
         updated_at: &str,
     ) -> ScratchpadForm {
@@ -144,6 +152,7 @@ impl ScratchpadForm {
             id: Some(id),
             title: text_area(title),
             body: text_area(body),
+            tags: text_area(&tags.join(", ")),
             focus: Field::Title,
             created: created_at.to_string(),
             updated: updated_at.to_string(),
@@ -155,6 +164,7 @@ impl ScratchpadForm {
             baseline: Baseline {
                 title: title.to_string(),
                 body: body.to_string(),
+                tags: tags.to_vec(),
             },
         }
     }
@@ -170,11 +180,21 @@ impl ScratchpadForm {
         match key.code {
             // Ctrl-C closes the form; q/x must remain typeable in the body.
             KeyCode::Char('c') if ctrl => ScratchpadFormAction::Close,
-            // Tab cycles focus between title and body.
-            KeyCode::Tab | KeyCode::BackTab => {
+            // Tab cycles focus: Title -> Tags -> Body -> Title. BackTab walks
+            // the same cycle in reverse so Shift-Tab is the inverse of Tab.
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Field::Title => Field::Tags,
+                    Field::Tags => Field::Body,
+                    Field::Body => Field::Title,
+                };
+                ScratchpadFormAction::Idle
+            }
+            KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Field::Title => Field::Body,
-                    Field::Body => Field::Title,
+                    Field::Tags => Field::Title,
+                    Field::Body => Field::Tags,
                 };
                 ScratchpadFormAction::Idle
             }
@@ -185,6 +205,7 @@ impl ScratchpadForm {
     fn field_key(&mut self, key: KeyEvent) -> ScratchpadFormAction {
         let changed = match self.focus {
             Field::Title => single_line_input(&mut self.title, key),
+            Field::Tags => single_line_input(&mut self.tags, key),
             Field::Body => text_input(&mut self.body, key),
         };
         if changed {
@@ -203,6 +224,7 @@ impl ScratchpadForm {
         }
         let changed = match self.focus {
             Field::Title => paste_into_single_line(&mut self.title, s),
+            Field::Tags => paste_into_single_line(&mut self.tags, s),
             Field::Body => paste_into(&mut self.body, s),
         };
         if changed {
@@ -248,6 +270,7 @@ impl ScratchpadForm {
             return Ok(());
         }
         let body = self.current_body();
+        let tags = self.current_tags();
 
         let client = Client::connect(&self.url)?;
         let outcome = (|| -> Result<()> {
@@ -260,9 +283,9 @@ impl ScratchpadForm {
                         .ok_or_else(|| anyhow!("daemon returned no scratchpad id"))?;
                     self.id = Some(id);
                     // `scratchpad_create` accepts only `title`; the daemon
-                    // initialises the body to "". Record that in the baseline
-                    // so the diff below sends whichever body the user typed
-                    // in the new-scratchpad form.
+                    // initialises the body to "" and tags to []. Record both
+                    // in the baseline so the diff below sends whichever body
+                    // or tags the user typed in the new-scratchpad form.
                     self.baseline.title = title.clone();
                     id
                 }
@@ -275,6 +298,9 @@ impl ScratchpadForm {
             if body != self.baseline.body {
                 payload.insert("body".into(), json!(body));
             }
+            if tags != self.baseline.tags {
+                payload.insert("tags".into(), json!(tags));
+            }
             // Skip the round-trip when nothing changed - this is the common
             // shape of a debounced autosave fired by an unrelated event.
             if payload.len() > 1 {
@@ -286,7 +312,7 @@ impl ScratchpadForm {
         outcome?;
         // Refresh the baseline so future flushes diff against what the daemon
         // now holds, not what was loaded an edit ago.
-        self.baseline = Baseline { title, body };
+        self.baseline = Baseline { title, body, tags };
         self.dirty = false;
         self.dirty_since = None;
         self.message = format!("saved scratchpad #{}", self.id.unwrap_or(0));
@@ -315,6 +341,14 @@ impl ScratchpadForm {
         let remote = Baseline {
             title: pad["title"].as_str().unwrap_or("").to_string(),
             body: pad["body"].as_str().unwrap_or("").to_string(),
+            tags: pad["tags"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
         let remote_updated = pad["updated_at"].as_str().unwrap_or("").to_string();
         let remote_locked_by = pad["locked_by"].as_str().map(str::to_string);
@@ -346,6 +380,14 @@ impl ScratchpadForm {
                 conflicts.push("body");
             } else {
                 self.body = text_area(&remote.body);
+                changed = true;
+            }
+        }
+        if remote.tags != self.baseline.tags {
+            if self.current_tags() != self.baseline.tags {
+                conflicts.push("tags");
+            } else {
+                self.tags = text_area(&remote.tags.join(", "));
                 changed = true;
             }
         }
@@ -382,14 +424,30 @@ impl ScratchpadForm {
         self.body.lines().join("\n")
     }
 
+    /// The tag list parsed from the tags input: comma-split, trim, drop empty.
+    /// A multi-line paste is normalised to commas first so the result is order-
+    /// preserving and matches whatever the user sees on screen. Mirrors the
+    /// todo form's tag parsing.
+    fn current_tags(&self) -> Vec<String> {
+        self.tags
+            .lines()
+            .join(",")
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
     /// Render the form into `area`.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        // Rows: title / body / context / message. The pane title (set by the
-        // Zellij sidebar) already names the scratchpad, so no in-form header
-        // row is needed; locked-by, when set, surfaces in the message line at
-        // the bottom. Mirrors the todo form's #53 cleanup.
+        // Rows: title / tags / body / context / message. The pane title (set
+        // by the Zellij sidebar) already names the scratchpad, so no in-form
+        // header row is needed; locked-by, when set, surfaces in the message
+        // line at the bottom. Mirrors the todo form's #53 cleanup.
         let rows = Layout::vertical([
             Constraint::Length(3), // title
+            Constraint::Length(3), // tags
             Constraint::Min(3),    // body
             Constraint::Length(1), // context (created/updated)
             Constraint::Length(1), // message + help
@@ -398,7 +456,9 @@ impl ScratchpadForm {
 
         self.style_field(Field::Title, "Title");
         frame.render_widget(&self.title, rows[0]);
-        self.draw_body(frame, rows[1]);
+        self.style_field(Field::Tags, "Tags");
+        frame.render_widget(&self.tags, rows[1]);
+        self.draw_body(frame, rows[2]);
 
         let context = if !self.created.is_empty() {
             format!(" created {}   updated {}", self.created, self.updated)
@@ -407,7 +467,7 @@ impl ScratchpadForm {
         };
         frame.render_widget(
             Paragraph::new(context).style(Style::default().fg(Color::DarkGray)),
-            rows[2],
+            rows[3],
         );
 
         let help = "Tab field  Ctrl-C close";
@@ -426,7 +486,7 @@ impl ScratchpadForm {
         } else {
             Style::default().fg(Color::Yellow)
         };
-        frame.render_widget(Paragraph::new(line).style(line_style), rows[3]);
+        frame.render_widget(Paragraph::new(line).style(line_style), rows[4]);
     }
 
     /// Render the Body field with our soft-wrap renderer. See
@@ -488,6 +548,7 @@ impl ScratchpadForm {
         let focused = self.focus == field;
         let area = match field {
             Field::Title => &mut self.title,
+            Field::Tags => &mut self.tags,
             Field::Body => return,
         };
         let border = if focused {
@@ -522,25 +583,30 @@ mod tests {
     }
 
     #[test]
-    fn from_parts_preloads_id_title_and_body() {
+    fn from_parts_preloads_id_title_body_and_tags() {
         let form = ScratchpadForm::from_parts(
             "http://localhost/?ws=/x",
             7,
             "notes",
             "first\nsecond",
+            &["a".into(), "b".into()],
             "2026-05-23 04:36:21",
             "2026-05-23 04:36:21",
         );
         assert_eq!(form.id, Some(7));
         assert_eq!(form.title.lines().join(" "), "notes");
         assert_eq!(form.body.lines().join("\n"), "first\nsecond");
+        assert_eq!(form.tags.lines().join(""), "a, b");
+        assert_eq!(form.current_tags(), vec!["a".to_string(), "b".to_string()]);
         assert!(!form.dirty);
     }
 
     #[test]
-    fn tab_cycles_focus_between_title_and_body() {
+    fn tab_cycles_focus_title_tags_body() {
         let mut form = ScratchpadForm::blank("http://localhost/?ws=/x");
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(form.handle_key(tab), ScratchpadFormAction::Idle);
+        assert_eq!(form.focus, Field::Tags);
         assert_eq!(form.handle_key(tab), ScratchpadFormAction::Idle);
         assert_eq!(form.focus, Field::Body);
         assert_eq!(form.handle_key(tab), ScratchpadFormAction::Idle);
@@ -569,8 +635,9 @@ mod tests {
     #[test]
     fn handle_paste_into_body_preserves_lines() {
         let mut form = ScratchpadForm::blank("http://localhost/?ws=/x");
-        // Tab to Body.
+        // Tab past Tags to Body (cycle is Title -> Tags -> Body).
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        form.handle_key(tab);
         form.handle_key(tab);
         assert_eq!(form.focus, Field::Body);
         let action = form.handle_paste("alpha\nbeta\ngamma");
@@ -586,6 +653,7 @@ mod tests {
             1,
             "old title",
             "old body",
+            &[],
             "2026-05-27 00:00:00",
             "2026-05-27 00:00:00",
         );
@@ -593,6 +661,7 @@ mod tests {
             Baseline {
                 title: "new title".to_string(),
                 body: "new body".to_string(),
+                tags: vec!["x".into()],
             },
             "2026-05-27 00:00:05".to_string(),
             None,
@@ -600,6 +669,7 @@ mod tests {
         assert!(changed);
         assert_eq!(form.current_title(), "new title");
         assert_eq!(form.current_body(), "new body");
+        assert_eq!(form.current_tags(), vec!["x".to_string()]);
         assert_eq!(form.updated, "2026-05-27 00:00:05");
         assert!(!form.message.contains("overwrite"));
     }
@@ -614,6 +684,7 @@ mod tests {
             1,
             "old title",
             "old body",
+            &[],
             "2026-05-27 00:00:00",
             "2026-05-27 00:00:00",
         );
@@ -625,6 +696,7 @@ mod tests {
             Baseline {
                 title: "remote title".to_string(),
                 body: "remote body".to_string(),
+                tags: vec![],
             },
             "2026-05-27 00:00:05".to_string(),
             None,
@@ -651,6 +723,7 @@ mod tests {
             1,
             "t",
             "b",
+            &[],
             "2026-05-27 00:00:00",
             "2026-05-27 00:00:00",
         );
@@ -658,6 +731,7 @@ mod tests {
             Baseline {
                 title: "t".to_string(),
                 body: "b".to_string(),
+                tags: vec![],
             },
             "2026-05-27 00:00:00".to_string(),
             None,
@@ -674,6 +748,7 @@ mod tests {
             1,
             "t",
             "b",
+            &[],
             "2026-05-27 00:00:00",
             "2026-05-27 00:00:00",
         );
@@ -681,11 +756,40 @@ mod tests {
             Baseline {
                 title: "t".to_string(),
                 body: "b".to_string(),
+                tags: vec![],
             },
             "2026-05-27 00:00:00".to_string(),
             Some("alice".to_string()),
         );
         assert!(changed);
         assert_eq!(form.locked_by.as_deref(), Some("alice"));
+    }
+
+    /// A local tag edit conflicts with a remote tag change; an untouched tag
+    /// field instead picks up the remote value.
+    #[test]
+    fn refresh_handles_tags_drift_with_conflict_detection() {
+        let mut form = ScratchpadForm::from_parts(
+            "http://localhost/?ws=/x",
+            1,
+            "t",
+            "b",
+            &["a".into()],
+            "2026-05-27 00:00:00",
+            "2026-05-27 00:00:00",
+        );
+        // No local edit: remote tags should replace ours and not conflict.
+        let changed = form.replay_remote(
+            Baseline {
+                title: "t".to_string(),
+                body: "b".to_string(),
+                tags: vec!["a".into(), "b".into()],
+            },
+            "2026-05-27 00:00:00".to_string(),
+            None,
+        );
+        assert!(changed);
+        assert_eq!(form.current_tags(), vec!["a".to_string(), "b".to_string()]);
+        assert!(!form.message.contains("overwrite"));
     }
 }

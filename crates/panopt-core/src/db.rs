@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -285,6 +285,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 7 {
         apply_v7(conn)?;
     }
+    if version < 8 {
+        apply_v8(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -304,6 +307,18 @@ fn apply_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column_if_missing(conn, "agent_tools", "deleted_at", "TEXT")?;
     add_column_if_missing(conn, "processes", "deleted_at", "TEXT")?;
     Ok(())
+}
+
+/// Version 8: tags on scratchpads (todo #61).
+///
+/// Scratchpads grow the same `tags` column todos got in V2, stored as a JSON
+/// array string with default `'[]'`. The vocabulary is shared with todos -
+/// `state::tags_list` returns the union across both kinds - so a tag chosen on
+/// one surface is offered up on the other. The column uses
+/// [`add_column_if_missing`] for the same dev-database drift case the earlier
+/// scratchpad migration (V4) guarded against.
+fn apply_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "scratchpads", "tags", "TEXT NOT NULL DEFAULT '[]'")
 }
 
 #[cfg(test)]
@@ -731,6 +746,68 @@ mod tests {
                 .unwrap();
             assert_eq!(alive, 1, "{table} row survives V7 migration as live");
         }
+    }
+
+    #[test]
+    fn v7_database_upgrades_to_v8_with_empty_scratchpad_tags() {
+        // Stand up a V7 database with one pre-existing scratchpad. V8 adds the
+        // tags column with default '[]', so the row keeps its body untouched
+        // and reads back an empty JSON array - no backfill needed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, next_id) VALUES (1, '/x', 2);
+             INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+                 VALUES (1, 1, 'pre-v8', 'note', '2026-01-01', '2026-01-01');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let tags: String = conn
+            .query_row("SELECT tags FROM scratchpads WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(tags, "[]", "pre-V8 scratchpad gets the empty-tags default");
+    }
+
+    #[test]
+    fn v8_migration_tolerates_a_transitional_database_with_tags_already_present() {
+        // The same drift case V4 guards against: an in-development V8 binary
+        // ran the ALTER on `scratchpads` but did not bump `user_version`, so
+        // the database now reports v7 yet already carries the tags column.
+        // `migrate` should upgrade it cleanly instead of failing on duplicate.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE scratchpads ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

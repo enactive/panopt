@@ -55,12 +55,13 @@ struct ScratchpadDto {
     title: String,
 }
 
-/// Wire shape for `scratchpad_get`: title, body, and timestamps.
+/// Wire shape for `scratchpad_get`: title, body, tags, and timestamps.
 #[derive(Serialize)]
 struct ScratchpadDetailDto {
     id: u64,
     title: String,
     body: String,
+    tags: Vec<String>,
     created_at: String,
     updated_at: String,
 }
@@ -71,6 +72,7 @@ impl ScratchpadDetailDto {
             id: pad.id,
             title: pad.title.clone(),
             body: pad.body.clone(),
+            tags: pad.tags.clone(),
             created_at: pad.created_at.clone(),
             updated_at: pad.updated_at.clone(),
         }
@@ -751,9 +753,10 @@ impl Handler {
     }
 
     #[tool(
-        description = "Edit a scratchpad's title and/or body. Each omitted field is left \
+        description = "Edit a scratchpad's title, body, and/or tags. Each omitted field is left \
                        unchanged; body replaces the existing body in full (use \
-                       scratchpad_append to add instead of replace)."
+                       scratchpad_append to add instead of replace); tags replaces the whole \
+                       tag list."
     )]
     async fn scratchpad_update(
         &self,
@@ -763,7 +766,11 @@ impl Handler {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            let patch = ScratchpadPatch { title: args.title, body: args.body };
+            let patch = ScratchpadPatch {
+                title: args.title,
+                body: args.body,
+                tags: args.tags,
+            };
             st.scratchpad_update(project, args.scratchpad_id, patch)
                 .map_err(map_core_err)?;
         }
@@ -786,6 +793,23 @@ impl Handler {
                 .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(
+        description = "List the project's tag vocabulary: the sorted, deduped union of every \
+                       tag attached to any todo OR scratchpad. Identical output to \
+                       todo_tags_list - the two surfaces share one project-wide tag pool."
+    )]
+    async fn scratchpad_tags_list(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let tags = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.tags_list(project).map_err(map_core_err)?
+        };
+        json_result(&tags)
     }
 
     #[tool(description = "Create a new todo with a title. Returns its numeric id.")]
@@ -1012,8 +1036,9 @@ impl Handler {
     }
 
     #[tool(description = "List the project's tag vocabulary: the sorted, deduped union of \
-                          every tag attached to any todo. Used for tag autocomplete in the \
-                          cockpit form.")]
+                          every tag attached to any todo OR scratchpad. The two surfaces \
+                          share one project-wide tag pool, so this returns identical output \
+                          to scratchpad_tags_list.")]
     async fn todo_tags_list(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1021,7 +1046,7 @@ impl Handler {
         let tags = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.todo_tags_list(project).map_err(map_core_err)?
+            st.tags_list(project).map_err(map_core_err)?
         };
         json_result(&tags)
     }
@@ -1320,14 +1345,15 @@ impl ServerHandler for Handler {
                  todo_get (one todo in full), todo_update (edit any field), \
                  todo_complete, todo_delete, todo_add_blocker / todo_remove_blocker / \
                  todo_set_blockers, todo_comment_add / todo_comment_update / \
-                 todo_comment_delete, todo_tags_list (project tag vocabulary), and \
-                 todo_lock / todo_unlock (advisory `todo:<id>` lock, surfaced as \
-                 locked_by on todo_get). Each todo also projects to \
+                 todo_comment_delete, todo_tags_list (project tag vocabulary, union with \
+                 scratchpads), and todo_lock / todo_unlock (advisory `todo:<id>` lock, \
+                 surfaced as locked_by on todo_get). Each todo also projects to \
                  .panopt/todos/<id>.md.\n\
                  - Scratchpads: scratchpad_create (returns an id), scratchpad_list, \
                  scratchpad_get (one scratchpad in full), scratchpad_append (add to body), \
-                 scratchpad_read (body only), scratchpad_update (replace title and/or body), \
-                 scratchpad_delete. Each scratchpad also projects to \
+                 scratchpad_read (body only), scratchpad_update (replace title, body, and/or \
+                 tags), scratchpad_delete, scratchpad_tags_list (project tag vocabulary, \
+                 same union as todo_tags_list). Each scratchpad also projects to \
                  .panopt/scratchpad/<id>.md.\n\
                  - Agent tools (config layer): agent_tool_create (returns an id), \
                  agent_tool_list, agent_tool_get, agent_tool_update, agent_tool_delete. \

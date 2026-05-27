@@ -179,12 +179,14 @@ pub(crate) fn render_todo_md(todo: &Todo) -> String {
     out
 }
 
-/// Render a scratchpad as a `---` frontmatter block of created/updated
-/// timestamps, the title as an H1, then its body verbatim. The frontmatter
-/// mirrors `render_todo_md` so every per-item file in the projection carries
-/// the same structured-then-prose shape.
+/// Render a scratchpad as a `---` frontmatter block of tags + timestamps, the
+/// title as an H1, then its body verbatim. The frontmatter mirrors
+/// `render_todo_md` so every per-item file in the projection carries the same
+/// structured-then-prose shape. Empty `tags` renders as `tags: ` (no special
+/// case), exactly like todos do.
 pub(crate) fn render_scratchpad_md(pad: &Scratchpad) -> String {
     let mut out = String::from("---\n");
+    out.push_str(&format!("tags: {}\n", pad.tags.join(", ")));
     out.push_str(&format!("created: {}\n", pad.created_at));
     out.push_str(&format!("updated: {}\n", pad.updated_at));
     out.push_str("---\n\n");
@@ -552,12 +554,14 @@ mod tests {
             id: 3,
             title: "notes".into(),
             body: "line one".into(),
+            tags: vec![],
             created_at: "2026-05-23 18:05:00".into(),
             updated_at: "2026-05-23 18:05:21".into(),
         };
         assert_eq!(
             render_scratchpad_md(&pad),
             "---\n\
+             tags: \n\
              created: 2026-05-23 18:05:00\n\
              updated: 2026-05-23 18:05:21\n\
              ---\n\
@@ -565,6 +569,23 @@ mod tests {
              # notes\n\
              \n\
              line one\n",
+        );
+    }
+
+    #[test]
+    fn scratchpad_frontmatter_carries_a_comma_joined_tags_line() {
+        let pad = Scratchpad {
+            id: 5,
+            title: "n".into(),
+            body: String::new(),
+            tags: vec!["foo".into(), "bar".into()],
+            created_at: "2026-05-27 00:00:00".into(),
+            updated_at: "2026-05-27 00:00:00".into(),
+        };
+        let rendered = render_scratchpad_md(&pad);
+        assert!(
+            rendered.contains("\ntags: foo, bar\n"),
+            "expected `tags: foo, bar` in frontmatter, got:\n{rendered}"
         );
     }
 

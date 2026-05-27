@@ -24,7 +24,7 @@ pub enum ScratchpadCmd {
         /// Numeric id of the scratchpad to delete.
         id: u64,
     },
-    /// Edit a scratchpad's title or body. Omitted options are left unchanged.
+    /// Edit a scratchpad's title, body, or tags. Omitted options are left unchanged.
     Set {
         /// Numeric id of the scratchpad to edit.
         id: u64,
@@ -32,6 +32,9 @@ pub enum ScratchpadCmd {
         title: Option<String>,
         #[arg(long)]
         body: Option<String>,
+        /// New tag list, comma-separated. Pass an empty string to clear tags.
+        #[arg(long)]
+        tags: Option<String>,
     },
 }
 
@@ -50,11 +53,24 @@ fn dispatch(client: &Client, cmd: ScratchpadCmd) -> Result<()> {
             client.call("scratchpad_delete", json!({ "scratchpad_id": id }))?;
             println!("deleted scratchpad #{id}");
         }
-        ScratchpadCmd::Set { id, title, body } => {
+        ScratchpadCmd::Set {
+            id,
+            title,
+            body,
+            tags,
+        } => {
             let mut args = Map::new();
             args.insert("scratchpad_id".into(), json!(id));
             insert_opt(&mut args, "title", title);
             insert_opt(&mut args, "body", body);
+            if let Some(tags) = tags {
+                let list: Vec<&str> = tags
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                args.insert("tags".into(), json!(list));
+            }
             client.call("scratchpad_update", Value::Object(args))?;
             println!("updated scratchpad #{id}");
         }

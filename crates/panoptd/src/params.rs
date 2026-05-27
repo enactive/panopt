@@ -45,6 +45,11 @@ pub struct ScratchpadUpdateArgs {
     /// unchanged.
     #[serde(default)]
     pub body: Option<String>,
+    /// New complete tag list, replacing the old one. Tags share a project-wide
+    /// vocabulary with todos (see `scratchpad_tags_list`). Omit to leave
+    /// unchanged.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

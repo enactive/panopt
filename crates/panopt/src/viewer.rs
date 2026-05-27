@@ -983,14 +983,25 @@ impl Viewer {
                 Content::ScratchpadForm(Box::new(ScratchpadForm::blank(&self.url)))
             }
             Target::Scratchpad(id) => match load_scratchpad(&self.url, *id) {
-                Ok(pad) => Content::ScratchpadForm(Box::new(ScratchpadForm::from_parts(
-                    &self.url,
-                    *id,
-                    pad["title"].as_str().unwrap_or(""),
-                    pad["body"].as_str().unwrap_or(""),
-                    pad["created_at"].as_str().unwrap_or(""),
-                    pad["updated_at"].as_str().unwrap_or(""),
-                ))),
+                Ok(pad) => {
+                    let tags: Vec<String> = pad["tags"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Content::ScratchpadForm(Box::new(ScratchpadForm::from_parts(
+                        &self.url,
+                        *id,
+                        pad["title"].as_str().unwrap_or(""),
+                        pad["body"].as_str().unwrap_or(""),
+                        &tags,
+                        pad["created_at"].as_str().unwrap_or(""),
+                        pad["updated_at"].as_str().unwrap_or(""),
+                    )))
+                }
                 Err(e) => Content::Message(format!("could not load scratchpad #{id}: {e:#}")),
             },
             Target::TodoList => match load_todo_list(&self.url) {
