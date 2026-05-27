@@ -915,8 +915,7 @@ impl Viewer {
     /// If a form edit has been pending for at least [`DEBOUNCE`], flush it.
     /// Errors are surfaced in the form's message line by the form itself.
     fn maybe_autosave(&mut self) {
-        let mut promote: Option<Target> = None;
-        match &mut self.content {
+        let promote = match &mut self.content {
             Content::TodoForm(form)
                 if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
             {
@@ -924,11 +923,7 @@ impl Viewer {
                     form.message = format!("autosave failed: {e:#}");
                 }
                 self.needs_draw = true;
-                if matches!(self.target, Target::NewTodo) {
-                    if let Some(id) = form.id {
-                        promote = Some(Target::Todo(id));
-                    }
-                }
+                promotion_target(&self.target, form.id)
             }
             Content::ScratchpadForm(form)
                 if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
@@ -937,14 +932,10 @@ impl Viewer {
                     form.message = format!("autosave failed: {e:#}");
                 }
                 self.needs_draw = true;
-                if matches!(self.target, Target::NewScratchpad) {
-                    if let Some(id) = form.id {
-                        promote = Some(Target::Scratchpad(id));
-                    }
-                }
+                promotion_target(&self.target, form.id)
             }
-            _ => {}
-        }
+            _ => None,
+        };
         if let Some(target) = promote {
             self.promote_form_target(target);
         }
@@ -1328,6 +1319,21 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Decide whether the just-flushed form has earned a kind transition. Pure
+/// function: takes the viewer's current [`Target`] and the form's id after
+/// flush, returns `Some(Target::Todo(id) | Target::Scratchpad(id))` only when
+/// a `new-*` target now has an id. Everything else (the form was already
+/// promoted, the flush didn't assign an id, or we're not on a form target)
+/// returns `None`. Kept separate from [`Viewer::maybe_autosave`] so the
+/// scratchpad/todo symmetry can be exercised in unit tests.
+fn promotion_target(target: &Target, form_id: Option<u64>) -> Option<Target> {
+    match (target, form_id) {
+        (Target::NewTodo, Some(id)) => Some(Target::Todo(id)),
+        (Target::NewScratchpad, Some(id)) => Some(Target::Scratchpad(id)),
+        _ => None,
+    }
+}
+
 /// Atomically write a viewer routing file. Mirrors the sidebar plugin's
 /// `write_routing` so both writers produce a byte-identical payload; the
 /// viewer reaches this only on the new-todo / new-scratchpad promotion path
@@ -1620,5 +1626,100 @@ mod tests {
         viewer.target = Target::ScratchpadList;
         viewer.cycle_filter(true);
         assert_eq!(viewer.todo_filter, TodoFilter::All);
+    }
+
+    #[test]
+    fn promotion_target_flips_new_kinds_once_an_id_lands() {
+        // Both new-* kinds promote symmetrically once the daemon assigns an
+        // id; this is the contract sync_pane_titles relies on to re-title the
+        // pane from "New scratchpad" / "New todo" to the id-bearing form.
+        assert_eq!(
+            promotion_target(&Target::NewTodo, Some(7)),
+            Some(Target::Todo(7))
+        );
+        assert_eq!(
+            promotion_target(&Target::NewScratchpad, Some(7)),
+            Some(Target::Scratchpad(7))
+        );
+        // Flush hasn't assigned an id yet (empty-title autosave is a no-op):
+        // stay on the new-* kind so the plugin keeps the placeholder title.
+        assert_eq!(promotion_target(&Target::NewTodo, None), None);
+        assert_eq!(promotion_target(&Target::NewScratchpad, None), None);
+        // Already promoted: a subsequent autosave must not re-flip the target
+        // (which would clobber a user-driven re-point of the same pane).
+        assert_eq!(promotion_target(&Target::Todo(7), Some(9)), None);
+        assert_eq!(promotion_target(&Target::Scratchpad(7), Some(9)), None);
+        // Non-form targets never promote regardless of an incoming id.
+        assert_eq!(promotion_target(&Target::TodoList, Some(7)), None);
+        assert_eq!(promotion_target(&Target::Empty, Some(7)), None);
+    }
+
+    #[test]
+    fn write_routing_to_emits_the_plugin_compatible_payload() {
+        // The viewer rewrites its own routing file on promotion; the payload
+        // must match what the plugin writes byte-for-byte so `parse_viewer_-
+        // routing` and the plugin's title path round-trip cleanly.
+        let dir = tempdir();
+        let path = dir.join("viewer-tx.json");
+        write_routing_to(&path, "scratchpad", Some(42));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"kind":"scratchpad","id":42}"#
+        );
+        write_routing_to(&path, "todo", Some(9));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"kind":"todo","id":9}"#
+        );
+    }
+
+    #[test]
+    fn promote_form_target_rewrites_routing_and_flips_target() {
+        // End-to-end of the #66 / #57 fix: a NewScratchpad pane whose form
+        // just earned id 42 must (a) overwrite its routing file with the id-
+        // bearing kind so the sidebar plugin re-titles it on the next tick,
+        // and (b) flip self.target so the cockpit's own status bar follows.
+        let dir = tempdir();
+        let routing_path = dir.join("viewer-promo.json");
+        std::fs::write(&routing_path, r#"{"kind":"new-scratchpad"}"#).unwrap();
+        let mut viewer = Viewer {
+            ws: dir.clone(),
+            url: String::new(),
+            routing_path: routing_path.clone(),
+            routing_mtime: mtime(&routing_path),
+            target: Target::NewScratchpad,
+            content: Content::Message(String::new()),
+            content_mtime: None,
+            scroll: 0,
+            cursor: 0,
+            viewport: 1,
+            todo_filter: TodoFilter::All,
+            todo_sort_1: TodoSort::PriorityDesc,
+            todo_sort_2: TodoSort::CreatedAsc,
+            last_refresh: Instant::now(),
+            needs_draw: false,
+        };
+        viewer.promote_form_target(Target::Scratchpad(42));
+        assert_eq!(viewer.target, Target::Scratchpad(42));
+        assert_eq!(
+            std::fs::read_to_string(&routing_path).unwrap(),
+            r#"{"kind":"scratchpad","id":42}"#
+        );
+        // routing_mtime tracks the write we just did, so the next poll_routing
+        // sees no change and doesn't reload (which would tear the open form).
+        assert_eq!(viewer.routing_mtime, mtime(&routing_path));
+    }
+
+    fn tempdir() -> PathBuf {
+        // Tests can run concurrently; nanos + pid keeps paths unique without
+        // pulling in the `tempfile` crate just for two unit tests.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("panopt-viewer-test-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

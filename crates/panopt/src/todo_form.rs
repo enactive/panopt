@@ -662,9 +662,16 @@ impl TodoForm {
     /// second pane).
     pub fn flush(&mut self) -> Result<()> {
         let title = self.title.lines().join(" ").trim().to_string();
-        if title.is_empty() {
-            // Nothing to save against - silently no-op so an autosave on an
-            // empty new form does not spam errors.
+        // Suppress only the new-form case: `todo_create` needs a non-empty
+        // title, and an autosave on a blank-from-the-start form would surface
+        // that as a spurious error in the message line. Once the todo exists,
+        // the user is allowed to clear its title - the update path accepts an
+        // empty string. Without this distinction the last non-empty mid-
+        // delete state ("a" while removing "abc") would be the value the
+        // daemon and the sidebar see, and the next refresh would replay that
+        // orphan character back into the title field. Mirrors the
+        // ScratchpadForm fix for todo #75.
+        if self.id.is_none() && title.is_empty() {
             return Ok(());
         }
         let body = self.body.lines().join("\n");

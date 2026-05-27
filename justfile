@@ -90,7 +90,10 @@ refresh:
         echo "run \`just refresh\` from a plain shell, not inside Zellij" >&2
         exit 1
     fi
-    zellij list-sessions -sn 2>/dev/null | grep '^panopt-' | while read -r s; do
+    # `grep` exits 1 when no panopt-* sessions match - that's a clean slate,
+    # not an error. Wrap so `set -o pipefail` doesn't abort the recipe when
+    # there's nothing to kill (e.g. a follow-up refresh after a crash).
+    zellij list-sessions -sn 2>/dev/null | { grep '^panopt-' || true; } | while read -r s; do
         zellij kill-session "$s" 2>/dev/null || true
         zellij delete-session "$s" 2>/dev/null || true
     done

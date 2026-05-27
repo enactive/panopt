@@ -2349,7 +2349,18 @@ fn parse_index_line(line: &str) -> Option<(u64, String)> {
     let close = line[hash..].find(']')? + hash;
     let id: u64 = line[hash..close].parse().ok()?;
     let label_at = line[close..].find(") ")? + close + 2;
-    let label = line.get(label_at..).unwrap_or("").trim().to_string();
+    let raw = line.get(label_at..).unwrap_or("");
+    // The scratchpad/todo projections both render as
+    // `- [#N](path) {title} - <suffix>`, so when the title slot is empty the
+    // raw chunk we just sliced out starts with a space (the projection's
+    // pre-suffix separator). Treat that as "no title": otherwise the leading-
+    // space gets trimmed and `lookup_title` mistakes the orphan `- updated
+    // <ts>` or `- <status>, <priority>` for the title.
+    let label = if raw.starts_with(' ') {
+        String::new()
+    } else {
+        raw.trim().to_string()
+    };
     Some((id, label))
 }
 
@@ -2449,6 +2460,34 @@ mod tests {
         assert!(parse_index_line("# Todos").is_none());
         assert!(parse_index_line("_(no todos)_").is_none());
         assert!(parse_index_line("").is_none());
+    }
+
+    #[test]
+    fn empty_title_scratchpad_line_returns_an_empty_label() {
+        // After a user clears the title field, the projection renders
+        // `- [#N](scratchpad/N.md)  - updated <ts>` (double space). Without
+        // the leading-space guard, parse_index_line would trim and surface
+        // `- updated <ts>` as the title - which then appears in the sidebar
+        // entry and the pane title.
+        let (id, label) =
+            parse_index_line("- [#73](scratchpad/73.md)  - updated 2026-05-27 07:00:00").unwrap();
+        assert_eq!(id, 73);
+        assert_eq!(label, "");
+        // lookup_title rolls the empty label up to "no title" so the pane
+        // title falls back to "Scratchpad #N".
+        let pads = vec![(73u64, label)];
+        assert!(lookup_title(&pads, 73).is_none());
+    }
+
+    #[test]
+    fn empty_title_todo_line_returns_an_empty_label() {
+        // The same shape on the todo side: empty title + " - open, medium"
+        // suffix used to leak the suffix into the sidebar.
+        let (id, label) = parse_index_line("- [ ] [#75](todos/75.md)  - open, medium").unwrap();
+        assert_eq!(id, 75);
+        assert_eq!(label, "");
+        let todos = vec![(75u64, label)];
+        assert!(lookup_title(&todos, 75).is_none());
     }
 
     #[test]

@@ -235,9 +235,16 @@ impl ScratchpadForm {
     /// `scratchpad_update` rather than echoed back stale.
     pub fn flush(&mut self) -> Result<()> {
         let title = self.current_title();
-        if title.is_empty() {
-            // Nothing to save against - silently no-op so an autosave on an
-            // empty new form does not spam errors.
+        // Suppress only the new-form case: `scratchpad_create` needs a non-
+        // empty title, and an autosave on a blank-from-the-start form would
+        // surface that as a spurious error in the message line. Once the
+        // scratchpad exists, the user is allowed to clear its title - the
+        // update path accepts an empty string. Without this distinction the
+        // last non-empty intermediate state ("a" while the user is mid-delete
+        // of "abc") would be the value the daemon and the sidebar see, and
+        // the next refresh would replay that orphan character back into the
+        // title field.
+        if self.id.is_none() && title.is_empty() {
             return Ok(());
         }
         let body = self.current_body();
@@ -377,9 +384,11 @@ impl ScratchpadForm {
 
     /// Render the form into `area`.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        // Rows: header / title / body / context / message.
+        // Rows: title / body / context / message. The pane title (set by the
+        // Zellij sidebar) already names the scratchpad, so no in-form header
+        // row is needed; locked-by, when set, surfaces in the message line at
+        // the bottom. Mirrors the todo form's #53 cleanup.
         let rows = Layout::vertical([
-            Constraint::Length(1), // header (incl. locked-by banner)
             Constraint::Length(3), // title
             Constraint::Min(3),    // body
             Constraint::Length(1), // context (created/updated)
@@ -387,21 +396,9 @@ impl ScratchpadForm {
         ])
         .split(area);
 
-        let header_text = match (&self.id, &self.locked_by) {
-            (Some(id), Some(holder)) => format!(" Edit scratchpad #{id}   [locked by {holder}]"),
-            (Some(id), None) => format!(" Edit scratchpad #{id}"),
-            (None, _) => " New scratchpad".to_string(),
-        };
-        let header_style = if self.locked_by.is_some() {
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red)
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        };
-        frame.render_widget(Paragraph::new(header_text).style(header_style), rows[0]);
-
         self.style_field(Field::Title, "Title");
-        frame.render_widget(&self.title, rows[1]);
-        self.draw_body(frame, rows[2]);
+        frame.render_widget(&self.title, rows[0]);
+        self.draw_body(frame, rows[1]);
 
         let context = if !self.created.is_empty() {
             format!(" created {}   updated {}", self.created, self.updated)
@@ -410,19 +407,26 @@ impl ScratchpadForm {
         };
         frame.render_widget(
             Paragraph::new(context).style(Style::default().fg(Color::DarkGray)),
-            rows[3],
+            rows[2],
         );
 
         let help = "Tab field  Ctrl-C close";
+        let lock_prefix = self
+            .locked_by
+            .as_deref()
+            .map(|h| format!("[locked by {h}]   "))
+            .unwrap_or_default();
         let line = if self.message.is_empty() {
-            format!(" {help}")
+            format!(" {lock_prefix}{help}")
         } else {
-            format!(" {}   |   {help}", self.message)
+            format!(" {lock_prefix}{}   |   {help}", self.message)
         };
-        frame.render_widget(
-            Paragraph::new(line).style(Style::default().fg(Color::Yellow)),
-            rows[4],
-        );
+        let line_style = if self.locked_by.is_some() {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        frame.render_widget(Paragraph::new(line).style(line_style), rows[3]);
     }
 
     /// Render the Body field with our soft-wrap renderer. See
