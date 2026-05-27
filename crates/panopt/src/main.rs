@@ -13,6 +13,7 @@ mod mcp;
 mod mcpclient;
 mod paths;
 mod process;
+mod scratchpad;
 mod scratchpad_form;
 mod todo;
 mod todo_form;
@@ -75,6 +76,15 @@ enum Cmd {
         ws: Option<PathBuf>,
         #[command(subcommand)]
         action: process::ProcessCmd,
+    },
+    /// Operate on the project's scratchpads from the CLI. Currently exposes
+    /// only `rm`; the rest of the surface lives in the cockpit's editor form.
+    Scratchpad {
+        /// Project root the scratchpads belong to (default: the current directory).
+        #[arg(long, global = true)]
+        ws: Option<PathBuf>,
+        #[command(subcommand)]
+        action: scratchpad::ScratchpadCmd,
     },
     /// Internal: the entrypoint that runs inside an agent pane.
     #[command(name = "_agent", hide = true)]
@@ -145,6 +155,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Todo { ws, action } => todo::run(ws, action, cli.port),
         Cmd::AgentTool { ws, action } => agent_tool::run(ws, action, cli.port),
         Cmd::Process { ws, action } => process::run(ws, action, cli.port),
+        Cmd::Scratchpad { ws, action } => scratchpad::run(ws, action, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),

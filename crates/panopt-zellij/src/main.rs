@@ -813,6 +813,7 @@ impl PanoptPane {
             }
             Mode::Scratchpads => {
                 lines.push("  n             new scratchpad".to_string());
+                lines.push("  x             delete scratchpad".to_string());
             }
             Mode::Agents => {
                 lines.push("  n             new agent".to_string());
@@ -1481,11 +1482,9 @@ impl PanoptPane {
         }
     }
 
-    /// Delete the focused item. Todos and process rows go through the
-    /// `panopt` CLI (the daemon owns the durable state); ad-hoc agent panes
-    /// and plain shell terminals are just closed via the host. Scratchpad
-    /// delete has no CLI yet - surface a refusal so the user knows the
-    /// keypress was seen.
+    /// Delete the focused item. Todos, scratchpads, and process rows go
+    /// through the `panopt` CLI (the daemon owns the durable state); ad-hoc
+    /// agent panes and plain shell terminals are just closed via the host.
     fn delete_focused(&mut self) {
         let Some(item) = self.items.get(self.cursor) else {
             return;
@@ -1497,8 +1496,8 @@ impl PanoptPane {
         };
         match target {
             ItemTarget::Todo(id) => self.spawn_delete_gate_dialog("todo", id, &label, cwd),
-            ItemTarget::Scratchpad(_) => {
-                self.refuse_gate("scratchpad delete not yet supported");
+            ItemTarget::Scratchpad(id) => {
+                self.spawn_delete_gate_dialog("scratchpad", id, &label, cwd)
             }
             ItemTarget::Process(id) => self.spawn_delete_gate_dialog("process", id, &label, cwd),
             // A "pane" target is a transient view (a terminal pane, an ad-hoc
@@ -1569,6 +1568,12 @@ impl PanoptPane {
             "todo" => {
                 self.run_panopt(&["todo", "rm", &id.to_string(), "--port", &self.port], cwd);
             }
+            "scratchpad" => {
+                self.run_panopt(
+                    &["scratchpad", "rm", &id.to_string(), "--port", &self.port],
+                    cwd,
+                );
+            }
             "process" => {
                 // Process delete also tears down its live pane (if any), the
                 // same way the pre-gate `delete_focused` used to. The pane
@@ -1582,9 +1587,9 @@ impl PanoptPane {
                     cwd,
                 );
             }
-            // `scratchpad` and `agent-tool` are not yet reachable through the
-            // sidebar's delete keybind, so a stray pipe for them is ignored
-            // rather than executed against a missing CLI.
+            // `agent-tool` is not yet reachable through the sidebar's delete
+            // keybind, so a stray pipe for it is ignored rather than executed
+            // against a missing CLI.
             _ => {}
         }
     }
