@@ -909,6 +909,33 @@ impl Store {
         self.reproject_todos(project)
     }
 
+    /// Transition a todo to [`TodoStatus::InProgress`] to signal that an agent
+    /// has begun work. Idempotent when the todo is already in progress.
+    /// Terminal states (`Completed`, `NotDone`) are rejected as
+    /// [`CoreError::BadRequest`] so the caller has to reopen the todo
+    /// explicitly via [`Self::todo_update`] - silently un-terminating a closed
+    /// todo would lose the close signal.
+    pub fn todo_start(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        let todo = self.fetch_todo(project, id)?;
+        match todo.status {
+            TodoStatus::InProgress => return Ok(()),
+            TodoStatus::Completed | TodoStatus::NotDone => {
+                return Err(CoreError::BadRequest(format!(
+                    "todo {id} is {} - reopen via todo_update before starting",
+                    todo.status.as_str()
+                )));
+            }
+            TodoStatus::Open | TodoStatus::Backlog | TodoStatus::Draft => {}
+        }
+        self.conn.execute(
+            "UPDATE todos SET status = 'in_progress', updated_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+            params![project.0, id as i64],
+        )?;
+        self.reconcile_completed_at(project, id, TodoStatus::InProgress)?;
+        self.reproject_todos(project)
+    }
+
     /// Soft-delete a todo: stamp `deleted_at` so the live list, fetches, and
     /// the projection sweep it. Comments and blocker links stay in their side
     /// tables for the eventual undelete to reattach; cleanup of orphan side
@@ -1699,6 +1726,58 @@ mod tests {
             fx.store.todo_get(p, id).unwrap().status,
             TodoStatus::Completed
         );
+    }
+
+    #[test]
+    fn todo_start_flips_status_and_rejects_terminal() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let id = fx.store.todo_create(p, "task".into()).unwrap();
+        assert_eq!(fx.store.todo_get(p, id).unwrap().status, TodoStatus::Open);
+
+        fx.store.todo_start(p, id).unwrap();
+        assert_eq!(
+            fx.store.todo_get(p, id).unwrap().status,
+            TodoStatus::InProgress
+        );
+        // Idempotent on a todo already in progress.
+        fx.store.todo_start(p, id).unwrap();
+        assert_eq!(
+            fx.store.todo_get(p, id).unwrap().status,
+            TodoStatus::InProgress
+        );
+
+        // Backlog/draft start cleanly too.
+        let backlog = fx.store.todo_create(p, "later".into()).unwrap();
+        fx.store
+            .todo_update(
+                p,
+                backlog,
+                TodoPatch {
+                    status: Some(TodoStatus::Backlog),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fx.store.todo_start(p, backlog).unwrap();
+        assert_eq!(
+            fx.store.todo_get(p, backlog).unwrap().status,
+            TodoStatus::InProgress
+        );
+
+        // Terminal states refuse to be silently reopened.
+        fx.store.todo_complete(p, id).unwrap();
+        let err = fx.store.todo_start(p, id).unwrap_err();
+        assert!(matches!(err, CoreError::BadRequest(_)));
+        assert_eq!(
+            fx.store.todo_get(p, id).unwrap().status,
+            TodoStatus::Completed
+        );
+
+        assert!(matches!(
+            fx.store.todo_start(p, 9_999),
+            Err(CoreError::TodoNotFound(_))
+        ));
     }
 
     #[test]

@@ -44,6 +44,12 @@ Logs: `~/.local/share/panopt/panoptd.log` (tail with `just logs`). Database: `~/
 
 The daemon exposes todos, scratchpads, locks, agent registry, and roster as MCP tools. Each MCP connection is scoped to one project via `?ws=<absolute-path>` on the URL. State mirrors to `.panopt/*.md` on every mutation — those files are read-mostly for humans and the Zellij plugin, not a write surface.
 
+## Working a panopt todo
+
+When the user asks you to work on a todo (`do #N`, `start #N`, `work on #N`, etc.), call `mcp__panopt__todo_start` as your first MCP action against that todo *instead of* `todo_get`. It returns the same full detail, flips status to `in_progress`, and claims the `todo:<N>` advisory lock so other agents and the sidebar see the project state correctly. When you finish, call `todo_complete`. If `todo_start` returns `{started: false, held_by: <name>}`, stop and tell the user — another agent already owns it.
+
+Use `todo_get` only when the intent is to *read* a todo (browse, answer a question about it, render it) — not to begin work on it.
+
 ## Reference
 
 - `DESIGN.md` — full architecture, decision rationale, data model. Read this before non-trivial changes to the data layer or MCP surface.

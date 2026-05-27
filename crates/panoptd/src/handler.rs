@@ -29,7 +29,7 @@ use crate::params::{
     ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs,
     TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs,
     TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs,
-    TodoSetBlockersArgs, TodoUnlockArgs, TodoUpdateArgs,
+    TodoSetBlockersArgs, TodoStartArgs, TodoUnlockArgs, TodoUpdateArgs,
 };
 
 /// Per-session MCP handler.
@@ -908,6 +908,43 @@ impl Handler {
             st.todo_complete(project, args.todo_id).map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Claim a todo for active work: atomically acquires the `todo:<id>` \
+                          advisory lock, transitions status to `in_progress`, and returns the \
+                          same full detail as `todo_get`. Use this as the first MCP call when \
+                          you start work on a todo (e.g. the user asks 'do #N'). Idempotent \
+                          when you already hold the lock and the todo is `in_progress`. If \
+                          another agent holds the lock, returns {started: false, held_by} \
+                          without mutating status. Errors on terminal states \
+                          (`completed`/`not_done`) - reopen via `todo_update` first.")]
+    async fn todo_start(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<TodoStartArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().expect("state mutex poisoned");
+        let (project, key) = enter(&mut st, &parts)?;
+        let key = require_key(key)?;
+        // Make sure the todo exists before we touch the lock table - otherwise
+        // an agent could squat `todo:999` forever (same guard `todo_lock` has).
+        st.todo_get(project, args.todo_id).map_err(map_core_err)?;
+        let name = format!("todo:{}", args.todo_id);
+        match st
+            .lock_acquire(project, &key, name, args.note)
+            .map_err(map_core_err)?
+        {
+            Some(holder) => {
+                json_result(&serde_json::json!({ "started": false, "held_by": holder }))
+            }
+            None => {
+                st.todo_start(project, args.todo_id).map_err(map_core_err)?;
+                let todo = st.todo_get(project, args.todo_id).map_err(map_core_err)?;
+                let locked_by = todo_lock_holder(&st, project, args.todo_id);
+                let dto = TodoDetailDto::from_todo(todo, locked_by);
+                json_result(&serde_json::json!({ "started": true, "todo": dto }))
+            }
+        }
     }
 
     #[tool(description = "Delete a todo, addressed by numeric id. Its comments and blocker \

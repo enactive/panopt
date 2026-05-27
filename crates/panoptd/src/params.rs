@@ -71,6 +71,16 @@ pub struct TodoCompleteArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TodoStartArgs {
+    /// Numeric id of the todo to claim and transition to `in_progress`.
+    pub todo_id: u64,
+    /// Optional reason, forwarded to the `todo:<id>` advisory lock and shown
+    /// to other agents in `lock_status`.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TodoGetArgs {
     /// Numeric id of the todo to fetch.
     pub todo_id: u64,
