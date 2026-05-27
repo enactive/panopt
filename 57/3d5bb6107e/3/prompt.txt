@@ -1,0 +1,176 @@
+plan #83
+
+---
+
+mcp is back
+
+---
+
+do agent_list or whatever it's called
+
+---
+
+again
+
+---
+
+did you run it again? i started an agent in panopt...
+
+---
+
+go
+
+---
+
+can we force the new agent to do something so it gets registered automatically?
+
+---
+
+of course I mean can we add something to the agent launch process that forces it to id itself to the mcp server.  either implicitly or ex.  do it here.
+
+---
+
+run agent_list
+
+---
+
+the mcp connection used to not 'fail' like this.  i never had to reconnect it.  what happened/
+
+---
+
+2026-05-27T21:21:22.277066Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:22.277199Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:22.284964Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:22.285063Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:21:23.288104Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="24d2790a-5443-44e9-9265-7752f3c52d16"
+2026-05-27T21:21:23.290980Z  INFO serve_inner: rmcp::service: Service initialized as server peer_info=Some(InitializeRequestParams { meta: None, protocol_version: ProtocolVersion("2025-06-18"), capabilities: ClientCapabilities { experimental: None, extensions: None, roots: None, sampling: None, elicitation: None, tasks: None }, client_info: Implementation { name: "panopt-cli", title: None, version: "0.1.0", description: None, icons: None, website_url: None } })
+2026-05-27T21:21:23.292826Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:23.293016Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:23.300472Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:23.300574Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:21:24.303423Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="45a49bce-dbe0-4859-98d0-09361316c717"
+2026-05-27T21:21:24.306359Z  INFO serve_inner: rmcp::service: Service initialized as server peer_info=Some(InitializeRequestParams { meta: None, protocol_version: ProtocolVersion("2025-06-18"), capabilities: ClientCapabilities { experimental: None, extensions: None, roots: None, sampling: None, elicitation: None, tasks: None }, client_info: Implementation { name: "panopt-cli", title: None, version: "0.1.0", description: None, icons: None, website_url: None } })
+2026-05-27T21:21:24.307876Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:24.307983Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:24.316120Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:24.316246Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:21:25.319386Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="bed0b8d8-ad34-4698-8166-2c217dda6ac9"
+2026-05-27T21:21:25.324162Z  INFO serve_inner: rmcp::service: Service initialized as server peer_info=Some(InitializeRequestParams { meta: None, protocol_version: ProtocolVersion("2025-06-18"), capabilities: ClientCapabilities { experimental: None, extensions: None, roots: None, sampling: None, elicitation: None, tasks: None }, client_info: Implementation { name: "panopt-cli", title: None, version: "0.1.0", description: None, icons: None, website_url: None } })
+2026-05-27T21:21:25.325767Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:25.325876Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:25.333877Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:25.333970Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:21:26.336776Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="4fae4229-88ff-4433-87dc-b5efca3019b7"
+2026-05-27T21:21:26.339822Z  INFO serve_inner: rmcp::service: Service initialized as server peer_info=Some(InitializeRequestParams { meta: None, protocol_version: ProtocolVersion("2025-06-18"), capabilities: ClientCapabilities { experimental: None, extensions: None, roots: None, sampling: None, elicitation: None, tasks: None }, client_info: Implementation { name: "panopt-cli", title: None, version: "0.1.0", description: None, icons: None, website_url: None } })
+2026-05-27T21:21:26.341370Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:26.341486Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:26.349176Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:26.349269Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:21:27.352149Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="542de061-ac36-4c2b-a3b3-f9edac70bd08"
+2026-05-27T21:21:27.355046Z  INFO serve_inner: rmcp::service: Service initialized as server peer_info=Some(InitializeRequestParams { meta: None, protocol_version: ProtocolVersion("2025-06-18"), capabilities: ClientCapabilities { experimental: None, extensions: None, roots: None, sampling: None, elicitation: None, tasks: None }, client_info: Implementation { name: "panopt-cli", title: None, version: "0.1.0", description: None, icons: None, website_url: None } })
+2026-05-27T21:21:27.357040Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:27.357225Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:27.369222Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:27.369338Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:21:28.372164Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="3f503213-b8e6-4d7e-ab63-e9565186a09e"
+2026-05-27T21:21:28.374921Z  INFO serve_inner: rmcp::service: Service initialized as server peer_info=Some(InitializeRequestParams { meta: None, protocol_version: ProtocolVersion("2025-06-18"), capabilities: ClientCapabilities { experimental: None, extensions: None, roots: None, sampling: None, elicitation: None, tasks: None }, client_info: Implementation { name: "panopt-cli", title: None, version: "0.1.0", description: None, icons: None, website_url: None } })
+2026-05-27T21:21:28.376489Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:28.376614Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:28.384251Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:28.384338Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:21:29.387049Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="09a82357-1f4b-45cc-b501-51e338831c90"
+2026-05-27T21:21:29.390008Z  INFO serve_inner: rmcp::service: Service initialized as server peer_info=Some(InitializeRequestParams { meta: None, protocol_version: ProtocolVersion("2025-06-18"), capabilities: ClientCapabilities { experimental: None, extensions: None, roots: None, sampling: None, elicitation: None, tasks: None }, client_info: Implementation { name: "panopt-cli", title: None, version: "0.1.0", description: None, icons: None, website_url: None } })
+2026-05-27T21:21:29.391626Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:21:29.391737Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:21:29.399487Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:21:29.399599Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+
+---
+
+2026-05-27T21:25:01.623423Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:01.623596Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:01.631413Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:01.631512Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:02.634167Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="9f1eaf94-25ea-416f-97a5-555280854e9e"
+2026-05-27T21:25:02.638849Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:02.638970Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:02.646778Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:02.646868Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:03.649657Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="21ded6aa-a6f5-4300-a066-c2fe2875db57"
+2026-05-27T21:25:03.654684Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:03.654815Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:03.662732Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:03.662836Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:04.665838Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="f7d4b0a3-34f1-41af-bf4e-97e115445e99"
+2026-05-27T21:25:04.672192Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:04.672369Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:04.682109Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:04.682204Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:05.685148Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="fa2133ed-5f54-43d1-89f8-311b19864f57"
+2026-05-27T21:25:05.689827Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:05.689963Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:05.697678Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:05.697800Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:06.700348Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="5973c9e9-f428-4cfd-a985-dba3643968a2"
+2026-05-27T21:25:06.704960Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:06.705067Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:06.712863Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:06.712972Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:07.715586Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="2fa371cb-031d-49c6-b593-397005845e34"
+2026-05-27T21:25:07.720264Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:07.720404Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:07.728513Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:07.728618Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:08.731354Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="1be483c2-a17c-4d04-bdb1-008ba08a7581"
+2026-05-27T21:25:08.735786Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:08.735893Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:08.743479Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:08.743593Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:09.746290Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="e4c2339f-30e1-4ca3-9a9f-606ec5b19885"
+2026-05-27T21:25:09.750812Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:09.750920Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:09.758549Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:09.758655Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:10.761439Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="29515a87-a385-4351-aec1-f327532391c4"
+2026-05-27T21:25:10.766050Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:10.766188Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:10.773933Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:10.774024Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+2026-05-27T21:25:11.776933Z  INFO rmcp::transport::streamable_http_server::session::local: create new session session_id="fdc16af5-def8-43d7-9f54-bb88b187c615"
+2026-05-27T21:25:11.781607Z  INFO serve_inner: rmcp::service: received notification notification=InitializedNotification(NotificationNoParam { method: InitializedNotificationMethod, extensions: Extensions })
+2026-05-27T21:25:11.781726Z  INFO serve_inner: rmcp::handler::server: client initialized
+2026-05-27T21:25:11.789642Z  INFO serve_inner: rmcp::service: input stream terminated
+2026-05-27T21:25:11.789729Z  INFO serve_inner: rmcp::service: serve finished quit_reason=Closed
+
+---
+
+first; nothing. second: every second stuff
+
+---
+
+add a todo for the one-client-per-viewer thing
+
+i was *def* killing everything after every change made here.  and the claude version hasn;t changed. what version are you?
+
+---
+
+it;s back
+
+
+i REALLY need this to reconnect like it had been doing for days and days.
+
+---
+
+it tires to reconnect 5 times.  it still failed.
+
+---
+
+these all weem wrong-headed.  what if we make *another* mcp server that remote agents use as a proxy to panoptd?  it is simple and long-lived.  it connects to panoptd and tolerates indefinite disconnections.
+
+---
+
+write a doc: what it is [for], how to use it, etc.  put is in a scratchpad
+
+---
+
+back

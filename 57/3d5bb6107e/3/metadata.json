@@ -1,0 +1,219 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "573d5bb6107e",
+  "session_id": "8d1e8ce7-e6d9-4dcf-ae81-af6eafc9d5f0",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-27T23:02:49.880942455Z",
+  "branch": "main",
+  "checkpoints_count": 18,
+  "files_touched": [
+    "CLAUDE.md",
+    "Cargo.lock",
+    "README.md",
+    "crates/panopt-core/src/lib.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt/Cargo.toml",
+    "crates/panopt/src/agent.rs",
+    "crates/panopt/src/agent_config.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/mcp.rs",
+    "crates/panopt/src/paths.rs",
+    "crates/panopt/src/todo.rs",
+    "crates/panoptd/src/main.rs",
+    "justfile"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "bc331be14af3",
+  "token_usage": {
+    "input_tokens": 421,
+    "cache_creation_tokens": 1660842,
+    "cache_read_tokens": 44920037,
+    "output_tokens": 191687,
+    "api_call_count": 247
+  },
+  "session_metrics": {
+    "turn_count": 18
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-27T23:02:49.78981048Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 56,
+    "human_removed": 297,
+    "total_committed": 274,
+    "total_lines_changed": 358,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 612,
+      "user_lines_removed": 56,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/agents/entire-search.md": 25,
+        ".claude/scheduled_tasks.lock": 1,
+        ".claude/settings.json": 81,
+        "CLAUDE.md": 11,
+        "Cargo.lock": 1,
+        "DESIGN.md": 33,
+        "README.md": 26,
+        "crates/panopt-core/src/auth.rs": 141,
+        "crates/panopt-core/src/lib.rs": 1,
+        "crates/panopt-core/src/state.rs": 10,
+        "crates/panopt/Cargo.toml": 1,
+        "crates/panopt/src/agent.rs": 11,
+        "crates/panopt/src/agent_config.rs": 101,
+        "crates/panopt/src/main.rs": 25,
+        "crates/panopt/src/mcp.rs": 17,
+        "crates/panopt/src/paths.rs": 7,
+        "crates/panopt/src/todo.rs": 14,
+        "crates/panoptd/src/handler.rs": 13,
+        "crates/panoptd/src/main.rs": 89,
+        "justfile": 4
+      },
+      "user_removed_per_file": {
+        ".claude/settings.json": 5,
+        "CLAUDE.md": 1,
+        "DESIGN.md": 10,
+        "README.md": 14,
+        "crates/panopt-core/src/state.rs": 1,
+        "crates/panopt/src/agent.rs": 2,
+        "crates/panopt/src/mcp.rs": 8,
+        "crates/panopt/src/todo.rs": 3,
+        "crates/panoptd/src/main.rs": 10,
+        "justfile": 2
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1148,
+      "agent_lines_removed": 172
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1148,
+      "agent_lines_removed": 172
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1148,
+      "agent_lines_removed": 172
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1148,
+      "agent_lines_removed": 172
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1148,
+      "agent_lines_removed": 172
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1148,
+      "agent_lines_removed": 172
+    },
+    {
+      "checkpoint_number": 8,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1148,
+      "agent_lines_removed": 172
+    },
+    {
+      "checkpoint_number": 9,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1178,
+      "agent_lines_removed": 173
+    },
+    {
+      "checkpoint_number": 10,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1178,
+      "agent_lines_removed": 173
+    },
+    {
+      "checkpoint_number": 11,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1178,
+      "agent_lines_removed": 173
+    },
+    {
+      "checkpoint_number": 12,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1178,
+      "agent_lines_removed": 173
+    },
+    {
+      "checkpoint_number": 13,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1178,
+      "agent_lines_removed": 173
+    },
+    {
+      "checkpoint_number": 14,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1178,
+      "agent_lines_removed": 173
+    },
+    {
+      "checkpoint_number": 15,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1178,
+      "agent_lines_removed": 173
+    },
+    {
+      "checkpoint_number": 16,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1235,
+      "agent_lines_removed": 193
+    },
+    {
+      "checkpoint_number": 17,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1676,
+      "agent_lines_removed": 195
+    },
+    {
+      "checkpoint_number": 18,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1676,
+      "agent_lines_removed": 195
+    },
+    {
+      "checkpoint_number": 19,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1676,
+      "agent_lines_removed": 195
+    }
+  ]
+}
