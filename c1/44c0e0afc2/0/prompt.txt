@@ -1,0 +1,1 @@
+in agent panes, it looks like pageup and down move one line at a time.  In form fields pageup and down do nothihng
