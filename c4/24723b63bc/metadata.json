@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "c424723b63bc",
+  "strategy": "manual-commit",
+  "branch": "right-pane-terminal-ux-phase1",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-zellij/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/c4/24723b63bc/0/metadata.json",
+      "transcript": "/c4/24723b63bc/0/full.jsonl",
+      "content_hash": "/c4/24723b63bc/0/content_hash.txt",
+      "prompt": "/c4/24723b63bc/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 410,
+    "cache_creation_tokens": 624286,
+    "cache_read_tokens": 47739197,
+    "output_tokens": 188903,
+    "api_call_count": 233
+  }
+}
