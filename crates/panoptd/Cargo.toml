@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 panopt-core = { path = "../panopt-core" }
+panopt-tool-surface = { path = "../panopt-tool-surface" }
 rmcp = { version = "=1.7.0", features = [
     "server",
     "macros",

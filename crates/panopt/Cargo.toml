@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 panopt-core = { path = "../panopt-core" }
+panopt-tool-surface = { path = "../panopt-tool-surface" }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
 dirs = "5"

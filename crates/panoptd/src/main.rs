@@ -11,7 +11,6 @@
 //! exact same gate.
 
 mod handler;
-mod params;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -138,7 +137,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(db = %db_path.display(), "panoptd starting");
     tracing::info!(
         "MCP endpoint: http://{}:{}/mcp?ws=<project path>",
-        cli.host, cli.port
+        cli.host,
+        cli.port
     );
 
     // Drop agents that have gone silent, every 30s, so a closed agent leaves
@@ -176,12 +176,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let token_for_auth = Arc::new(token);
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(
-            token_for_auth,
-            require_token,
-        ));
+    let router =
+        axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn_with_state(
+                token_for_auth,
+                require_token,
+            ));
     let listener = tokio::net::TcpListener::bind((cli.host.as_str(), cli.port))
         .await
         .with_context(|| format!("failed to bind {}:{}", cli.host, cli.port))?;

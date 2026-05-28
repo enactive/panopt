@@ -1,0 +1,23 @@
+[package]
+name = "panopt-tool-surface"
+version.workspace = true
+edition.workspace = true
+
+# The single declaration of panopt's MCP tool surface: every tool's name,
+# description, and input schema, plus the `Parameters<T>` types whose
+# `JsonSchema` derives produce those schemas. Consumed by `panoptd` (which
+# pairs each entry with a local impl) and by `panopt`'s `_mcp-proxy` (which
+# pairs each entry with a "forward upstream" impl). No `rmcp`, `tokio`, or
+# `axum` here on purpose: those would re-pull async/HTTP machinery into the
+# launcher just to read a tool list. `cargo tree -p panopt-tool-surface` is
+# expected to contain none of rmcp, tokio, axum, or panoptd - the same
+# mechanical check pattern as panopt-core.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Pinned to match rmcp 1.7.0's schemars version so that during the macro->
+# data-driven migration, `JsonSchema` impls derived here satisfy the
+# `#[tool]` macros over in panoptd without a duplicate schemars in the
+# graph. After step 5 of the migration the macros are gone and this pin
+# only needs to satisfy our own `schema_for!` calls.
+schemars = "1.2"

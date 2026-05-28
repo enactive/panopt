@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/panopt-core", "crates/panoptd", "crates/panopt"]
+members = [
+    "crates/panopt-core",
+    "crates/panopt-tool-surface",
+    "crates/panoptd",
+    "crates/panopt",
+]
 # panopt-zellij is a WASM-only plugin crate; excluded so `cargo build --workspace`
 # (which targets the host) does not try to build it.
 exclude = ["crates/panopt-zellij"]

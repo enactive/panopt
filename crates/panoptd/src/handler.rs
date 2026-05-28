@@ -6,6 +6,14 @@
 //! agent key - the `agent` URL parameter when set, the MCP session id
 //! otherwise - so one daemon serves every project at once with no per-session
 //! state welded into the handler.
+//!
+//! The tool surface (names, descriptions, input schemas) is published by
+//! [`panopt_tool_surface::TOOL_SURFACE`]. [`build_router`] iterates that
+//! table at startup and registers each tool with the rmcp `ToolRouter` via
+//! a closure that funnels every call through [`dispatch_local`]. The proxy
+//! in `crates/panopt/src/mcp_proxy.rs` consumes the same table to answer
+//! `tools/list` without ever talking to panoptd - that's the whole point of
+//! the shared crate.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,15 +22,7 @@ use panopt_core::{
     Agent, AgentTool, AgentToolPatch, CoreError, KeySource, Lock, Priority, Process, ProcessKind,
     ProcessPatch, ProjectId, Scratchpad, ScratchpadPatch, Store, Todo, TodoPatch, TodoStatus,
 };
-use rmcp::{
-    handler::server::{common::Extension, router::tool::ToolRouter, wrapper::Parameters},
-    model::*,
-    tool, tool_handler, tool_router,
-    ErrorData as McpError, ServerHandler,
-};
-use serde::Serialize;
-
-use crate::params::{
+use panopt_tool_surface::params::{
     AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
     IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs,
     ProcessGetArgs, ProcessUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
@@ -31,6 +31,16 @@ use crate::params::{
     TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs,
     TodoSetBlockersArgs, TodoStartArgs, TodoUnlockArgs, TodoUpdateArgs,
 };
+use panopt_tool_surface::TOOL_SURFACE;
+use rmcp::{
+    handler::server::{
+        router::tool::{ToolRoute, ToolRouter},
+        tool::{parse_json_object, ToolCallContext},
+    },
+    model::*,
+    ErrorData as McpError, ServerHandler,
+};
+use serde::Serialize;
 
 /// Per-session MCP handler.
 ///
@@ -41,10 +51,8 @@ use crate::params::{
 #[derive(Clone)]
 pub struct Handler {
     state: Arc<Mutex<Store>>,
-    // Part of rmcp's `#[tool_router]` / `#[tool_handler]` pattern: built once in
-    // `new()` and consulted by the macro-generated `ServerHandler` impl. The
-    // dead-code lint does not attribute that macro-generated use to the field.
-    #[allow(dead_code)]
+    /// Built once in `new()` from [`build_router`] and consulted by this
+    /// type's manual `ServerHandler` impl (see `call_tool`, `list_tools`).
     tool_router: ToolRouter<Self>,
 }
 
@@ -383,10 +391,7 @@ fn resolve_id_kind(store: &Store, project: ProjectId, id: u64) -> Result<IdKindD
         Err(CoreError::ProcessNotFound(_)) => {}
         Err(e) => return Err(map_core_err(e)),
     }
-    Err(McpError::invalid_params(
-        format!("id {id} not found"),
-        None,
-    ))
+    Err(McpError::invalid_params(format!("id {id} not found"), None))
 }
 
 /// Map a core error onto an MCP error result at the protocol boundary.
@@ -522,7 +527,10 @@ fn require_key(key: Option<String>) -> Result<String, McpError> {
 /// Reject an empty or whitespace-only lock name.
 fn require_lock_name(name: String) -> Result<String, McpError> {
     if name.trim().is_empty() {
-        return Err(McpError::invalid_params("lock name must not be empty", None));
+        return Err(McpError::invalid_params(
+            "lock name must not be empty",
+            None,
+        ));
     }
     Ok(name)
 }
@@ -565,22 +573,15 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
-#[tool_router]
 impl Handler {
     pub fn new(state: Arc<Mutex<Store>>) -> Self {
         Self {
             state,
-            tool_router: Self::tool_router(),
+            tool_router: build_router(),
         }
     }
 
-    #[tool(description = "Register or update this agent's name and status in the coordination \
-                          registry. Other agents see it via agent_list.")]
-    async fn identify(
-        &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<IdentifyArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn identify(&self, parts: Parts, args: IdentifyArgs) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, key) = enter(&mut st, &parts)?;
@@ -593,16 +594,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Cooperatively leave the project's agent registry. Removes this agent \
-                          from agent_list immediately, releases every advisory lock it holds, \
-                          and re-projects .panopt/agents.md and .panopt/locks.md. Idempotent: \
-                          a second call by an already-gone agent is a silent ok. Intended for \
-                          a clean handoff or shutdown - the idle sweep handles agents that \
-                          just disappear.")]
-    async fn agent_leave(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn agent_leave(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, key) = enter(&mut st, &parts)?;
@@ -613,12 +605,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Return this agent's own registry entry: {name, status, idle_seconds, \
-                          is_self}.")]
-    async fn whoami(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn whoami(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, key) = enter(&mut st, &parts)?;
@@ -631,12 +618,7 @@ impl Handler {
         json_result(&dto)
     }
 
-    #[tool(description = "List every agent currently connected to this project as a JSON array \
-                          of {name, status, idle_seconds, is_self}.")]
-    async fn agent_list(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn agent_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let dtos: Vec<AgentDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, key) = enter(&mut st, &parts)?;
@@ -649,13 +631,10 @@ impl Handler {
         json_result(&dtos)
     }
 
-    #[tool(description = "Acquire a named advisory lock to coordinate exclusive work. \
-                          Non-blocking: returns {acquired: bool, held_by?: name} - acquired \
-                          is false when another agent holds it.")]
     async fn lock_acquire(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<LockAcquireArgs>,
+        parts: Parts,
+        args: LockAcquireArgs,
     ) -> Result<CallToolResult, McpError> {
         let name = require_lock_name(args.name)?;
         let outcome = {
@@ -667,36 +646,34 @@ impl Handler {
         };
         match outcome {
             None => json_result(&serde_json::json!({ "acquired": true })),
-            Some(holder) => json_result(&serde_json::json!({ "acquired": false, "held_by": holder })),
+            Some(holder) => {
+                json_result(&serde_json::json!({ "acquired": false, "held_by": holder }))
+            }
         }
     }
 
-    #[tool(description = "Release a named advisory lock you hold. Returns {released: bool, \
-                          held_by?: name}; released is false only if another agent holds it.")]
     async fn lock_release(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<LockReleaseArgs>,
+        parts: Parts,
+        args: LockReleaseArgs,
     ) -> Result<CallToolResult, McpError> {
         let name = require_lock_name(args.name)?;
         let outcome = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, key) = enter(&mut st, &parts)?;
             let key = require_key(key)?;
-            st.lock_release(project, &key, &name).map_err(map_core_err)?
+            st.lock_release(project, &key, &name)
+                .map_err(map_core_err)?
         };
         match outcome {
             None => json_result(&serde_json::json!({ "released": true })),
-            Some(holder) => json_result(&serde_json::json!({ "released": false, "held_by": holder })),
+            Some(holder) => {
+                json_result(&serde_json::json!({ "released": false, "held_by": holder }))
+            }
         }
     }
 
-    #[tool(description = "List all advisory locks held in this project as a JSON array of \
-                          {name, held_by, note, age_seconds, is_mine}.")]
-    async fn lock_status(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn lock_status(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let dtos: Vec<LockDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, key) = enter(&mut st, &parts)?;
@@ -708,25 +685,21 @@ impl Handler {
         json_result(&dtos)
     }
 
-    #[tool(description = "Create a new scratchpad with a title. Returns its numeric id.")]
     async fn scratchpad_create(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ScratchpadCreateArgs>,
+        parts: Parts,
+        args: ScratchpadCreateArgs,
     ) -> Result<CallToolResult, McpError> {
         let id = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.scratchpad_create(project, args.title).map_err(map_core_err)?
+            st.scratchpad_create(project, args.title)
+                .map_err(map_core_err)?
         };
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    #[tool(description = "List all scratchpads as a JSON array of {id, title}.")]
-    async fn scratchpad_list(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn scratchpad_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let dtos: Vec<ScratchpadDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -739,11 +712,10 @@ impl Handler {
         json_result(&dtos)
     }
 
-    #[tool(description = "Append text to an existing scratchpad, addressed by numeric id.")]
     async fn scratchpad_append(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ScratchpadAppendArgs>,
+        parts: Parts,
+        args: ScratchpadAppendArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -754,11 +726,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Read the full body of a scratchpad, addressed by numeric id.")]
     async fn scratchpad_read(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ScratchpadReadArgs>,
+        parts: Parts,
+        args: ScratchpadReadArgs,
     ) -> Result<CallToolResult, McpError> {
         let body = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -769,14 +740,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
-    #[tool(
-        description = "Fetch one scratchpad in full - id, title, body, and timestamps - \
-                       addressed by numeric id."
-    )]
     async fn scratchpad_get(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ScratchpadGetArgs>,
+        parts: Parts,
+        args: ScratchpadGetArgs,
     ) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -789,16 +756,10 @@ impl Handler {
         json_result(&dto)
     }
 
-    #[tool(
-        description = "Edit a scratchpad's title, body, and/or tags. Each omitted field is left \
-                       unchanged; body replaces the existing body in full (use \
-                       scratchpad_append to add instead of replace); tags replaces the whole \
-                       tag list."
-    )]
     async fn scratchpad_update(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ScratchpadUpdateArgs>,
+        parts: Parts,
+        args: ScratchpadUpdateArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -814,14 +775,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(
-        description = "Delete a scratchpad. Removes both the database row and the per-pad \
-                       projection file."
-    )]
     async fn scratchpad_delete(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ScratchpadDeleteArgs>,
+        parts: Parts,
+        args: ScratchpadDeleteArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -832,15 +789,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(
-        description = "List the project's tag vocabulary: the sorted, deduped union of every \
-                       tag attached to any todo OR scratchpad. Identical output to \
-                       todo_tags_list - the two surfaces share one project-wide tag pool."
-    )]
-    async fn scratchpad_tags_list(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn scratchpad_tags_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let tags = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -849,11 +798,10 @@ impl Handler {
         json_result(&tags)
     }
 
-    #[tool(description = "Create a new todo with a title. Returns its numeric id.")]
     async fn todo_create(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoCreateArgs>,
+        parts: Parts,
+        args: TodoCreateArgs,
     ) -> Result<CallToolResult, McpError> {
         let id = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -863,13 +811,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    #[tool(description = "List all todos as a JSON array of {id, title, status, priority, \
-                          assignee, tags, blockers, comment_count, created_at, updated_at}. \
-                          Use todo_get for a todo's body and comment thread.")]
-    async fn todo_list(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn todo_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let dtos: Vec<TodoSummaryDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -882,14 +824,7 @@ impl Handler {
         json_result(&dtos)
     }
 
-    #[tool(description = "Fetch one todo in full - body, comment thread, blockers and all - \
-                          addressed by numeric id. `locked_by` is set when an agent holds \
-                          the `todo:<id>` advisory lock.")]
-    async fn todo_get(
-        &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoGetArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn todo_get(&self, parts: Parts, args: TodoGetArgs) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -900,14 +835,10 @@ impl Handler {
         json_result(&dto)
     }
 
-    #[tool(description = "Edit a todo's fields. Every argument but todo_id is optional; an \
-                          omitted field is left unchanged. status is one of open/in_progress/\
-                          backlog/draft/completed/not_done, priority one of high/medium/low; tags \
-                          replaces the whole tag list.")]
     async fn todo_update(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoUpdateArgs>,
+        parts: Parts,
+        args: TodoUpdateArgs,
     ) -> Result<CallToolResult, McpError> {
         let status = match &args.status {
             Some(s) => Some(parse_status(s)?),
@@ -928,37 +859,30 @@ impl Handler {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.todo_update(project, args.todo_id, patch).map_err(map_core_err)?;
+            st.todo_update(project, args.todo_id, patch)
+                .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Mark a todo complete, addressed by numeric id.")]
     async fn todo_complete(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoCompleteArgs>,
+        parts: Parts,
+        args: TodoCompleteArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.todo_complete(project, args.todo_id).map_err(map_core_err)?;
+            st.todo_complete(project, args.todo_id)
+                .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Claim a todo for active work: atomically acquires the `todo:<id>` \
-                          advisory lock, transitions status to `in_progress`, and returns the \
-                          same full detail as `todo_get`. Use this as the first MCP call when \
-                          you start work on a todo (e.g. the user asks 'do #N'). Idempotent \
-                          when you already hold the lock and the todo is `in_progress`. If \
-                          another agent holds the lock, returns {started: false, held_by} \
-                          without mutating status. Errors on terminal states \
-                          (`completed`/`not_done`) - reopen via `todo_update` first.")]
     async fn todo_start(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoStartArgs>,
+        parts: Parts,
+        args: TodoStartArgs,
     ) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().expect("state mutex poisoned");
         let (project, key) = enter(&mut st, &parts)?;
@@ -984,27 +908,24 @@ impl Handler {
         }
     }
 
-    #[tool(description = "Delete a todo, addressed by numeric id. Its comments and blocker \
-                          links are removed with it.")]
     async fn todo_delete(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoDeleteArgs>,
+        parts: Parts,
+        args: TodoDeleteArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.todo_delete(project, args.todo_id).map_err(map_core_err)?;
+            st.todo_delete(project, args.todo_id)
+                .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Record that one todo is blocked by another: todo_id is blocked by \
-                          blocker_id. Both must exist and must differ.")]
     async fn todo_add_blocker(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoBlockerArgs>,
+        parts: Parts,
+        args: TodoBlockerArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1015,12 +936,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Remove a blocker link, so todo_id is no longer blocked by \
-                          blocker_id.")]
     async fn todo_remove_blocker(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoBlockerArgs>,
+        parts: Parts,
+        args: TodoBlockerArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1031,13 +950,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Add a comment to a todo. The author is the supplied `author`, or - \
-                          omitted - the calling agent's registered name. Returns the new \
-                          comment's numeric id.")]
     async fn todo_comment_add(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoCommentAddArgs>,
+        parts: Parts,
+        args: TodoCommentAddArgs,
     ) -> Result<CallToolResult, McpError> {
         let id = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1060,12 +976,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    #[tool(description = "Edit an existing comment's body. The author and timestamp are \
-                          preserved - this is not a re-post.")]
     async fn todo_comment_update(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoCommentUpdateArgs>,
+        parts: Parts,
+        args: TodoCommentUpdateArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1076,12 +990,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Delete a comment from a todo. Comment ids are not reused after \
-                          deletion - the per-todo counter keeps advancing.")]
     async fn todo_comment_delete(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoCommentDeleteArgs>,
+        parts: Parts,
+        args: TodoCommentDeleteArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1092,13 +1004,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Replace a todo's blocker set in one call. Equivalent to a diff of \
-                          todo_add_blocker / todo_remove_blocker, but atomic - used by the \
-                          cockpit form to avoid a half-applied state.")]
     async fn todo_set_blockers(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoSetBlockersArgs>,
+        parts: Parts,
+        args: TodoSetBlockersArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1109,14 +1018,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "List the project's tag vocabulary: the sorted, deduped union of \
-                          every tag attached to any todo OR scratchpad. The two surfaces \
-                          share one project-wide tag pool, so this returns identical output \
-                          to scratchpad_tags_list.")]
-    async fn todo_tags_list(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn todo_tags_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let tags = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -1125,13 +1027,10 @@ impl Handler {
         json_result(&tags)
     }
 
-    #[tool(description = "Claim a todo as `todo:<id>` in the advisory lock table. A thin \
-                          wrapper around lock_acquire - non-blocking, returns {acquired: \
-                          bool, held_by?: name}. Advisory only.")]
     async fn todo_lock(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoLockArgs>,
+        parts: Parts,
+        args: TodoLockArgs,
     ) -> Result<CallToolResult, McpError> {
         let outcome = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1146,36 +1045,37 @@ impl Handler {
         };
         match outcome {
             None => json_result(&serde_json::json!({ "acquired": true })),
-            Some(holder) => json_result(&serde_json::json!({ "acquired": false, "held_by": holder })),
+            Some(holder) => {
+                json_result(&serde_json::json!({ "acquired": false, "held_by": holder }))
+            }
         }
     }
 
-    #[tool(description = "Release the `todo:<id>` advisory lock you hold. Returns \
-                          {released: bool, held_by?: name}.")]
     async fn todo_unlock(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<TodoUnlockArgs>,
+        parts: Parts,
+        args: TodoUnlockArgs,
     ) -> Result<CallToolResult, McpError> {
         let outcome = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, key) = enter(&mut st, &parts)?;
             let key = require_key(key)?;
             let name = format!("todo:{}", args.todo_id);
-            st.lock_release(project, &key, &name).map_err(map_core_err)?
+            st.lock_release(project, &key, &name)
+                .map_err(map_core_err)?
         };
         match outcome {
             None => json_result(&serde_json::json!({ "released": true })),
-            Some(holder) => json_result(&serde_json::json!({ "released": false, "held_by": holder })),
+            Some(holder) => {
+                json_result(&serde_json::json!({ "released": false, "held_by": holder }))
+            }
         }
     }
 
-    #[tool(description = "Create an agent tool (config layer) - a durable agent configuration \
-                          this project can spawn processes from. Returns its numeric id.")]
     async fn agent_tool_create(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<AgentToolCreateArgs>,
+        parts: Parts,
+        args: AgentToolCreateArgs,
     ) -> Result<CallToolResult, McpError> {
         let id = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1194,12 +1094,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    #[tool(description = "List this project's agent tools as a JSON array of {id, name, \
-                          display_name, command, cwd, tool_type, enabled, position, created_at}.")]
-    async fn agent_tool_list(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn agent_tool_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let dtos: Vec<AgentToolDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -1212,11 +1107,10 @@ impl Handler {
         json_result(&dtos)
     }
 
-    #[tool(description = "Fetch one agent tool in full, addressed by numeric id.")]
     async fn agent_tool_get(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<AgentToolGetArgs>,
+        parts: Parts,
+        args: AgentToolGetArgs,
     ) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1229,12 +1123,10 @@ impl Handler {
         json_result(&dto)
     }
 
-    #[tool(description = "Edit an agent tool's fields. Every argument but agent_tool_id is \
-                          optional; an omitted field is left unchanged.")]
     async fn agent_tool_update(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<AgentToolUpdateArgs>,
+        parts: Parts,
+        args: AgentToolUpdateArgs,
     ) -> Result<CallToolResult, McpError> {
         let patch = AgentToolPatch {
             name: args.name,
@@ -1254,13 +1146,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Delete an agent tool, addressed by numeric id. Any processes that \
-                          reference it keep running; their agent_tool_id back-reference is \
-                          set to NULL.")]
     async fn agent_tool_delete(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<AgentToolDeleteArgs>,
+        parts: Parts,
+        args: AgentToolDeleteArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1271,13 +1160,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Create a process (instance layer) - a per-project agent/command/ \
-                          terminal instance. Optionally links to a source agent_tool via \
-                          agent_tool_id. Returns its numeric id.")]
     async fn process_create(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ProcessCreateArgs>,
+        parts: Parts,
+        args: ProcessCreateArgs,
     ) -> Result<CallToolResult, McpError> {
         let kind = parse_process_kind(&args.kind)?;
         let id = {
@@ -1297,13 +1183,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    #[tool(description = "List this project's processes as a JSON array of {id, kind, name, \
-                          display_name, command, cwd, position, agent_tool_id, pid, status, \
-                          agent_state, last_seen, created_at}.")]
-    async fn process_list(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn process_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let dtos: Vec<ProcessDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -1316,11 +1196,10 @@ impl Handler {
         json_result(&dtos)
     }
 
-    #[tool(description = "Fetch one process in full, addressed by numeric id.")]
     async fn process_get(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ProcessGetArgs>,
+        parts: Parts,
+        args: ProcessGetArgs,
     ) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1333,12 +1212,10 @@ impl Handler {
         json_result(&dto)
     }
 
-    #[tool(description = "Edit a process's fields. Every argument but process_id is \
-                          optional; an omitted field is left unchanged.")]
     async fn process_update(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ProcessUpdateArgs>,
+        parts: Parts,
+        args: ProcessUpdateArgs,
     ) -> Result<CallToolResult, McpError> {
         let patch = ProcessPatch {
             name: args.name,
@@ -1357,11 +1234,10 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Delete a process, addressed by numeric id.")]
     async fn process_delete(
         &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<ProcessDeleteArgs>,
+        parts: Parts,
+        args: ProcessDeleteArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1372,19 +1248,7 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(
-        description = "Given a numeric id, return what kind of resource it is \
-                       and a short label. Resolves across todos, scratchpads, \
-                       agent tools, and processes (ids are unified per project \
-                       so a `#N` reference points to exactly one row). Errors \
-                       `invalid_params` if the id matches no live (non-soft- \
-                       deleted) resource."
-    )]
-    async fn id_kind(
-        &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<IdKindArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn id_kind(&self, parts: Parts, args: IdKindArgs) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -1394,7 +1258,297 @@ impl Handler {
     }
 }
 
-#[tool_handler]
+/// Every tool name in [`TOOL_SURFACE`], promoted to an enum so [`dispatch_local`]'s
+/// `match` is exhaustive: adding a new tool here forces a corresponding
+/// dispatch arm at compile time. The unit test `tool_enum_covers_tool_surface`
+/// asserts the inverse - that every surface entry resolves through [`Tool::from_name`].
+#[derive(Clone, Copy)]
+enum Tool {
+    Identify,
+    AgentLeave,
+    Whoami,
+    AgentList,
+    LockAcquire,
+    LockRelease,
+    LockStatus,
+    ScratchpadCreate,
+    ScratchpadList,
+    ScratchpadAppend,
+    ScratchpadRead,
+    ScratchpadGet,
+    ScratchpadUpdate,
+    ScratchpadDelete,
+    ScratchpadTagsList,
+    TodoCreate,
+    TodoList,
+    TodoGet,
+    TodoUpdate,
+    TodoComplete,
+    TodoStart,
+    TodoDelete,
+    TodoAddBlocker,
+    TodoRemoveBlocker,
+    TodoCommentAdd,
+    TodoCommentUpdate,
+    TodoCommentDelete,
+    TodoSetBlockers,
+    TodoTagsList,
+    TodoLock,
+    TodoUnlock,
+    AgentToolCreate,
+    AgentToolList,
+    AgentToolGet,
+    AgentToolUpdate,
+    AgentToolDelete,
+    ProcessCreate,
+    ProcessList,
+    ProcessGet,
+    ProcessUpdate,
+    ProcessDelete,
+    IdKind,
+}
+
+impl Tool {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "identify" => Tool::Identify,
+            "agent_leave" => Tool::AgentLeave,
+            "whoami" => Tool::Whoami,
+            "agent_list" => Tool::AgentList,
+            "lock_acquire" => Tool::LockAcquire,
+            "lock_release" => Tool::LockRelease,
+            "lock_status" => Tool::LockStatus,
+            "scratchpad_create" => Tool::ScratchpadCreate,
+            "scratchpad_list" => Tool::ScratchpadList,
+            "scratchpad_append" => Tool::ScratchpadAppend,
+            "scratchpad_read" => Tool::ScratchpadRead,
+            "scratchpad_get" => Tool::ScratchpadGet,
+            "scratchpad_update" => Tool::ScratchpadUpdate,
+            "scratchpad_delete" => Tool::ScratchpadDelete,
+            "scratchpad_tags_list" => Tool::ScratchpadTagsList,
+            "todo_create" => Tool::TodoCreate,
+            "todo_list" => Tool::TodoList,
+            "todo_get" => Tool::TodoGet,
+            "todo_update" => Tool::TodoUpdate,
+            "todo_complete" => Tool::TodoComplete,
+            "todo_start" => Tool::TodoStart,
+            "todo_delete" => Tool::TodoDelete,
+            "todo_add_blocker" => Tool::TodoAddBlocker,
+            "todo_remove_blocker" => Tool::TodoRemoveBlocker,
+            "todo_comment_add" => Tool::TodoCommentAdd,
+            "todo_comment_update" => Tool::TodoCommentUpdate,
+            "todo_comment_delete" => Tool::TodoCommentDelete,
+            "todo_set_blockers" => Tool::TodoSetBlockers,
+            "todo_tags_list" => Tool::TodoTagsList,
+            "todo_lock" => Tool::TodoLock,
+            "todo_unlock" => Tool::TodoUnlock,
+            "agent_tool_create" => Tool::AgentToolCreate,
+            "agent_tool_list" => Tool::AgentToolList,
+            "agent_tool_get" => Tool::AgentToolGet,
+            "agent_tool_update" => Tool::AgentToolUpdate,
+            "agent_tool_delete" => Tool::AgentToolDelete,
+            "process_create" => Tool::ProcessCreate,
+            "process_list" => Tool::ProcessList,
+            "process_get" => Tool::ProcessGet,
+            "process_update" => Tool::ProcessUpdate,
+            "process_delete" => Tool::ProcessDelete,
+            "id_kind" => Tool::IdKind,
+            _ => return None,
+        })
+    }
+}
+
+/// Build the rmcp `ToolRouter` from [`TOOL_SURFACE`].
+///
+/// One `add_route` per entry. The handler closure is uniform: every tool
+/// funnels through [`dispatch_local`], which keys off the tool name. This is
+/// the only place rmcp's `ToolRoute`/`Tool` types are constructed, so any
+/// schema-shape surprise from the shared crate surfaces here at registration
+/// rather than at first-call.
+fn build_router() -> ToolRouter<Handler> {
+    let mut router = ToolRouter::<Handler>::new();
+    for def in TOOL_SURFACE {
+        let name: &'static str = def.name;
+        let schema_obj = match (def.schema_fn)() {
+            serde_json::Value::Object(m) => m,
+            other => panic!("TOOL_SURFACE entry `{name}` produced a non-object schema: {other:?}"),
+        };
+        let attr = rmcp::model::Tool::new(name, def.description, Arc::new(schema_obj));
+        router.add_route(ToolRoute::new_dyn(attr, move |ctx| {
+            Box::pin(dispatch_local(name, ctx))
+        }));
+    }
+    router
+}
+
+/// Route an incoming tool call to its impl on [`Handler`].
+///
+/// Pulls the `http::request::Parts` extension that `main.rs` injects per
+/// request, deserializes the JSON arguments into the tool's `Parameters<T>`
+/// type from `panopt_tool_surface::params`, then calls the corresponding
+/// async method on `Handler`. The `match` over [`Tool`] is exhaustive, so the
+/// compiler rejects a new tool added without a dispatch arm.
+async fn dispatch_local<'a>(
+    name: &'static str,
+    ctx: ToolCallContext<'a, Handler>,
+) -> Result<CallToolResult, McpError> {
+    let tool = Tool::from_name(name)
+        .ok_or_else(|| McpError::invalid_params(format!("unknown tool `{name}`"), None))?;
+    let parts = ctx
+        .request_context
+        .extensions
+        .get::<Parts>()
+        .cloned()
+        .ok_or_else(|| {
+            McpError::internal_error(
+                "the request is missing its http::request::Parts extension",
+                None,
+            )
+        })?;
+    let handler = ctx.service;
+    let raw_args = ctx.arguments.unwrap_or_default();
+    match tool {
+        Tool::Identify => {
+            let args: IdentifyArgs = parse_json_object(raw_args)?;
+            handler.identify(parts, args).await
+        }
+        Tool::AgentLeave => handler.agent_leave(parts).await,
+        Tool::Whoami => handler.whoami(parts).await,
+        Tool::AgentList => handler.agent_list(parts).await,
+        Tool::LockAcquire => {
+            let args: LockAcquireArgs = parse_json_object(raw_args)?;
+            handler.lock_acquire(parts, args).await
+        }
+        Tool::LockRelease => {
+            let args: LockReleaseArgs = parse_json_object(raw_args)?;
+            handler.lock_release(parts, args).await
+        }
+        Tool::LockStatus => handler.lock_status(parts).await,
+        Tool::ScratchpadCreate => {
+            let args: ScratchpadCreateArgs = parse_json_object(raw_args)?;
+            handler.scratchpad_create(parts, args).await
+        }
+        Tool::ScratchpadList => handler.scratchpad_list(parts).await,
+        Tool::ScratchpadAppend => {
+            let args: ScratchpadAppendArgs = parse_json_object(raw_args)?;
+            handler.scratchpad_append(parts, args).await
+        }
+        Tool::ScratchpadRead => {
+            let args: ScratchpadReadArgs = parse_json_object(raw_args)?;
+            handler.scratchpad_read(parts, args).await
+        }
+        Tool::ScratchpadGet => {
+            let args: ScratchpadGetArgs = parse_json_object(raw_args)?;
+            handler.scratchpad_get(parts, args).await
+        }
+        Tool::ScratchpadUpdate => {
+            let args: ScratchpadUpdateArgs = parse_json_object(raw_args)?;
+            handler.scratchpad_update(parts, args).await
+        }
+        Tool::ScratchpadDelete => {
+            let args: ScratchpadDeleteArgs = parse_json_object(raw_args)?;
+            handler.scratchpad_delete(parts, args).await
+        }
+        Tool::ScratchpadTagsList => handler.scratchpad_tags_list(parts).await,
+        Tool::TodoCreate => {
+            let args: TodoCreateArgs = parse_json_object(raw_args)?;
+            handler.todo_create(parts, args).await
+        }
+        Tool::TodoList => handler.todo_list(parts).await,
+        Tool::TodoGet => {
+            let args: TodoGetArgs = parse_json_object(raw_args)?;
+            handler.todo_get(parts, args).await
+        }
+        Tool::TodoUpdate => {
+            let args: TodoUpdateArgs = parse_json_object(raw_args)?;
+            handler.todo_update(parts, args).await
+        }
+        Tool::TodoComplete => {
+            let args: TodoCompleteArgs = parse_json_object(raw_args)?;
+            handler.todo_complete(parts, args).await
+        }
+        Tool::TodoStart => {
+            let args: TodoStartArgs = parse_json_object(raw_args)?;
+            handler.todo_start(parts, args).await
+        }
+        Tool::TodoDelete => {
+            let args: TodoDeleteArgs = parse_json_object(raw_args)?;
+            handler.todo_delete(parts, args).await
+        }
+        Tool::TodoAddBlocker => {
+            let args: TodoBlockerArgs = parse_json_object(raw_args)?;
+            handler.todo_add_blocker(parts, args).await
+        }
+        Tool::TodoRemoveBlocker => {
+            let args: TodoBlockerArgs = parse_json_object(raw_args)?;
+            handler.todo_remove_blocker(parts, args).await
+        }
+        Tool::TodoCommentAdd => {
+            let args: TodoCommentAddArgs = parse_json_object(raw_args)?;
+            handler.todo_comment_add(parts, args).await
+        }
+        Tool::TodoCommentUpdate => {
+            let args: TodoCommentUpdateArgs = parse_json_object(raw_args)?;
+            handler.todo_comment_update(parts, args).await
+        }
+        Tool::TodoCommentDelete => {
+            let args: TodoCommentDeleteArgs = parse_json_object(raw_args)?;
+            handler.todo_comment_delete(parts, args).await
+        }
+        Tool::TodoSetBlockers => {
+            let args: TodoSetBlockersArgs = parse_json_object(raw_args)?;
+            handler.todo_set_blockers(parts, args).await
+        }
+        Tool::TodoTagsList => handler.todo_tags_list(parts).await,
+        Tool::TodoLock => {
+            let args: TodoLockArgs = parse_json_object(raw_args)?;
+            handler.todo_lock(parts, args).await
+        }
+        Tool::TodoUnlock => {
+            let args: TodoUnlockArgs = parse_json_object(raw_args)?;
+            handler.todo_unlock(parts, args).await
+        }
+        Tool::AgentToolCreate => {
+            let args: AgentToolCreateArgs = parse_json_object(raw_args)?;
+            handler.agent_tool_create(parts, args).await
+        }
+        Tool::AgentToolList => handler.agent_tool_list(parts).await,
+        Tool::AgentToolGet => {
+            let args: AgentToolGetArgs = parse_json_object(raw_args)?;
+            handler.agent_tool_get(parts, args).await
+        }
+        Tool::AgentToolUpdate => {
+            let args: AgentToolUpdateArgs = parse_json_object(raw_args)?;
+            handler.agent_tool_update(parts, args).await
+        }
+        Tool::AgentToolDelete => {
+            let args: AgentToolDeleteArgs = parse_json_object(raw_args)?;
+            handler.agent_tool_delete(parts, args).await
+        }
+        Tool::ProcessCreate => {
+            let args: ProcessCreateArgs = parse_json_object(raw_args)?;
+            handler.process_create(parts, args).await
+        }
+        Tool::ProcessList => handler.process_list(parts).await,
+        Tool::ProcessGet => {
+            let args: ProcessGetArgs = parse_json_object(raw_args)?;
+            handler.process_get(parts, args).await
+        }
+        Tool::ProcessUpdate => {
+            let args: ProcessUpdateArgs = parse_json_object(raw_args)?;
+            handler.process_update(parts, args).await
+        }
+        Tool::ProcessDelete => {
+            let args: ProcessDeleteArgs = parse_json_object(raw_args)?;
+            handler.process_delete(parts, args).await
+        }
+        Tool::IdKind => {
+            let args: IdKindArgs = parse_json_object(raw_args)?;
+            handler.id_kind(parts, args).await
+        }
+    }
+}
+
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerInfo {
         // `Implementation::from_build_env()` reports rmcp's own package
@@ -1452,11 +1606,54 @@ impl ServerHandler for Handler {
                     .to_string(),
             )
     }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tool_router.get(name).cloned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::query_param;
+    use super::{query_param, Tool};
+    use panopt_tool_surface::TOOL_SURFACE;
+
+    /// Coverage check: every tool published in [`TOOL_SURFACE`] resolves
+    /// through [`Tool::from_name`]. Combined with the exhaustive `match Tool`
+    /// in `dispatch_local`, this guarantees every published tool has a
+    /// dispatch arm - so adding a `TOOL_SURFACE` entry without extending
+    /// `Tool` and `Tool::from_name` fails this test, and adding a `Tool`
+    /// variant without a `dispatch_local` arm fails to compile.
+    #[test]
+    fn tool_enum_covers_tool_surface() {
+        for def in TOOL_SURFACE {
+            assert!(
+                Tool::from_name(def.name).is_some(),
+                "TOOL_SURFACE entry `{}` has no corresponding `Tool` enum variant",
+                def.name
+            );
+        }
+    }
 
     #[test]
     fn query_param_finds_each_key() {
@@ -1467,7 +1664,10 @@ mod tests {
 
     #[test]
     fn query_param_percent_decodes() {
-        assert_eq!(query_param(Some("ws=/a%20b"), "ws").as_deref(), Some("/a b"));
+        assert_eq!(
+            query_param(Some("ws=/a%20b"), "ws").as_deref(),
+            Some("/a b")
+        );
     }
 
     #[test]

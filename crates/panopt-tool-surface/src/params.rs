@@ -1,20 +1,25 @@
 //! Request parameter structs for the MCP tools.
 //!
-//! Each derives `Deserialize` + `JsonSchema` so rmcp can generate the tool's
-//! input schema. `schemars` is used via rmcp's re-export to avoid a version
-//! skew with whatever `schemars` rmcp itself depends on. Doc comments on the
-//! fields become the parameter descriptions agents see.
+//! Each derives `Deserialize` + `JsonSchema` so the surface table in
+//! [`crate`] can generate each tool's input schema, and so panoptd can
+//! deserialize incoming tool-call arguments. Doc comments on the fields
+//! become the parameter descriptions agents see.
+//!
+//! `schemars` is re-exported from [`crate`] (and used directly here) at the
+//! version pinned by this crate's Cargo.toml; both panoptd and the proxy
+//! see the same schemars, so the schemas the proxy publishes are
+//! bit-identical to the ones panoptd deserializes against.
 
-use rmcp::schemars;
+use schemars::JsonSchema;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadCreateArgs {
     /// Human-readable title for the new scratchpad.
     pub title: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadAppendArgs {
     /// Numeric id of the scratchpad to append to.
     pub scratchpad_id: u64,
@@ -22,19 +27,19 @@ pub struct ScratchpadAppendArgs {
     pub content: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadReadArgs {
     /// Numeric id of the scratchpad to read.
     pub scratchpad_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadGetArgs {
     /// Numeric id of the scratchpad to fetch in full.
     pub scratchpad_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadUpdateArgs {
     /// Numeric id of the scratchpad to edit.
     pub scratchpad_id: u64,
@@ -52,25 +57,25 @@ pub struct ScratchpadUpdateArgs {
     pub tags: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadDeleteArgs {
     /// Numeric id of the scratchpad to delete.
     pub scratchpad_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoCreateArgs {
     /// Short description of the todo.
     pub title: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoCompleteArgs {
     /// Numeric id of the todo to mark complete.
     pub todo_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoStartArgs {
     /// Numeric id of the todo to claim and transition to `in_progress`.
     pub todo_id: u64,
@@ -80,25 +85,25 @@ pub struct TodoStartArgs {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoGetArgs {
     /// Numeric id of the todo to fetch.
     pub todo_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct IdKindArgs {
     /// Numeric id to resolve to its resource kind.
     pub id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoDeleteArgs {
     /// Numeric id of the todo to delete. Its comments and blocker links go too.
     pub todo_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoUpdateArgs {
     /// Numeric id of the todo to edit.
     pub todo_id: u64,
@@ -124,7 +129,7 @@ pub struct TodoUpdateArgs {
     pub tags: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoBlockerArgs {
     /// Numeric id of the blocked todo.
     pub todo_id: u64,
@@ -132,7 +137,7 @@ pub struct TodoBlockerArgs {
     pub blocker_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoCommentAddArgs {
     /// Numeric id of the todo to comment on.
     pub todo_id: u64,
@@ -144,7 +149,7 @@ pub struct TodoCommentAddArgs {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoCommentUpdateArgs {
     /// Numeric id of the todo the comment lives on.
     pub todo_id: u64,
@@ -154,7 +159,7 @@ pub struct TodoCommentUpdateArgs {
     pub body: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoCommentDeleteArgs {
     /// Numeric id of the todo the comment lives on.
     pub todo_id: u64,
@@ -162,7 +167,7 @@ pub struct TodoCommentDeleteArgs {
     pub comment_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoSetBlockersArgs {
     /// Numeric id of the todo whose blocker set is being replaced.
     pub todo_id: u64,
@@ -170,7 +175,7 @@ pub struct TodoSetBlockersArgs {
     pub blocker_ids: Vec<u64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoLockArgs {
     /// Numeric id of the todo to claim. The advisory lock name is `todo:<id>`.
     pub todo_id: u64,
@@ -179,13 +184,13 @@ pub struct TodoLockArgs {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoUnlockArgs {
     /// Numeric id of the todo whose lock to release.
     pub todo_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentToolCreateArgs {
     /// Identifier-style name for the tool (e.g. "claude").
     pub name: String,
@@ -206,13 +211,13 @@ pub struct AgentToolCreateArgs {
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentToolGetArgs {
     /// Numeric id of the agent tool to fetch.
     pub agent_tool_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentToolUpdateArgs {
     /// Numeric id of the agent tool to edit.
     pub agent_tool_id: u64,
@@ -239,13 +244,13 @@ pub struct AgentToolUpdateArgs {
     pub position: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentToolDeleteArgs {
     /// Numeric id of the agent tool to delete.
     pub agent_tool_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProcessCreateArgs {
     /// Kind of process: one of agent, command, terminal.
     pub kind: String,
@@ -266,13 +271,13 @@ pub struct ProcessCreateArgs {
     pub agent_tool_id: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProcessGetArgs {
     /// Numeric id of the process to fetch.
     pub process_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProcessUpdateArgs {
     /// Numeric id of the process to edit.
     pub process_id: u64,
@@ -293,13 +298,13 @@ pub struct ProcessUpdateArgs {
     pub position: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProcessDeleteArgs {
     /// Numeric id of the process to delete.
     pub process_id: u64,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct IdentifyArgs {
     /// Human-readable name for this agent, shown to others in the registry.
     pub name: String,
@@ -308,7 +313,7 @@ pub struct IdentifyArgs {
     pub status: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct LockAcquireArgs {
     /// Name of the advisory lock to acquire - an agreed-on string such as a
     /// path, a task, or a phase of work.
@@ -318,7 +323,7 @@ pub struct LockAcquireArgs {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct LockReleaseArgs {
     /// Name of the advisory lock to release.
     pub name: String,

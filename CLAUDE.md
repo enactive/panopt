@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace layout
 
-Four crates under `crates/`:
+Five crates under `crates/`:
 
 - `panopt-core` — transport-agnostic state, persistence (SQLite), filesystem projection. **Must not depend on `rmcp`, `axum`, or `tokio`** — this boundary is the reason core is reusable. Verify with `cargo tree -p panopt-core` if you add a dep.
+- `panopt-tool-surface` — the single declaration of the MCP tool surface: `Parameters<T>` types plus a `TOOL_SURFACE` table (name, description, schema-generating function). Both `panoptd` and `panopt`'s `_mcp-proxy` register their tool routes from this table, so the proxy can answer `tools/list` without panoptd being up. **Must not depend on `rmcp`, `axum`, `tokio`, or `panoptd`** — verify with `cargo tree -p panopt-tool-surface`.
 - `panoptd` — MCP daemon over Streamable HTTP. Defaults to `127.0.0.1:7600`; bind is configurable via `--host` and every request is gated by a bearer token at `~/.local/share/panopt/token` (`Authorization: Bearer <token>` or `?token=<token>`). Wraps `panopt-core` in a `Mutex`.
 - `panopt` — CLI launcher and viewer. Starts `panoptd` on demand, drives Zellij, spawns agent panes.
 - `panopt-zellij` — Zellij sidebar plugin. **Excluded from the cargo workspace** because it only builds for `wasm32-wasip1`.
@@ -33,6 +34,7 @@ Logs: `~/.local/share/panopt/panoptd.log` (tail with `just logs`). Database: `~/
 - **Schema migrations are forward-only** via `PRAGMA user_version`. Add a new `V<n>` block in `db.rs` and an `if version < n` step — do not rewrite earlier versions.
 - **The plugin never closes panes**, only suppresses them. Swap-in-place is the model: a suppressed pane keeps running hidden, the user owns its lifecycle.
 - **Filesystem projection is atomic**: write to a temp file, then `rename` over the target. Never write directly to `.panopt/*.md`.
+- **One MCP tool surface declaration**: every tool is exactly one `ToolDef` in `panopt_tool_surface::TOOL_SURFACE` plus exactly one `Tool` enum variant + `dispatch_local` arm in `panoptd/src/handler.rs`. The proxy publishes from the shared table without its own list. Adding a tool that fails to wire the dispatch arm is a compile error (the `match Tool` is exhaustive); adding a `Tool` variant without an entry in `TOOL_SURFACE` is caught by `handler::tests::tool_enum_covers_tool_surface`.
 
 ## Style
 

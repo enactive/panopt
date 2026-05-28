@@ -28,6 +28,15 @@
 //! Claude Code, no error. Longer outages fail with a JSON-RPC error so the
 //! Claude Code conversation surface gets a visible failure rather than
 //! hanging indefinitely.
+//!
+//! `tools/list` is answered locally from [`panopt_tool_surface::TOOL_SURFACE`],
+//! the same table panoptd registers its routes from. That makes a cold start
+//! with a dead daemon survivable: Claude Code learns the tool surface
+//! immediately and the first `tools/call` is the first thing that has to wait
+//! on a real panoptd connection. Without this local answer, an unreachable
+//! daemon at startup would force Claude's `tools/list` request to error out
+//! (the MCP spec doesn't mandate a retry) and the panopt MCP server would
+//! appear toolless for the rest of the session.
 
 use std::io::{stdin, stdout, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -122,17 +131,43 @@ fn build_url(host: &str, port: u16, ws: &Path, id: &str, name: &str, token: &str
     )
 }
 
-/// Route a JSON-RPC request: answer the lifecycle methods locally, forward
-/// everything else to panoptd. Returns `Some(response)` for requests
-/// (those carrying an `id`) and `None` for notifications.
+/// Route a JSON-RPC request: answer the lifecycle methods and `tools/list`
+/// locally, forward everything else to panoptd. Returns `Some(response)` for
+/// requests (those carrying an `id`) and `None` for notifications.
 fn dispatch(backend: &mut Backend, req: &Value) -> Option<Value> {
     let method = req.get("method").and_then(Value::as_str)?;
     let id = req.get("id").cloned();
     match method {
         "initialize" => Some(handle_initialize(backend, id)),
         "notifications/initialized" => None,
+        "tools/list" => Some(handle_tools_list(id)),
         _ => Some(forward_or_error(backend, req, id)),
     }
+}
+
+/// Respond to `tools/list` from the shared [`TOOL_SURFACE`] table.
+///
+/// Same data panoptd uses to register its routes, so the proxy's published
+/// surface and the daemon's served surface cannot drift apart at build time.
+/// The schema for each tool is materialized by calling that entry's
+/// `schema_fn` - identical bytes to what panoptd emits, because both sides
+/// route through `panopt_tool_surface::schema_for::<T>`.
+fn handle_tools_list(id: Option<Value>) -> Value {
+    let tools: Vec<Value> = panopt_tool_surface::TOOL_SURFACE
+        .iter()
+        .map(|def| {
+            json!({
+                "name": def.name,
+                "description": def.description,
+                "inputSchema": (def.schema_fn)(),
+            })
+        })
+        .collect();
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "tools": tools },
+    })
 }
 
 /// Respond to Claude Code's `initialize` without forwarding. The proxy is
@@ -394,5 +429,37 @@ mod tests {
         );
         let req = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         assert!(dispatch(&mut backend, &req).is_none());
+    }
+
+    #[test]
+    fn dispatch_answers_tools_list_locally() {
+        // No panoptd in this test; if the proxy were forwarding tools/list it
+        // would fail. A success here means the local TOOL_SURFACE path served
+        // the request - the whole reason step 6 of todo #88 exists.
+        let mut backend = Backend::new(
+            "http://127.0.0.1:0/mcp".into(),
+            "alpha".into(),
+            "alpha".into(),
+        );
+        let req = json!({"jsonrpc": "2.0", "id": 11, "method": "tools/list"});
+        let resp = dispatch(&mut backend, &req).unwrap();
+        assert_eq!(resp["id"], json!(11));
+
+        let tools = resp["result"]["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), panopt_tool_surface::TOOL_SURFACE.len());
+
+        // Spot-check shape on the first entry: every published tool must have
+        // a non-empty name, a description, and an inputSchema that's an
+        // object - the three fields the MCP spec requires on a Tool.
+        for t in tools {
+            assert!(t["name"].is_string());
+            assert!(t["description"].is_string());
+            assert!(t["inputSchema"].is_object(), "{t}");
+        }
+
+        // We never touched panoptd, so the proxy's backend session must be
+        // unchanged. This is the load-bearing property: a cold start with a
+        // dead daemon should still answer tools/list.
+        assert!(backend.session_id.is_none());
     }
 }

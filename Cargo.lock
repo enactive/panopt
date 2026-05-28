@@ -1085,6 +1085,7 @@ dependencies = [
  "dirs",
  "libc",
  "panopt-core",
+ "panopt-tool-surface",
  "percent-encoding",
  "ratatui",
  "serde_json",
@@ -1104,6 +1105,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "panopt-tool-surface"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "panoptd"
 version = "0.1.0"
 dependencies = [
@@ -1113,6 +1123,7 @@ dependencies = [
  "dirs",
  "http",
  "panopt-core",
+ "panopt-tool-surface",
  "percent-encoding",
  "rmcp",
  "serde",
