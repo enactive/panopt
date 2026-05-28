@@ -1,0 +1,21 @@
+do #95
+
+---
+
+ctrl-u/d works in form field, ppage-up/down works in agent panes, mouse click-drag highlights, paste pastes, but copy doesn't copy.
+
+---
+
+using wezterm on a mac then tmux into gd3 than panopt.  now: can click to focus Body field in todos, but not Title.  copy still no work
+
+---
+
+look.  this is some bullshit.  every other application i use thru tmus is able to do copy and paste. just as it is.  but *actually*, this *isn't* thru tmux right now, so that's not gonna fix it.  WTF?
+
+---
+
+whatever you did messed up the entire applicaiton.  all the panes come up empty
+
+---
+
+can we grant the permission in the config?
