@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "0d48cb56917a",
+  "session_id": "e084bbcc-c2ad-4977-8520-3e3f17b4486c",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-28T19:13:05.285125883Z",
+  "branch": "right-pane-terminal-ux-phase1",
+  "checkpoints_count": 0,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "c1858277496b",
+  "checkpoint_transcript_start": 386,
+  "transcript_lines_at_start": 386,
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 40953,
+    "cache_read_tokens": 6109385,
+    "output_tokens": 19435,
+    "api_call_count": 31
+  },
+  "session_metrics": {
+    "turn_count": 8
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1
+      }
+    }
+  ]
+}
