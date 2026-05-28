@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "28e44904aee7",
+  "strategy": "manual-commit",
+  "branch": "right-pane-terminal-ux-phase1",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt/src/scratchpad_form.rs",
+    "crates/panopt/src/todo_form.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/28/e44904aee7/0/metadata.json",
+      "transcript": "/28/e44904aee7/0/full.jsonl",
+      "content_hash": "/28/e44904aee7/0/content_hash.txt",
+      "prompt": "/28/e44904aee7/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 31,
+    "cache_creation_tokens": 32483,
+    "cache_read_tokens": 10401107,
+    "output_tokens": 26874,
+    "api_call_count": 26
+  }
+}

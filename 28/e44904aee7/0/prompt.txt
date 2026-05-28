@@ -1,0 +1,3 @@
+todo: can mouse click to select fields can mouse drag to select in body but *not* title.
+
+scratchpad: same
