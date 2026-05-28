@@ -446,6 +446,13 @@ struct PanoptPane {
     /// Holds the same set of keys across modes so the UI never carries
     /// per-mode hint clutter - the help is the only place keys are listed.
     show_help: bool,
+    /// The most recent `switch_to_mode` decision this plugin emitted:
+    /// `Some(true)` after locking on content focus, `Some(false)` after
+    /// restoring Normal on sidebar focus, `None` before any decision. Lets
+    /// [`PanoptPane::ingest_panes`] fire `switch_to_mode` only on transitions
+    /// and not on every manifest tick. Only the Todos pane writes this -
+    /// see the gate in `ingest_panes`.
+    last_emitted_locked: Option<bool>,
 }
 
 /// A parsed `.panopt/processes.md` line. The line format is preserved from
@@ -1052,6 +1059,28 @@ impl PanoptPane {
         if saw_focused_pane {
             self.sidebar_focused = sidebar_focused_this_update;
             self.focused_tab = focused_tab_this_update;
+            // Auto-lock the multiplexer when focus is on a content pane
+            // (`panopt _viewer` form or an agent/terminal) so every Zellij
+            // keybind drops out and keys flow straight to the inner program;
+            // restore Normal mode when focus returns to any sidebar plugin
+            // pane so the user can navigate the cockpit again. Only the Todos
+            // pane emits this - the other four instances see the same focus
+            // manifest and would issue four redundant `switch_to_mode` calls
+            // per transition. Compare against the last emitted decision so a
+            // PaneUpdate that doesn't cross the sidebar/content boundary
+            // (e.g. a resize) is a no-op rather than yanking the user out of
+            // an explicit Zellij mode.
+            if self.mode == Mode::Todos {
+                let want_locked = !sidebar_focused_this_update;
+                if self.last_emitted_locked != Some(want_locked) {
+                    switch_to_input_mode(if want_locked {
+                        &InputMode::Locked
+                    } else {
+                        &InputMode::Normal
+                    });
+                    self.last_emitted_locked = Some(want_locked);
+                }
+            }
         }
         if let Some(slot) = self.slot_pane {
             if !self.panes.iter().any(|p| p.id == slot) {
