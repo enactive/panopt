@@ -22,13 +22,15 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use serde_json::{json, Value};
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 use crate::mcpclient::Client;
 use crate::todo_form::{
@@ -113,6 +115,11 @@ pub struct ScratchpadForm {
     /// Drives the half-page step for Ctrl-U / Ctrl-D in
     /// [`crate::todo_form::body_input`], same rationale as the todo form.
     body_view_height: usize,
+    /// Screen rectangle the Body field occupies (inside its border). Captured
+    /// each draw so click-to-position-cursor in [`ScratchpadForm::handle_mouse`]
+    /// can map a click back to a logical cursor without re-deriving the
+    /// layout. `None` until the first render lands.
+    body_area: Option<Rect>,
 
     /// The daemon's last-observed view of the editable fields. See
     /// [`Baseline`].
@@ -136,6 +143,7 @@ impl ScratchpadForm {
             dirty_since: None,
             body_scroll: 0,
             body_view_height: 0,
+            body_area: None,
             message: "new scratchpad - type to begin".to_string(),
             baseline: Baseline::default(),
         }
@@ -166,6 +174,7 @@ impl ScratchpadForm {
             dirty_since: None,
             body_scroll: 0,
             body_view_height: 0,
+            body_area: None,
             message: format!("scratchpad #{id}"),
             baseline: Baseline {
                 title: title.to_string(),
@@ -220,6 +229,37 @@ impl ScratchpadForm {
         } else {
             ScratchpadFormAction::Idle
         }
+    }
+
+    /// Handle one mouse event. Mirrors [`crate::todo_form::TodoForm::handle_mouse`]:
+    /// a left-click in the Body field focuses it and positions the textarea
+    /// cursor on the clicked character, mapped back through the soft-wrap.
+    /// Clicks elsewhere are dropped today; the form's other fields are
+    /// keyboard-only until later sub-pieces of scratchpad #91 land.
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> ScratchpadFormAction {
+        if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return ScratchpadFormAction::Idle;
+        }
+        let Some(area) = self.body_area else {
+            return ScratchpadFormAction::Idle;
+        };
+        let row = m.row;
+        let col = m.column;
+        if row < area.y || row >= area.y + area.height {
+            return ScratchpadFormAction::Idle;
+        }
+        if col < area.x || col >= area.x + area.width {
+            return ScratchpadFormAction::Idle;
+        }
+        self.focus = Field::Body;
+        let width = area.width as usize;
+        let visual_row = (row - area.y) as usize + self.body_scroll;
+        let visual_col = (col - area.x) as usize;
+        let wrapped = crate::wrap::wrap_for_display(self.body.lines(), self.body.cursor(), width);
+        let (lrow, lcol) = wrapped.visual_to_logical(visual_row, visual_col);
+        self.body
+            .move_cursor(CursorMove::Jump(lrow as u16, lcol as u16));
+        ScratchpadFormAction::Idle
     }
 
     /// Insert a bracketed-paste payload into the focused field. Multi-line
@@ -516,6 +556,9 @@ impl ScratchpadForm {
         // Same purpose as the matching line in todo_form: feeds the half-page
         // step for Ctrl-U / Ctrl-D paging in `body_input`.
         self.body_view_height = height;
+        // Remember the body rectangle so `handle_mouse` can decide whether a
+        // click hit the body field and, if so, where in it.
+        self.body_area = Some(inner);
         if width == 0 || height == 0 {
             return;
         }

@@ -630,30 +630,42 @@ impl Viewer {
 
     /// Handle a mouse event. In list mode a left-click on a row both selects
     /// and opens it, matching the sidebar's click-to-activate behaviour;
-    /// scroll wheel moves the cursor or scroll offset by one. Form modes
-    /// ignore mouse input for now - their fields are keyboard-driven.
+    /// scroll wheel moves the cursor or scroll offset by one. In form mode
+    /// a left-click is forwarded to the form so click-to-position-cursor in
+    /// the body field works; other mouse events on forms are dropped
+    /// (drag-to-select and OSC52 copy land in later sub-pieces of #95).
     fn handle_mouse(&mut self, m: MouseEvent) {
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = self.list_row_at(m.row) {
-                    self.cursor = idx;
-                    self.open_selected();
-                    self.needs_draw = true;
-                }
+        match &mut self.content {
+            Content::TodoForm(form) => {
+                let _ = form.handle_mouse(m);
+                self.needs_draw = true;
             }
-            MouseEventKind::ScrollUp => {
-                if matches!(self.content, Content::List(_) | Content::Doc(_)) {
-                    self.move_by(-1);
-                    self.needs_draw = true;
-                }
+            Content::ScratchpadForm(form) => {
+                let _ = form.handle_mouse(m);
+                self.needs_draw = true;
             }
-            MouseEventKind::ScrollDown => {
-                if matches!(self.content, Content::List(_) | Content::Doc(_)) {
-                    self.move_by(1);
-                    self.needs_draw = true;
+            _ => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(idx) = self.list_row_at(m.row) {
+                        self.cursor = idx;
+                        self.open_selected();
+                        self.needs_draw = true;
+                    }
                 }
-            }
-            _ => {}
+                MouseEventKind::ScrollUp => {
+                    if matches!(self.content, Content::List(_) | Content::Doc(_)) {
+                        self.move_by(-1);
+                        self.needs_draw = true;
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if matches!(self.content, Content::List(_) | Content::Doc(_)) {
+                        self.move_by(1);
+                        self.needs_draw = true;
+                    }
+                }
+                _ => {}
+            },
         }
     }
 

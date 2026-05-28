@@ -17,7 +17,9 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -188,6 +190,11 @@ pub struct TodoForm {
     /// refreshed on every render; a Ctrl-U press before the first draw falls
     /// back to a minimum step of one line via [`body_input`]'s `.max(1)`.
     body_view_height: usize,
+    /// Screen rectangle the Body field's content occupies (the area *inside*
+    /// the bordered block). Captured each draw so click-to-position-cursor
+    /// in [`TodoForm::handle_mouse`] can map a click to a logical cursor
+    /// without re-deriving the layout. `None` until the first render lands.
+    body_area: Option<Rect>,
 
     /// Last-known daemon-side values of the scalar fields, used by `flush` to
     /// send only the fields the user actually changed since load (or since
@@ -225,6 +232,7 @@ impl TodoForm {
             message: "new todo - type to begin".to_string(),
             body_scroll: 0,
             body_view_height: 0,
+            body_area: None,
             // A new todo's baseline matches the daemon's defaults for
             // `todo_create`: empty title/body/assignee/tags, status `open`,
             // priority `medium`. After the first save populates `id`, the
@@ -321,6 +329,7 @@ impl TodoForm {
             message: format!("editing todo #{id}"),
             body_scroll: 0,
             body_view_height: 0,
+            body_area: None,
             baseline,
         })
     }
@@ -351,6 +360,47 @@ impl TodoForm {
             }
             _ => self.field_key(key),
         }
+    }
+
+    /// Handle one mouse event. Today the form only listens for a left-click
+    /// in the Body field: the click focuses Body (if it wasn't already) and
+    /// positions the textarea cursor on the clicked character, mapped back
+    /// through the soft-wrap. Returns `Idle` because no content changed -
+    /// the viewer still redraws on every mouse event so the cursor moves
+    /// visibly on the next frame.
+    ///
+    /// Mouse routing for other fields (drag-to-select, click-to-focus on
+    /// single-line fields, scroll wheel) is reserved for later sub-pieces of
+    /// scratchpad #91.
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> TodoFormAction {
+        if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return TodoFormAction::Idle;
+        }
+        let Some(area) = self.body_area else {
+            return TodoFormAction::Idle;
+        };
+        // Strictly-less comparison against `x + width` so a click on the
+        // right border doesn't read as "inside the content area".
+        let row = m.row;
+        let col = m.column;
+        if row < area.y || row >= area.y + area.height {
+            return TodoFormAction::Idle;
+        }
+        if col < area.x || col >= area.x + area.width {
+            return TodoFormAction::Idle;
+        }
+        self.focus = FIELDS
+            .iter()
+            .position(|f| *f == Field::Body)
+            .unwrap_or(self.focus);
+        let width = area.width as usize;
+        let visual_row = (row - area.y) as usize + self.body_scroll;
+        let visual_col = (col - area.x) as usize;
+        let wrapped = crate::wrap::wrap_for_display(self.body.lines(), self.body.cursor(), width);
+        let (lrow, lcol) = wrapped.visual_to_logical(visual_row, visual_col);
+        self.body
+            .move_cursor(CursorMove::Jump(lrow as u16, lcol as u16));
+        TodoFormAction::Idle
     }
 
     /// Insert a bracketed-paste payload into whichever field currently has
@@ -1180,6 +1230,9 @@ impl TodoForm {
         // half-screen instead of by a fixed step. Stored every draw so resize
         // is picked up automatically on the next key.
         self.body_view_height = height;
+        // Remember the body rectangle so `handle_mouse` can decide whether a
+        // click hit the body field and, if so, where in it.
+        self.body_area = Some(inner);
         if width == 0 || height == 0 {
             return;
         }
@@ -1836,6 +1889,59 @@ mod tests {
             0,
         );
         assert_eq!(area.cursor().0, 1);
+    }
+
+    /// Click-to-position-cursor: a left-click inside the recorded body
+    /// rectangle focuses the Body field and moves the textarea cursor to the
+    /// logical position under the click, mapped through the soft-wrap.
+    #[test]
+    fn left_click_in_body_area_positions_the_cursor() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        // Pre-fill the body so there's something to click into.
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        for _ in 0..5 {
+            form.handle_key(tab);
+        }
+        assert_eq!(FIELDS[form.focus], Field::Body);
+        for c in "hello world".chars() {
+            form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        // Pretend the body rendered into rows 5..=8 at columns 10..=29.
+        form.body_area = Some(Rect::new(10, 5, 20, 4));
+        form.body_scroll = 0;
+        // Click at the start of the second word, "world": visual (0, 6).
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10 + 6,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        let action = form.handle_mouse(click);
+        assert_eq!(action, TodoFormAction::Idle);
+        assert_eq!(form.body.cursor(), (0, 6));
+        assert_eq!(FIELDS[form.focus], Field::Body);
+    }
+
+    /// A click outside the body rectangle is a no-op; the form's focus and
+    /// the textarea's cursor must not move.
+    #[test]
+    fn left_click_outside_body_area_is_a_noop() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        let initial_focus = form.focus;
+        form.body_area = Some(Rect::new(10, 5, 20, 4));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        let action = form.handle_mouse(click);
+        assert_eq!(action, TodoFormAction::Idle);
+        assert_eq!(form.focus, initial_focus);
     }
 
     /// Regression guard for the bracketed-paste path: `body_input` must

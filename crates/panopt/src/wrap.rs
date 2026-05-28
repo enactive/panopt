@@ -27,6 +27,40 @@ pub(crate) struct Wrapped {
     /// Where the logical cursor lands in the visual grid: `(row, col)`.
     /// `row` indexes [`Wrapped::lines`]; `col` is in cells from the left.
     pub cursor: (usize, usize),
+    /// For each visual row, the logical row it came from and the char index
+    /// inside that logical row at which this visual segment starts. Lets the
+    /// inverse mapping ([`Wrapped::visual_to_logical`]) place clicks on the
+    /// right character without re-running the wrap algorithm.
+    pub segments: Vec<(usize, usize)>,
+}
+
+impl Wrapped {
+    /// Map a click on visual cell `(vrow, vcol)` back to the logical cursor
+    /// position `(row, col)`. Past-end clicks clamp to the last visual row
+    /// and end of its segment - the click-to-position gesture should never
+    /// fail silently.
+    pub(crate) fn visual_to_logical(&self, vrow: usize, vcol: usize) -> (usize, usize) {
+        if self.segments.is_empty() {
+            return (0, 0);
+        }
+        let vrow = vrow.min(self.segments.len() - 1);
+        let (lrow, char_start) = self.segments[vrow];
+        // Walk the segment's chars accumulating cell width until we reach
+        // `vcol`; the count of chars consumed is the offset within the
+        // segment, added to the segment's char_start.
+        let seg = &self.lines[vrow];
+        let mut col_in_seg = 0usize;
+        let mut w_acc = 0usize;
+        for c in seg.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w_acc + cw > vcol {
+                break;
+            }
+            w_acc += cw;
+            col_in_seg += 1;
+        }
+        (lrow, char_start + col_in_seg)
+    }
 }
 
 /// Wrap `lines` at `width` cells per visual row, and locate the visual
@@ -36,13 +70,16 @@ pub(crate) struct Wrapped {
 /// visual cursor matches the logical one in row, with col clamped.
 pub(crate) fn wrap_for_display(lines: &[String], cursor: (usize, usize), width: usize) -> Wrapped {
     if width == 0 {
+        let segments = (0..lines.len()).map(|r| (r, 0usize)).collect();
         return Wrapped {
             lines: lines.to_vec(),
             cursor,
+            segments,
         };
     }
     let (clog_row, clog_col) = cursor;
     let mut out_lines: Vec<String> = Vec::new();
+    let mut segments: Vec<(usize, usize)> = Vec::new();
     let mut cvis: (usize, usize) = (0, 0);
     let mut found_cursor = false;
 
@@ -55,6 +92,7 @@ pub(crate) fn wrap_for_display(lines: &[String], cursor: (usize, usize), width: 
                 found_cursor = true;
             }
             out_lines.push(String::new());
+            segments.push((lrow, 0));
             continue;
         }
 
@@ -111,6 +149,7 @@ pub(crate) fn wrap_for_display(lines: &[String], cursor: (usize, usize), width: 
             }
 
             out_lines.push(seg);
+            segments.push((lrow, i));
             i = seg_end;
         }
     }
@@ -124,6 +163,7 @@ pub(crate) fn wrap_for_display(lines: &[String], cursor: (usize, usize), width: 
     Wrapped {
         lines: out_lines,
         cursor: cvis,
+        segments,
     }
 }
 
@@ -229,6 +269,37 @@ mod tests {
         // i=12: chars[12..]="lmno pqr". walk: 'l','m','n','o',' ','p','q','r' visual_w=1..=8 stops at next? 8 chars, all fit. j=20=chars.len(). push "lmno pqr".
         let w = wrap_for_display(&lines, (0, 0), 8);
         assert_eq!(w.lines, vec!["abcdefgh", "ijk ", "lmno pqr"]);
+    }
+
+    #[test]
+    fn visual_to_logical_inverts_a_wrapped_segment() {
+        let lines = vec!["hello world foo".to_string()];
+        // Visual rows: "hello ", "world ", "foo".
+        let w = wrap_for_display(&lines, (0, 0), 8);
+        // Click on row 1, col 2 -> 'r' in "world " -> logical col 6 + 2 = 8.
+        assert_eq!(w.visual_to_logical(1, 2), (0, 8));
+        // Click on row 2, col 0 -> 'f' -> logical col 12.
+        assert_eq!(w.visual_to_logical(2, 0), (0, 12));
+    }
+
+    #[test]
+    fn visual_to_logical_clamps_past_end_clicks() {
+        let lines = vec!["abc".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 8);
+        // Click well past the end of the only visual row clamps to the
+        // segment end - 3 chars.
+        assert_eq!(w.visual_to_logical(0, 100), (0, 3));
+        // Click on a visual row past the last clamps to the last row.
+        assert_eq!(w.visual_to_logical(50, 1), (0, 1));
+    }
+
+    #[test]
+    fn visual_to_logical_handles_empty_logical_line() {
+        let lines = vec!["a".to_string(), "".to_string(), "b".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 4);
+        // Visual row 1 is the empty logical line - any vcol maps to (1, 0).
+        assert_eq!(w.visual_to_logical(1, 0), (1, 0));
+        assert_eq!(w.visual_to_logical(1, 10), (1, 0));
     }
 
     /// Word-wrap maps the cursor onto the row that actually holds the char
