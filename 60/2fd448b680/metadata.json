@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "602fd448b680",
+  "strategy": "manual-commit",
+  "branch": "right-pane-terminal-ux-phase1",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt/src/paths.rs",
+    "crates/panopt/src/up.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/60/2fd448b680/0/metadata.json",
+      "transcript": "/60/2fd448b680/0/full.jsonl",
+      "content_hash": "/60/2fd448b680/0/content_hash.txt",
+      "prompt": "/60/2fd448b680/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 68,
+    "cache_creation_tokens": 42731,
+    "cache_read_tokens": 24304358,
+    "output_tokens": 29985,
+    "api_call_count": 53
+  }
+}

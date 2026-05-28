@@ -1,0 +1,13 @@
+there are no shells 'inside the cockpit'
+
+---
+
+●   gregz@gd3   ssh   nix:impure   ~/cp/panopt  git:right-pane-terminal-ux-phase1
+% printf '\e]52;c;%s\a\n' "$(printf 'hello-from-osc52' | base64)"
+
+●   gregz@gd3   ssh   nix:impure   ~/cp/panopt  git:right-pane-terminal-ux-phase1
+%
+
+---
+
+yes it does.
