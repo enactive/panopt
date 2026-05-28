@@ -1,14 +1,23 @@
-//! OSC 52 clipboard helper.
+//! Clipboard helpers for `panopt _viewer`.
 //!
-//! OSC 52 is the terminal escape sequence "store this base64 payload in the
-//! system clipboard": `\x1b]52;c;<base64>\x07`. Every major terminal emulator
-//! the cockpit might run under honours it (iTerm2, Terminal.app, kitty,
-//! wezterm, alacritty, foot), and Zellij passes it through to the host
-//! terminal. That means the form's drag-to-copy gesture can reach the user's
-//! real clipboard without a clipboard daemon (xclip / wl-copy / ...) or a
-//! GUI dependency at all.
+//! Two strategies, tried in order by [`copy_to_clipboard`]:
+//!
+//! 1. **External command** (`pbcopy` / `wl-copy` / `xclip` / `xsel`). Talks
+//!    straight to the system clipboard daemon, bypassing Zellij entirely.
+//!    This is the strategy that actually works for the common case - Zellij
+//!    intercepts OSC 52 and routes it through its own `copy_command`
+//!    handler, which is unconfigured in stock setups and so silently drops
+//!    the payload.
+//! 2. **OSC 52** (`\x1b]52;c;<base64>\x07`). Fallback for the remote /
+//!    SSH'd-in case where the local box has no clipboard daemon (or none
+//!    that knows the SSH'd-from machine's clipboard). Most modern terminal
+//!    emulators forward OSC 52 to the host system clipboard.
+//!
+//! Order matters because we want the user's machine clipboard to win when
+//! they're working locally: external command first, OSC 52 second.
 
 use std::io::{self, Write};
+use std::process::{Command, Stdio};
 
 /// Encode `bytes` in the standard `A-Z a-z 0-9 + /` base64 alphabet with `=`
 /// padding. Hand-rolled rather than pulled in as a crate dependency; OSC 52
@@ -46,13 +55,71 @@ pub(crate) fn to_osc52(text: &str) -> String {
 
 /// Write the OSC 52 sequence for `text` straight to stdout. The viewer holds
 /// the terminal in raw alt-screen mode, so crossterm does not intercept the
-/// bytes; they pass through Zellij to the host terminal, which writes them
-/// into the system clipboard.
+/// bytes; they pass through Zellij and the host terminal forwards them to
+/// the system clipboard *if* OSC 52 is allowed end-to-end. Zellij's stock
+/// behaviour is to intercept the sequence instead of forwarding it - which
+/// is why this is a fallback, not the primary path. See
+/// [`copy_to_clipboard`] for the actual entry point.
 pub(crate) fn emit_osc52(text: &str) -> io::Result<()> {
     let seq = to_osc52(text);
     let mut out = io::stdout();
     out.write_all(seq.as_bytes())?;
     out.flush()
+}
+
+/// Try each candidate clipboard daemon command, in priority order, until one
+/// accepts the payload. Returns `true` as soon as a child exits successfully.
+///
+/// Order: macOS first (`pbcopy`), then Wayland (`wl-copy`), then X11
+/// (`xclip` then `xsel`). The `wl-copy` order before X11 matters because
+/// systems that run both XWayland and Wayland natively often have both
+/// `xclip` and `wl-copy` installed but only the latter actually reaches the
+/// running compositor's clipboard.
+fn copy_via_external_command(text: &str) -> bool {
+    let candidates: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for &(cmd, args) in candidates {
+        let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        // Take stdin so dropping it closes the pipe and the child sees EOF;
+        // without that close `wl-copy --foreground` (and friends) would
+        // wait forever.
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(text.as_bytes()).is_err() {
+                let _ = child.kill();
+                continue;
+            }
+        }
+        if let Ok(status) = child.wait() {
+            if status.success() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Put `text` in the system clipboard. Tries the external clipboard daemon
+/// commands first (the reliable path inside the cockpit, since Zellij eats
+/// OSC 52 by default), then falls back to emitting OSC 52 on stdout for
+/// the case where no clipboard daemon is reachable but the terminal can
+/// forward OSC 52 to a different machine's clipboard.
+pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    if copy_via_external_command(text) {
+        return Ok(());
+    }
+    emit_osc52(text)
 }
 
 #[cfg(test)]

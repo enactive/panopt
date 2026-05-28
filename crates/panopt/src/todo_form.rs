@@ -198,9 +198,10 @@ pub struct TodoForm {
     /// In-progress or completed mouse selection in the Body field:
     /// `(anchor, tip)` in logical `(row, col)` coordinates. `anchor` is set
     /// on mouse-down, `tip` follows the drag, and a non-empty selection on
-    /// mouse-up emits an OSC 52 copy via [`crate::clip::emit_osc52`]. Cleared
-    /// on the next key press (any keystroke is treated as "user moved on")
-    /// and on a bare click without drag.
+    /// mouse-up pushes the text to the system clipboard via
+    /// [`crate::clip::copy_to_clipboard`] (external command first, OSC 52
+    /// fallback). Cleared on the next key press (any keystroke is treated
+    /// as "user moved on") and on a bare click without drag.
     selection: Option<((usize, usize), (usize, usize))>,
 
     /// Last-known daemon-side values of the scalar fields, used by `flush` to
@@ -359,7 +360,7 @@ impl TodoForm {
             if let Some((anchor, tip)) = self.selection {
                 if anchor != tip {
                     let text = selected_text(self.body.lines(), anchor, tip);
-                    let _ = crate::clip::emit_osc52(&text);
+                    let _ = crate::clip::copy_to_clipboard(&text);
                 }
             }
             return TodoFormAction::Idle;
@@ -438,7 +439,7 @@ impl TodoForm {
                         self.selection = None;
                     } else {
                         let text = selected_text(self.body.lines(), anchor, tip);
-                        let _ = crate::clip::emit_osc52(&text);
+                        let _ = crate::clip::copy_to_clipboard(&text);
                     }
                 }
             }

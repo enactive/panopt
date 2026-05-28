@@ -208,7 +208,7 @@ impl ScratchpadForm {
             if let Some((anchor, tip)) = self.selection {
                 if anchor != tip {
                     let text = selected_text(self.body.lines(), anchor, tip);
-                    let _ = crate::clip::emit_osc52(&text);
+                    let _ = crate::clip::copy_to_clipboard(&text);
                 }
             }
             return ScratchpadFormAction::Idle;
@@ -290,7 +290,7 @@ impl ScratchpadForm {
                         self.selection = None;
                     } else {
                         let text = selected_text(self.body.lines(), anchor, tip);
-                        let _ = crate::clip::emit_osc52(&text);
+                        let _ = crate::clip::copy_to_clipboard(&text);
                     }
                 }
             }
