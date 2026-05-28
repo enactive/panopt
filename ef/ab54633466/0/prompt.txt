@@ -1,0 +1,6 @@
+use the panopt todo_list tool and show me
+   what you get
+
+---
+
+/verify-all

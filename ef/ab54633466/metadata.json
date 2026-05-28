@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "efab54633466",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "CLAUDE.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/panopt/Cargo.toml",
+    "crates/panopt/src/mcp_proxy.rs",
+    "crates/panoptd/Cargo.toml",
+    "crates/panoptd/src/handler.rs",
+    "crates/panoptd/src/main.rs",
+    "crates/panoptd/src/params.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ef/ab54633466/0/metadata.json",
+      "transcript": "/ef/ab54633466/0/full.jsonl",
+      "content_hash": "/ef/ab54633466/0/content_hash.txt",
+      "prompt": "/ef/ab54633466/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 20,
+    "cache_creation_tokens": 47902,
+    "cache_read_tokens": 153386,
+    "output_tokens": 865,
+    "api_call_count": 6
+  }
+}
