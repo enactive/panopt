@@ -1,0 +1,73 @@
+no coding, just investigations:
+
+tell me about the mcp 'proxy' for external agents.  I guess it's used for *all* connections (confirm), but am thinking about external ones, now. I am assuming that the external agent mirrors the tools that the "real" panopt mcp server provides. ? 
+
+claude seems to retry failed mcp connections 5 times, then fail it.  How does this proxy behave?
+
+---
+
+if I start a claude agent using the mcp proxy  when the upstream panoptd isn't running, how does the proxy know the tools?
+
+---
+
+this sounds like a big failure mode.  do we know that claude or other agents will requery a mcp server that's told them it has no tools?
+
+---
+
+how about this: since we're building from the same source, have the proxy return the actual tool list that the real proxy uses.  why not?  as long as we DRY, that's fine.
+
+---
+
+what;s the rationale for 'must not depend on rmcp'?
+
+---
+
+clarify: 'handler.rs uses rmcp's ...' that sounds like the mcp server.  i'm asking for the mcp proxy to know the same (also an mcp server, duh).  where does panopt-core come in?
+
+---
+
+can handler.rs do its macro stuff based on the shared crate as well?
+
+---
+
+sorry for being dense, but think about this without regard for what's already done:  we want two binaries to be mcp servers that publish the same tool list and metadata. one relays and the other implements.  ??
+
+---
+
+yes
+
+---
+
+plan it out
+
+---
+
+save this plan as a panopt todo
+
+---
+
+now I'd like you to do it. do you have instructions to put todos into in-progress status when you start on them>
+
+---
+
+what did you defer and how are we going to track ig?
+
+---
+
+why would they differ?
+
+---
+
+that's a narrow case, but i guess we should account for it.  make a todo.
+
+---
+
+how to test this work?
+
+---
+
+no mcp present in: claude --mcp-config "$(panopt agent-config --name test-greg)"
+
+---
+
+it's fine.  mcp present and connected.  i started panoptd well after calling todo_list but before it timed out.  it returned results!  surprising.
