@@ -49,3 +49,11 @@ pub fn cockpit_layout() -> Result<PathBuf> {
 pub fn cockpit_config() -> Result<PathBuf> {
     Ok(config_dir()?.join("cockpit-config.kdl"))
 }
+
+/// The shell script `panopt up` writes so the generated cockpit config can
+/// point Zellij's `copy_command` at it. The script reads selection text on
+/// stdin and emits OSC 52 to `/dev/tty` - bypassing Zellij's own OSC 52 path
+/// which gets eaten somewhere in the WezTerm-via-SSH chain.
+pub fn copy_helper_script() -> Result<PathBuf> {
+    Ok(data_dir()?.join("copy-to-osc52.sh"))
+}
