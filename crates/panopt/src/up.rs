@@ -455,10 +455,15 @@ fn inject_page_scroll_keybinds(base: &str) -> (String, bool) {
 /// The `shared { ... }` block spliced in by [`inject_page_scroll_keybinds`].
 /// Four-space indent (one level inside the surrounding `keybinds { ... }`)
 /// to match the mode blocks already there.
+///
+/// `PageScrollUp` / `PageScrollDown` (not `ScrollUp` / `ScrollDown`) move a
+/// full visible-height page at a time, matching the gesture users expect
+/// from PageUp; the bare `ScrollUp` is a single-line action and would feel
+/// like a slow arrow-key.
 fn page_scroll_shared_block() -> String {
     "    shared {\n        \
-        bind \"PageUp\" { ScrollUp; }\n        \
-        bind \"PageDown\" { ScrollDown; }\n    \
+        bind \"PageUp\" { PageScrollUp; }\n        \
+        bind \"PageDown\" { PageScrollDown; }\n    \
     }\n"
     .to_string()
 }
@@ -914,8 +919,8 @@ keybinds clear-defaults=true {
         assert!(ok);
         // PageUp/PageDown go to direct scroll actions, not into scroll mode -
         // so they don't enter a modal state and auto-return on next I/O.
-        assert!(out.contains(r#"bind "PageUp" { ScrollUp; }"#));
-        assert!(out.contains(r#"bind "PageDown" { ScrollDown; }"#));
+        assert!(out.contains(r#"bind "PageUp" { PageScrollUp; }"#));
+        assert!(out.contains(r#"bind "PageDown" { PageScrollDown; }"#));
         // The block lives inside the top-level `keybinds` body so Zellij's
         // parser actually picks it up (a second top-level `keybinds` block
         // would be silently ignored - see the note in render_config).
@@ -937,8 +942,8 @@ keybinds clear-defaults=true {
         let base = "keybinds clear-defaults=true {\n    locked {}\n}\n";
         let (out, ok) = inject_page_scroll_keybinds(base);
         assert!(ok);
-        assert!(out.contains(r#"bind "PageUp" { ScrollUp; }"#));
-        assert!(out.contains(r#"bind "PageDown" { ScrollDown; }"#));
+        assert!(out.contains(r#"bind "PageUp" { PageScrollUp; }"#));
+        assert!(out.contains(r#"bind "PageDown" { PageScrollDown; }"#));
     }
 
     #[test]
