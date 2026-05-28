@@ -53,6 +53,26 @@ pub(crate) fn to_osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
 }
 
+/// Wrap an OSC 52 sequence (or any escape sequence) in tmux's DCS
+/// pass-through envelope when we appear to be running inside tmux. The
+/// wrapper is `ESC P tmux; ESC <payload> ESC \\`; tmux strips the leading
+/// `ESC P tmux;` and trailing `ESC \\`, doubles the inner `ESC` back to a
+/// single one, and forwards the rest to its own parent terminal. Requires
+/// `set -g allow-passthrough on` in the user's tmux config (off by default
+/// in tmux 3.3+).
+///
+/// Detection uses `$TMUX`, which tmux exports for every process it spawns.
+/// Outside tmux the payload is returned unchanged.
+fn wrap_for_tmux(payload: &str) -> String {
+    if std::env::var_os("TMUX").is_none() {
+        return payload.to_string();
+    }
+    // Inside tmux the payload's own ESCs would be eaten when tmux strips
+    // its DCS wrapper; double them so one survives the strip.
+    let escaped = payload.replace('\x1b', "\x1b\x1b");
+    format!("\x1bPtmux;{escaped}\x1b\\")
+}
+
 /// Write the OSC 52 sequence for `text` straight to stdout. The viewer holds
 /// the terminal in raw alt-screen mode, so crossterm does not intercept the
 /// bytes; they pass through Zellij and the host terminal forwards them to
@@ -60,8 +80,14 @@ pub(crate) fn to_osc52(text: &str) -> String {
 /// behaviour is to intercept the sequence instead of forwarding it - which
 /// is why this is a fallback, not the primary path. See
 /// [`copy_to_clipboard`] for the actual entry point.
+///
+/// When `$TMUX` is set the sequence is also wrapped in a DCS pass-through
+/// envelope so tmux forwards it up to the next layer (Zellij forwards DCS
+/// strings by default, and tmux strips the wrapper on its way out). Users
+/// who want this chain to work need `set -g allow-passthrough on` in their
+/// tmux config; otherwise tmux drops the DCS pass-through.
 pub(crate) fn emit_osc52(text: &str) -> io::Result<()> {
-    let seq = to_osc52(text);
+    let seq = wrap_for_tmux(&to_osc52(text));
     let mut out = io::stdout();
     out.write_all(seq.as_bytes())?;
     out.flush()
@@ -145,5 +171,35 @@ mod tests {
         assert!(seq.ends_with('\x07'));
         // The body is the base64 of `hello`.
         assert!(seq.contains("aGVsbG8="));
+    }
+
+    /// `wrap_for_tmux` is a no-op when `$TMUX` is unset; doubles ESCs and
+    /// wraps in `ESC P tmux; ... ESC \\` when set. Lock the env var for the
+    /// duration of the test - other tests in the suite may run in parallel
+    /// but they do not touch `$TMUX`, so we use a manual save/restore.
+    #[test]
+    fn wrap_for_tmux_round_trip() {
+        use super::wrap_for_tmux;
+        let saved = std::env::var_os("TMUX");
+        // SAFETY: tests in this binary are single-threaded for env access by
+        // convention; no other test in this crate touches `$TMUX`.
+        unsafe {
+            std::env::remove_var("TMUX");
+        }
+        assert_eq!(wrap_for_tmux("\x1b]52;c;ZA==\x07"), "\x1b]52;c;ZA==\x07");
+        unsafe {
+            std::env::set_var("TMUX", "/tmp/tmux-1000/default,123,0");
+        }
+        let wrapped = wrap_for_tmux("\x1b]52;c;ZA==\x07");
+        // ESC at start of OSC was doubled, wrapper has its own bracketing ESC.
+        assert!(wrapped.starts_with("\x1bPtmux;\x1b\x1b]52;c;"));
+        assert!(wrapped.ends_with("\x07\x1b\\"));
+        // Restore.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("TMUX", v),
+                None => std::env::remove_var("TMUX"),
+            }
+        }
     }
 }

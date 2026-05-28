@@ -203,6 +203,13 @@ pub struct TodoForm {
     /// fallback). Cleared on the next key press (any keystroke is treated
     /// as "user moved on") and on a bare click without drag.
     selection: Option<((usize, usize), (usize, usize))>,
+    /// Screen rectangles each non-body field occupies, captured every draw
+    /// so a left-click outside the Body field can still focus the right
+    /// field (Title, Tags, Assignee, Status, Priority, Comments, Blockers).
+    /// Rebuilt from scratch on every render so resize / focus changes do
+    /// not stale-cache. Body is intentionally not in this list - it has its
+    /// own click handling for cursor positioning via `body_area`.
+    field_areas: Vec<(Field, Rect)>,
 
     /// Last-known daemon-side values of the scalar fields, used by `flush` to
     /// send only the fields the user actually changed since load (or since
@@ -242,6 +249,7 @@ impl TodoForm {
             body_view_height: 0,
             body_area: None,
             selection: None,
+            field_areas: Vec::new(),
             // A new todo's baseline matches the daemon's defaults for
             // `todo_create`: empty title/body/assignee/tags, status `open`,
             // priority `medium`. After the first save populates `id`, the
@@ -340,6 +348,7 @@ impl TodoForm {
             body_view_height: 0,
             body_area: None,
             selection: None,
+            field_areas: Vec::new(),
             baseline,
         })
     }
@@ -408,28 +417,39 @@ impl TodoForm {
     /// in-rect logical position for the geometry; this is how every native
     /// text widget handles "drag off the bottom of the field."
     pub fn handle_mouse(&mut self, m: MouseEvent) -> TodoFormAction {
-        let Some(area) = self.body_area else {
-            return TodoFormAction::Idle;
-        };
+        let body_area = self.body_area;
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) else {
-                    return TodoFormAction::Idle;
-                };
-                self.focus = FIELDS
-                    .iter()
-                    .position(|f| *f == Field::Body)
-                    .unwrap_or(self.focus);
-                self.body
-                    .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
-                self.selection = Some((pos, pos));
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
-                    if let Some((anchor, _)) = self.selection {
-                        self.selection = Some((anchor, pos));
+                // Body click: focus + position the cursor + start a selection.
+                if let Some(area) = body_area {
+                    if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
+                        self.focus = FIELDS
+                            .iter()
+                            .position(|f| *f == Field::Body)
+                            .unwrap_or(self.focus);
                         self.body
                             .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                        self.selection = Some((pos, pos));
+                        return TodoFormAction::Idle;
+                    }
+                }
+                // Click missed the body; see if it landed on any other field.
+                if let Some(field) = self.field_at(m.row, m.column) {
+                    if let Some(idx) = FIELDS.iter().position(|f| *f == field) {
+                        self.focus = idx;
+                        self.selection = None;
+                    }
+                }
+                return TodoFormAction::Idle;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(area) = body_area {
+                    if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
+                        if let Some((anchor, _)) = self.selection {
+                            self.selection = Some((anchor, pos));
+                            self.body
+                                .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                        }
                     }
                 }
             }
@@ -452,6 +472,24 @@ impl TodoForm {
             _ => {}
         }
         TodoFormAction::Idle
+    }
+
+    /// Field whose recorded rectangle contains terminal cell `(row, col)`,
+    /// or `None` if the click missed every field. First match wins; rectangles
+    /// for inline fields (Status next to Priority, Assignee next to Tags) do
+    /// not overlap so order does not matter in practice.
+    fn field_at(&self, row: u16, col: u16) -> Option<Field> {
+        self.field_areas.iter().find_map(|(field, rect)| {
+            if row >= rect.y
+                && row < rect.y + rect.height
+                && col >= rect.x
+                && col < rect.x + rect.width
+            {
+                Some(*field)
+            } else {
+                None
+            }
+        })
     }
 
     /// Translate a terminal-cell position `(row, col)` inside `area` to a
@@ -1184,8 +1222,11 @@ impl TodoForm {
         ])
         .split(area);
 
+        self.field_areas.clear();
+
         self.style_field(Field::Title, "Title");
         frame.render_widget(&self.title, rows[0]);
+        self.field_areas.push((Field::Title, rows[0]));
 
         let focus = FIELDS[self.focus];
         let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -1194,6 +1235,7 @@ impl TodoForm {
             enum_line("Status", STATUSES[self.status], focus == Field::Status),
             cols[0],
         );
+        self.field_areas.push((Field::Status, cols[0]));
         frame.render_widget(
             enum_line(
                 "Priority",
@@ -1202,6 +1244,7 @@ impl TodoForm {
             ),
             cols[1],
         );
+        self.field_areas.push((Field::Priority, cols[1]));
 
         self.style_inline_field(Field::Assignee);
         self.style_inline_field(Field::Tags);
@@ -1214,6 +1257,9 @@ impl TodoForm {
             assignee_cols[0],
         );
         frame.render_widget(&self.assignee, assignee_cols[1]);
+        // The clickable hitbox for Assignee includes the label so a click
+        // anywhere on the row picks the field; same for Tags.
+        self.field_areas.push((Field::Assignee, cols[0]));
         let tags_cols =
             Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).split(cols[1]);
         frame.render_widget(
@@ -1221,11 +1267,14 @@ impl TodoForm {
             tags_cols[0],
         );
         frame.render_widget(&self.tags, tags_cols[1]);
+        self.field_areas.push((Field::Tags, cols[1]));
 
         self.draw_body(frame, rows[3]);
 
         self.draw_comments(frame, rows[4]);
+        self.field_areas.push((Field::Comments, rows[4]));
         self.draw_blockers(frame, rows[5]);
+        self.field_areas.push((Field::Blockers, rows[5]));
 
         let context = if !self.created.is_empty() {
             format!(" created {}   updated {}", self.created, self.updated)

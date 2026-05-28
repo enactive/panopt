@@ -125,6 +125,10 @@ pub struct ScratchpadForm {
     /// `(anchor, tip)` in logical `(row, col)` coordinates. Mirrors
     /// `TodoForm::selection`; see that field's doc for the lifecycle.
     selection: Option<((usize, usize), (usize, usize))>,
+    /// Title / Tags screen rectangles, captured every draw so a click off
+    /// the Body field still focuses the right one. Body has its own click
+    /// path through `body_area`.
+    field_areas: Vec<(Field, Rect)>,
 
     /// The daemon's last-observed view of the editable fields. See
     /// [`Baseline`].
@@ -150,6 +154,7 @@ impl ScratchpadForm {
             body_view_height: 0,
             body_area: None,
             selection: None,
+            field_areas: Vec::new(),
             message: "new scratchpad - type to begin".to_string(),
             baseline: Baseline::default(),
         }
@@ -182,6 +187,7 @@ impl ScratchpadForm {
             body_view_height: 0,
             body_area: None,
             selection: None,
+            field_areas: Vec::new(),
             message: format!("scratchpad #{id}"),
             baseline: Baseline {
                 title: title.to_string(),
@@ -262,25 +268,32 @@ impl ScratchpadForm {
     /// lifecycle (Down anchors a selection, Drag extends it, Up emits OSC 52,
     /// scroll wheel walks the cursor).
     pub fn handle_mouse(&mut self, m: MouseEvent) -> ScratchpadFormAction {
-        let Some(area) = self.body_area else {
-            return ScratchpadFormAction::Idle;
-        };
+        let body_area = self.body_area;
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) else {
-                    return ScratchpadFormAction::Idle;
-                };
-                self.focus = Field::Body;
-                self.body
-                    .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
-                self.selection = Some((pos, pos));
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
-                    if let Some((anchor, _)) = self.selection {
-                        self.selection = Some((anchor, pos));
+                if let Some(area) = body_area {
+                    if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
+                        self.focus = Field::Body;
                         self.body
                             .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                        self.selection = Some((pos, pos));
+                        return ScratchpadFormAction::Idle;
+                    }
+                }
+                if let Some(field) = self.field_at(m.row, m.column) {
+                    self.focus = field;
+                    self.selection = None;
+                }
+                return ScratchpadFormAction::Idle;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(area) = body_area {
+                    if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
+                        if let Some((anchor, _)) = self.selection {
+                            self.selection = Some((anchor, pos));
+                            self.body
+                                .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                        }
                     }
                 }
             }
@@ -303,6 +316,22 @@ impl ScratchpadForm {
             _ => {}
         }
         ScratchpadFormAction::Idle
+    }
+
+    /// Field whose recorded rectangle contains the click, or `None` if the
+    /// click missed every non-body field.
+    fn field_at(&self, row: u16, col: u16) -> Option<Field> {
+        self.field_areas.iter().find_map(|(field, rect)| {
+            if row >= rect.y
+                && row < rect.y + rect.height
+                && col >= rect.x
+                && col < rect.x + rect.width
+            {
+                Some(*field)
+            } else {
+                None
+            }
+        })
     }
 
     fn body_logical_pos_at(&self, area: Rect, row: u16, col: u16) -> Option<(usize, usize)> {
@@ -557,10 +586,14 @@ impl ScratchpadForm {
         ])
         .split(area);
 
+        self.field_areas.clear();
+
         self.style_field(Field::Title, "Title");
         frame.render_widget(&self.title, rows[0]);
+        self.field_areas.push((Field::Title, rows[0]));
         self.style_field(Field::Tags, "Tags");
         frame.render_widget(&self.tags, rows[1]);
+        self.field_areas.push((Field::Tags, rows[1]));
         self.draw_body(frame, rows[2]);
 
         let context = if !self.created.is_empty() {
