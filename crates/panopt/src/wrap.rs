@@ -35,6 +35,58 @@ pub(crate) struct Wrapped {
 }
 
 impl Wrapped {
+    /// For a logical selection from `anchor` to `tip` (each a logical
+    /// `(row, col)`), return the per-visual-row highlight ranges as
+    /// `(visual_row, char_start_in_segment, char_end_in_segment)`. Char
+    /// indices into the segment string - what the draw code splits on to
+    /// build styled spans.
+    ///
+    /// Anchor and tip can arrive in either order (mouse-up after a backward
+    /// drag); normalized inside. A zero-length selection (`anchor == tip`)
+    /// returns an empty vector so the draw code can fast-path "no highlight".
+    pub(crate) fn visual_selection_ranges(
+        &self,
+        anchor: (usize, usize),
+        tip: (usize, usize),
+    ) -> Vec<(usize, usize, usize)> {
+        let (start, end) = if anchor <= tip {
+            (anchor, tip)
+        } else {
+            (tip, anchor)
+        };
+        if start == end {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (vrow, seg) in self.lines.iter().enumerate() {
+            let (lrow, char_start) = self.segments[vrow];
+            if lrow < start.0 || lrow > end.0 {
+                continue;
+            }
+            let seg_chars = seg.chars().count();
+            let seg_char_end = char_start + seg_chars;
+            // The selection's effective char range inside this segment,
+            // clipped to the segment's own span.
+            let sel_start = if lrow == start.0 {
+                start.1.max(char_start)
+            } else {
+                char_start
+            };
+            let sel_end = if lrow == end.0 {
+                end.1.min(seg_char_end)
+            } else {
+                seg_char_end
+            };
+            if sel_start >= sel_end {
+                continue;
+            }
+            let from = sel_start - char_start;
+            let to = sel_end - char_start;
+            out.push((vrow, from, to));
+        }
+        out
+    }
+
     /// Map a click on visual cell `(vrow, vcol)` back to the logical cursor
     /// position `(row, col)`. Past-end clicks clamp to the last visual row
     /// and end of its segment - the click-to-position gesture should never
@@ -291,6 +343,35 @@ mod tests {
         assert_eq!(w.visual_to_logical(0, 100), (0, 3));
         // Click on a visual row past the last clamps to the last row.
         assert_eq!(w.visual_to_logical(50, 1), (0, 1));
+    }
+
+    #[test]
+    fn visual_selection_ranges_covers_a_wrapped_run() {
+        let lines = vec!["hello world foo".to_string()];
+        // Visual rows: "hello ", "world ", "foo".
+        let w = wrap_for_display(&lines, (0, 0), 8);
+        // Select "world foo" - chars 6..15 of the only logical line.
+        let r = w.visual_selection_ranges((0, 6), (0, 15));
+        // Row 1 ("world ") is fully covered: chars 0..6 within the segment.
+        // Row 2 ("foo") is fully covered: chars 0..3.
+        assert_eq!(r, vec![(1, 0, 6), (2, 0, 3)]);
+    }
+
+    #[test]
+    fn visual_selection_ranges_normalizes_reversed_anchors() {
+        let lines = vec!["abcdefghij".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 4);
+        let forward = w.visual_selection_ranges((0, 2), (0, 6));
+        let reverse = w.visual_selection_ranges((0, 6), (0, 2));
+        assert_eq!(forward, reverse);
+        assert!(!forward.is_empty());
+    }
+
+    #[test]
+    fn visual_selection_ranges_empty_for_zero_length_selection() {
+        let lines = vec!["abc".to_string()];
+        let w = wrap_for_display(&lines, (0, 0), 4);
+        assert_eq!(w.visual_selection_ranges((0, 1), (0, 1)), Vec::new());
     }
 
     #[test]

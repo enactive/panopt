@@ -195,6 +195,13 @@ pub struct TodoForm {
     /// in [`TodoForm::handle_mouse`] can map a click to a logical cursor
     /// without re-deriving the layout. `None` until the first render lands.
     body_area: Option<Rect>,
+    /// In-progress or completed mouse selection in the Body field:
+    /// `(anchor, tip)` in logical `(row, col)` coordinates. `anchor` is set
+    /// on mouse-down, `tip` follows the drag, and a non-empty selection on
+    /// mouse-up emits an OSC 52 copy via [`crate::clip::emit_osc52`]. Cleared
+    /// on the next key press (any keystroke is treated as "user moved on")
+    /// and on a bare click without drag.
+    selection: Option<((usize, usize), (usize, usize))>,
 
     /// Last-known daemon-side values of the scalar fields, used by `flush` to
     /// send only the fields the user actually changed since load (or since
@@ -233,6 +240,7 @@ impl TodoForm {
             body_scroll: 0,
             body_view_height: 0,
             body_area: None,
+            selection: None,
             // A new todo's baseline matches the daemon's defaults for
             // `todo_create`: empty title/body/assignee/tags, status `open`,
             // priority `medium`. After the first save populates `id`, the
@@ -330,6 +338,7 @@ impl TodoForm {
             body_scroll: 0,
             body_view_height: 0,
             body_area: None,
+            selection: None,
             baseline,
         })
     }
@@ -341,6 +350,24 @@ impl TodoForm {
             return TodoFormAction::Idle;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // Ctrl-Shift-C: copy the current Body selection to the system
+        // clipboard without releasing a drag. Handled before the Ctrl-C
+        // close arm below so the shift modifier disambiguates the two.
+        if ctrl && shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            if let Some((anchor, tip)) = self.selection {
+                if anchor != tip {
+                    let text = selected_text(self.body.lines(), anchor, tip);
+                    let _ = crate::clip::emit_osc52(&text);
+                }
+            }
+            return TodoFormAction::Idle;
+        }
+
+        // Any other keystroke moves the user on, so the visible selection
+        // is stale - clear it before dispatching.
+        self.selection = None;
 
         // While editing a comment in place, every key but the commit / cancel
         // pair flows into the editor's TextArea.
@@ -362,45 +389,86 @@ impl TodoForm {
         }
     }
 
-    /// Handle one mouse event. Today the form only listens for a left-click
-    /// in the Body field: the click focuses Body (if it wasn't already) and
-    /// positions the textarea cursor on the clicked character, mapped back
-    /// through the soft-wrap. Returns `Idle` because no content changed -
-    /// the viewer still redraws on every mouse event so the cursor moves
-    /// visibly on the next frame.
+    /// Handle one mouse event in the Body field.
     ///
-    /// Mouse routing for other fields (drag-to-select, click-to-focus on
-    /// single-line fields, scroll wheel) is reserved for later sub-pieces of
-    /// scratchpad #91.
+    /// - Left-click (`Down`): clear any prior selection, move the textarea
+    ///   cursor to the clicked character, plant the selection anchor there.
+    /// - Drag with left button held: extend the selection tip to the current
+    ///   character; the cursor follows the tip so the user sees where they
+    ///   are.
+    /// - Release: if the selection is non-empty, emit it to the system
+    ///   clipboard via OSC 52 (`\x1b]52;c;<base64>\x07`); a bare click
+    ///   without drag clears the zero-length selection.
+    /// - Scroll wheel: walk the textarea cursor up / down by one row; the
+    ///   existing viewport-follow logic in `draw_body` then catches up.
+    ///
+    /// Drag and Up events whose coordinates leave the body rect are still
+    /// processed for the bookkeeping (extend / finalize) but use the last
+    /// in-rect logical position for the geometry; this is how every native
+    /// text widget handles "drag off the bottom of the field."
     pub fn handle_mouse(&mut self, m: MouseEvent) -> TodoFormAction {
-        if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return TodoFormAction::Idle;
-        }
         let Some(area) = self.body_area else {
             return TodoFormAction::Idle;
         };
-        // Strictly-less comparison against `x + width` so a click on the
-        // right border doesn't read as "inside the content area".
-        let row = m.row;
-        let col = m.column;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) else {
+                    return TodoFormAction::Idle;
+                };
+                self.focus = FIELDS
+                    .iter()
+                    .position(|f| *f == Field::Body)
+                    .unwrap_or(self.focus);
+                self.body
+                    .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                self.selection = Some((pos, pos));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
+                    if let Some((anchor, _)) = self.selection {
+                        self.selection = Some((anchor, pos));
+                        self.body
+                            .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((anchor, tip)) = self.selection {
+                    if anchor == tip {
+                        self.selection = None;
+                    } else {
+                        let text = selected_text(self.body.lines(), anchor, tip);
+                        let _ = crate::clip::emit_osc52(&text);
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                self.body.move_cursor(CursorMove::Up);
+            }
+            MouseEventKind::ScrollDown => {
+                self.body.move_cursor(CursorMove::Down);
+            }
+            _ => {}
+        }
+        TodoFormAction::Idle
+    }
+
+    /// Translate a terminal-cell position `(row, col)` inside `area` to a
+    /// logical `(row, col)` in the body's source buffer, via the soft-wrap.
+    /// Returns `None` when the click is outside the body content area; the
+    /// border is treated as "outside".
+    fn body_logical_pos_at(&self, area: Rect, row: u16, col: u16) -> Option<(usize, usize)> {
         if row < area.y || row >= area.y + area.height {
-            return TodoFormAction::Idle;
+            return None;
         }
         if col < area.x || col >= area.x + area.width {
-            return TodoFormAction::Idle;
+            return None;
         }
-        self.focus = FIELDS
-            .iter()
-            .position(|f| *f == Field::Body)
-            .unwrap_or(self.focus);
         let width = area.width as usize;
         let visual_row = (row - area.y) as usize + self.body_scroll;
         let visual_col = (col - area.x) as usize;
         let wrapped = crate::wrap::wrap_for_display(self.body.lines(), self.body.cursor(), width);
-        let (lrow, lcol) = wrapped.visual_to_logical(visual_row, visual_col);
-        self.body
-            .move_cursor(CursorMove::Jump(lrow as u16, lcol as u16));
-        TodoFormAction::Idle
+        Some(wrapped.visual_to_logical(visual_row, visual_col))
     }
 
     /// Insert a bracketed-paste payload into whichever field currently has
@@ -1253,12 +1321,23 @@ impl TodoForm {
             self.body_scroll = max_scroll;
         }
 
+        let selection_ranges: Vec<(usize, usize, usize)> = match self.selection {
+            Some((a, t)) => wrapped.visual_selection_ranges(a, t),
+            None => Vec::new(),
+        };
         let visible: Vec<Line> = wrapped
             .lines
             .iter()
+            .enumerate()
             .skip(self.body_scroll)
             .take(height)
-            .map(|l| Line::from(l.clone()))
+            .map(|(vrow, l)| {
+                if let Some(&(_, from, to)) = selection_ranges.iter().find(|(r, _, _)| *r == vrow) {
+                    highlight_line(l, from, to)
+                } else {
+                    Line::from(l.clone())
+                }
+            })
             .collect();
         frame.render_widget(Paragraph::new(visible), inner);
 
@@ -1575,6 +1654,72 @@ pub(crate) fn text_input(area: &mut TextArea, key: KeyEvent) -> bool {
     }
 }
 
+/// Extract the text under a logical selection `(anchor, tip)` from `lines`.
+/// Each endpoint is `(row, char_col)`; the endpoints may arrive in either
+/// order (a backward drag is just as valid as a forward one). Out-of-range
+/// columns clamp to the line's char count - a click past the right edge of
+/// a wrapped line still produces a sensible cut.
+///
+/// Multi-line selections join with `\n`, matching what a user would type to
+/// recreate the buffer. This is what we hand to OSC 52 so paste-back
+/// elsewhere preserves line breaks.
+pub(crate) fn selected_text(
+    lines: &[String],
+    anchor: (usize, usize),
+    tip: (usize, usize),
+) -> String {
+    let (start, end) = if anchor <= tip {
+        (anchor, tip)
+    } else {
+        (tip, anchor)
+    };
+    if start.0 == end.0 {
+        let line = lines.get(start.0).map(String::as_str).unwrap_or("");
+        let chars: Vec<char> = line.chars().collect();
+        let s = start.1.min(chars.len());
+        let e = end.1.min(chars.len());
+        return chars[s..e].iter().collect();
+    }
+    let mut out = String::new();
+    if let Some(line) = lines.get(start.0) {
+        let chars: Vec<char> = line.chars().collect();
+        let s = start.1.min(chars.len());
+        out.extend(chars[s..].iter());
+    }
+    for r in (start.0 + 1)..end.0 {
+        out.push('\n');
+        if let Some(line) = lines.get(r) {
+            out.push_str(line);
+        }
+    }
+    out.push('\n');
+    if let Some(line) = lines.get(end.0) {
+        let chars: Vec<char> = line.chars().collect();
+        let e = end.1.min(chars.len());
+        out.extend(chars[..e].iter());
+    }
+    out
+}
+
+/// Build a [`Line`] from a soft-wrapped visual row, with the char range
+/// `[from, to)` rendered in reverse video (the standard "selected" cue
+/// across terminal emulators). Out-of-range indices clamp to the segment
+/// length so a slightly stale selection (drag-then-resize) renders safely.
+pub(crate) fn highlight_line(seg: &str, from: usize, to: usize) -> Line<'static> {
+    let chars: Vec<char> = seg.chars().collect();
+    let lo = from.min(chars.len());
+    let hi = to.min(chars.len()).max(lo);
+    let pre: String = chars[..lo].iter().collect();
+    let mid: String = chars[lo..hi].iter().collect();
+    let post: String = chars[hi..].iter().collect();
+    let style = Style::default().add_modifier(Modifier::REVERSED);
+    Line::from(vec![
+        Span::raw(pre),
+        Span::styled(mid, style),
+        Span::raw(post),
+    ])
+}
+
 /// Body-specific wrapper around [`text_input`]: intercepts `Ctrl-U` and
 /// `Ctrl-D` to page the cursor by half the visible Body height (vim/less
 /// convention), then lets every other key fall through to the textarea.
@@ -1889,6 +2034,118 @@ mod tests {
             0,
         );
         assert_eq!(area.cursor().0, 1);
+    }
+
+    #[test]
+    fn selected_text_extracts_single_line_substring() {
+        let lines = vec!["hello world".to_string()];
+        assert_eq!(selected_text(&lines, (0, 6), (0, 11)), "world");
+        // Reversed anchors produce the same text.
+        assert_eq!(selected_text(&lines, (0, 11), (0, 6)), "world");
+    }
+
+    #[test]
+    fn selected_text_joins_multi_line_with_newlines() {
+        let lines = vec!["abc".to_string(), "def".to_string(), "ghi".to_string()];
+        // From (0,1) to (2,2): "bc\ndef\ngh".
+        assert_eq!(selected_text(&lines, (0, 1), (2, 2)), "bc\ndef\ngh");
+    }
+
+    #[test]
+    fn selected_text_clamps_past_end_columns() {
+        let lines = vec!["abc".to_string()];
+        assert_eq!(selected_text(&lines, (0, 0), (0, 99)), "abc");
+    }
+
+    /// Mouse-drag-then-release with a non-empty selection emits OSC 52. We
+    /// can't read the host stdout from a test, but the selection bookkeeping
+    /// is the part that actually drives the copy - verify those transitions.
+    #[test]
+    fn drag_then_release_populates_selection_and_clears_on_bare_click() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        for _ in 0..5 {
+            form.handle_key(tab);
+        }
+        for c in "hello world".chars() {
+            form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        form.body_area = Some(Rect::new(10, 5, 20, 4));
+        form.body_scroll = 0;
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        form.handle_mouse(down);
+        assert_eq!(form.selection, Some(((0, 0), (0, 0))));
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 10 + 5,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        form.handle_mouse(drag);
+        assert_eq!(form.selection, Some(((0, 0), (0, 5))));
+        // Releasing with a non-empty selection keeps it set (so the highlight
+        // survives until the next interaction); the OSC 52 emit is the
+        // side-effect we can't observe here.
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10 + 5,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        form.handle_mouse(up);
+        assert_eq!(form.selection, Some(((0, 0), (0, 5))));
+        // A fresh bare click (Down + Up with no drag) starts then clears.
+        form.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10 + 2,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(form.selection, Some(((0, 2), (0, 2))));
+        form.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10 + 2,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(form.selection, None);
+    }
+
+    /// Any keystroke other than Ctrl-Shift-C clears the selection so the
+    /// highlight doesn't linger over text the user is editing past.
+    #[test]
+    fn keystroke_clears_a_pending_selection() {
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        form.selection = Some(((0, 0), (0, 3)));
+        form.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()));
+        assert_eq!(form.selection, None);
+    }
+
+    /// Ctrl-Shift-C does NOT clear the selection - it re-emits OSC 52 while
+    /// leaving the highlight in place so the user can copy again.
+    #[test]
+    fn ctrl_shift_c_preserves_the_selection() {
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+        for _ in 0..5 {
+            form.handle_key(tab);
+        }
+        for c in "hi".chars() {
+            form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        form.selection = Some(((0, 0), (0, 2)));
+        form.handle_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(form.selection, Some(((0, 0), (0, 2))));
     }
 
     /// Click-to-position-cursor: a left-click inside the recorded body

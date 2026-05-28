@@ -6,6 +6,7 @@
 mod agent;
 mod agent_config;
 mod agent_tool;
+mod clip;
 mod close_gate;
 mod daemon;
 mod delete_gate;

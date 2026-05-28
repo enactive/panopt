@@ -34,7 +34,8 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::mcpclient::Client;
 use crate::todo_form::{
-    body_input, paste_into, paste_into_single_line, single_line_input, text_area,
+    body_input, highlight_line, paste_into, paste_into_single_line, selected_text,
+    single_line_input, text_area,
 };
 
 /// What [`ScratchpadForm::handle_key`] is telling the host to do next.
@@ -120,6 +121,10 @@ pub struct ScratchpadForm {
     /// can map a click back to a logical cursor without re-deriving the
     /// layout. `None` until the first render lands.
     body_area: Option<Rect>,
+    /// In-progress or completed mouse selection in the Body field:
+    /// `(anchor, tip)` in logical `(row, col)` coordinates. Mirrors
+    /// `TodoForm::selection`; see that field's doc for the lifecycle.
+    selection: Option<((usize, usize), (usize, usize))>,
 
     /// The daemon's last-observed view of the editable fields. See
     /// [`Baseline`].
@@ -144,6 +149,7 @@ impl ScratchpadForm {
             body_scroll: 0,
             body_view_height: 0,
             body_area: None,
+            selection: None,
             message: "new scratchpad - type to begin".to_string(),
             baseline: Baseline::default(),
         }
@@ -175,6 +181,7 @@ impl ScratchpadForm {
             body_scroll: 0,
             body_view_height: 0,
             body_area: None,
+            selection: None,
             message: format!("scratchpad #{id}"),
             baseline: Baseline {
                 title: title.to_string(),
@@ -192,6 +199,25 @@ impl ScratchpadForm {
             return ScratchpadFormAction::Idle;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // Ctrl-Shift-C: copy current Body selection to the system clipboard.
+        // Handled ahead of the Ctrl-C close arm so the shift modifier
+        // disambiguates the two.
+        if ctrl && shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            if let Some((anchor, tip)) = self.selection {
+                if anchor != tip {
+                    let text = selected_text(self.body.lines(), anchor, tip);
+                    let _ = crate::clip::emit_osc52(&text);
+                }
+            }
+            return ScratchpadFormAction::Idle;
+        }
+
+        // Any other key: the visible selection is stale; clear before
+        // dispatching so the highlight goes away on the next render.
+        self.selection = None;
+
         match key.code {
             // Ctrl-C closes the form; q/x must remain typeable in the body.
             KeyCode::Char('c') if ctrl => ScratchpadFormAction::Close,
@@ -231,35 +257,66 @@ impl ScratchpadForm {
         }
     }
 
-    /// Handle one mouse event. Mirrors [`crate::todo_form::TodoForm::handle_mouse`]:
-    /// a left-click in the Body field focuses it and positions the textarea
-    /// cursor on the clicked character, mapped back through the soft-wrap.
-    /// Clicks elsewhere are dropped today; the form's other fields are
-    /// keyboard-only until later sub-pieces of scratchpad #91 land.
+    /// Handle one mouse event in the Body field. Mirrors
+    /// [`crate::todo_form::TodoForm::handle_mouse`]; see that for the full
+    /// lifecycle (Down anchors a selection, Drag extends it, Up emits OSC 52,
+    /// scroll wheel walks the cursor).
     pub fn handle_mouse(&mut self, m: MouseEvent) -> ScratchpadFormAction {
-        if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return ScratchpadFormAction::Idle;
-        }
         let Some(area) = self.body_area else {
             return ScratchpadFormAction::Idle;
         };
-        let row = m.row;
-        let col = m.column;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) else {
+                    return ScratchpadFormAction::Idle;
+                };
+                self.focus = Field::Body;
+                self.body
+                    .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                self.selection = Some((pos, pos));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
+                    if let Some((anchor, _)) = self.selection {
+                        self.selection = Some((anchor, pos));
+                        self.body
+                            .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((anchor, tip)) = self.selection {
+                    if anchor == tip {
+                        self.selection = None;
+                    } else {
+                        let text = selected_text(self.body.lines(), anchor, tip);
+                        let _ = crate::clip::emit_osc52(&text);
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                self.body.move_cursor(CursorMove::Up);
+            }
+            MouseEventKind::ScrollDown => {
+                self.body.move_cursor(CursorMove::Down);
+            }
+            _ => {}
+        }
+        ScratchpadFormAction::Idle
+    }
+
+    fn body_logical_pos_at(&self, area: Rect, row: u16, col: u16) -> Option<(usize, usize)> {
         if row < area.y || row >= area.y + area.height {
-            return ScratchpadFormAction::Idle;
+            return None;
         }
         if col < area.x || col >= area.x + area.width {
-            return ScratchpadFormAction::Idle;
+            return None;
         }
-        self.focus = Field::Body;
         let width = area.width as usize;
         let visual_row = (row - area.y) as usize + self.body_scroll;
         let visual_col = (col - area.x) as usize;
         let wrapped = crate::wrap::wrap_for_display(self.body.lines(), self.body.cursor(), width);
-        let (lrow, lcol) = wrapped.visual_to_logical(visual_row, visual_col);
-        self.body
-            .move_cursor(CursorMove::Jump(lrow as u16, lcol as u16));
-        ScratchpadFormAction::Idle
+        Some(wrapped.visual_to_logical(visual_row, visual_col))
     }
 
     /// Insert a bracketed-paste payload into the focused field. Multi-line
@@ -577,12 +634,23 @@ impl ScratchpadForm {
             self.body_scroll = max_scroll;
         }
 
+        let selection_ranges: Vec<(usize, usize, usize)> = match self.selection {
+            Some((a, t)) => wrapped.visual_selection_ranges(a, t),
+            None => Vec::new(),
+        };
         let visible: Vec<ratatui::text::Line> = wrapped
             .lines
             .iter()
+            .enumerate()
             .skip(self.body_scroll)
             .take(height)
-            .map(|l| ratatui::text::Line::from(l.clone()))
+            .map(|(vrow, l)| {
+                if let Some(&(_, from, to)) = selection_ranges.iter().find(|(r, _, _)| *r == vrow) {
+                    highlight_line(l, from, to)
+                } else {
+                    ratatui::text::Line::from(l.clone())
+                }
+            })
             .collect();
         frame.render_widget(Paragraph::new(visible), inner);
 
