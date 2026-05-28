@@ -1,0 +1,13 @@
+plan #80
+
+---
+
+i want to be able to connect an agent to a panoptd on another machine.  you tell me what's missing.  at the end of it I need a document that describes how to do (use) it.
+
+---
+
+wha? i thought that we had a proxy for the mcp, now.  why did it drop?
+
+---
+
+did you write the document describing its use?
