@@ -1,0 +1,35 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "843079a1f342",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "DESIGN.md",
+    "README.md",
+    "crates/panopt/src/agent_tool.rs",
+    "crates/panopt/src/daemon.rs",
+    "crates/panopt/src/edit.rs",
+    "crates/panopt/src/id_kind.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/process.rs",
+    "crates/panopt/src/scratchpad.rs",
+    "crates/panopt/src/todo.rs",
+    "crates/panopt/src/up.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/84/3079a1f342/0/metadata.json",
+      "transcript": "/84/3079a1f342/0/full.jsonl",
+      "content_hash": "/84/3079a1f342/0/content_hash.txt",
+      "prompt": "/84/3079a1f342/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 163,
+    "cache_creation_tokens": 481970,
+    "cache_read_tokens": 10609519,
+    "output_tokens": 44690,
+    "api_call_count": 115
+  }
+}

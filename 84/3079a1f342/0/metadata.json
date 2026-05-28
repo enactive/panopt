@@ -1,0 +1,47 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "843079a1f342",
+  "session_id": "6f363559-43c6-40a0-ab34-5192e0bfde23",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-28T00:55:54.276887362Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "DESIGN.md",
+    "README.md",
+    "crates/panopt/src/agent_tool.rs",
+    "crates/panopt/src/daemon.rs",
+    "crates/panopt/src/edit.rs",
+    "crates/panopt/src/id_kind.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/process.rs",
+    "crates/panopt/src/scratchpad.rs",
+    "crates/panopt/src/todo.rs",
+    "crates/panopt/src/up.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-7[1m]",
+  "turn_id": "dd02cf024d39",
+  "token_usage": {
+    "input_tokens": 163,
+    "cache_creation_tokens": 481970,
+    "cache_read_tokens": 10609519,
+    "output_tokens": 44690,
+    "api_call_count": 115
+  },
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-28T00:55:54.233883875Z",
+    "agent_lines": 121,
+    "agent_removed": 19,
+    "human_added": 14,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 135,
+    "total_lines_changed": 156,
+    "agent_percentage": 89.74358974358975,
+    "metric_version": 2
+  }
+}
