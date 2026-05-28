@@ -1,0 +1,5 @@
+do #95
+
+---
+
+ctrl-u/d works in form field, ppage-up/down works in agent panes, mouse click-drag highlights, paste pastes, but copy doesn't copy.
