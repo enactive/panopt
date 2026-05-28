@@ -169,17 +169,28 @@ fn copy_via_zellij_plugin(text: &str) -> bool {
     status.success()
 }
 
-/// Put `text` in the system clipboard. Tries the Zellij plugin pipe first
-/// (the path that works end-to-end inside the cockpit), then a local
-/// clipboard daemon command, then OSC 52 on stdout.
+/// Put `text` in the system clipboard. Tries every path that might work,
+/// not just the first one that returns success - the failure modes of each
+/// path are silent (a clipboard daemon may exit 0 without actually writing
+/// to a session-less compositor; a Zellij pipe spawn may succeed without
+/// the plugin's host call reaching the host terminal). The user's
+/// clipboard ends up with the text as soon as *any* path actually lands
+/// it, so running every path is cheaper than diagnosing which one is
+/// silently broken in their setup.
 pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    if copy_via_zellij_plugin(text) {
-        return Ok(());
-    }
-    if copy_via_external_command(text) {
-        return Ok(());
-    }
-    emit_osc52(text)
+    // Cheapest path first: a direct OSC 52 to our own stdout. Zellij sees
+    // the bytes and decides whether to forward them to the host terminal
+    // or eat them; users with a working OSC-52 chain (most modern setups)
+    // get their clipboard here. Wrapped in tmux DCS pass-through when
+    // `$TMUX` is set.
+    let osc52_result = emit_osc52(text);
+    // Plugin pipe path: ships the text to `panopt-zellij`'s pipe handler,
+    // which calls Zellij's host `copy_to_clipboard` (separate code path
+    // from raw OSC-52 forwarding in Zellij).
+    let _ = copy_via_zellij_plugin(text);
+    // External daemon for the non-Zellij dev cases.
+    let _ = copy_via_external_command(text);
+    osc52_result
 }
 
 #[cfg(test)]
