@@ -32,7 +32,7 @@ pub fn run(ws: Option<PathBuf>, id: Option<u64>, new: bool, port: u16) -> Result
     if new == id.is_some() {
         return Err(anyhow!("pass a todo id to edit, or --new to create one"));
     }
-    daemon::ensure(port)?;
+    daemon::ensure(None, port)?;
     let url = observer_url(ws, port)?;
 
     let mut form = match id {

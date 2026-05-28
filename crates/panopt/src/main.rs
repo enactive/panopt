@@ -49,6 +49,12 @@ enum Cmd {
         /// build when omitted).
         #[arg(long)]
         plugin: Option<PathBuf>,
+        /// Bind address for the daemon when this call starts it. Defaults to
+        /// `127.0.0.1`; pass `0.0.0.0` to accept connections from agents on
+        /// other machines (the bearer-token gate still applies). Ignored if
+        /// the daemon is already running.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Open a new agent pane in the running cockpit.
     Agent {
@@ -74,10 +80,23 @@ enum Cmd {
         /// Daemon host (default: 127.0.0.1).
         #[arg(long)]
         host: Option<String>,
+        /// Bearer token for the daemon's auth gate (default: read from
+        /// `~/.local/share/panopt/token`). Pass inline when configuring an
+        /// agent on another machine - get the value from the daemon host
+        /// with `panopt token`.
+        #[arg(long)]
+        token: Option<String>,
         /// Project root (default: the current directory).
         #[arg(long)]
         ws: Option<PathBuf>,
     },
+    /// Print the daemon's bearer token to stdout.
+    ///
+    /// Useful when configuring an agent on another machine: read the token
+    /// from the daemon host (e.g. `ssh nixos panopt token`) and pass it to
+    /// `panopt agent-config --token <value>` on the agent host, which then
+    /// does not need a local token file.
+    Token,
     /// Inspect and edit the project's shared todos.
     Todo {
         /// Project root the todos belong to (default: the current directory).
@@ -219,9 +238,22 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Up { plugin } => up::run(plugin, cli.port),
+        Cmd::Up { plugin, host } => up::run(plugin, host, cli.port),
         Cmd::Agent { name } => agent::spawn(name),
-        Cmd::AgentConfig { name, id, host, ws } => agent_config::run(host, cli.port, id, name, ws),
+        Cmd::AgentConfig {
+            name,
+            id,
+            host,
+            token,
+            ws,
+        } => agent_config::run(host, cli.port, id, name, token, ws),
+        Cmd::Token => {
+            use anyhow::Context;
+            let token = panopt_core::auth::read_token(&paths::token()?)
+                .context("reading the panopt token (start the daemon with `panopt up`)")?;
+            println!("{token}");
+            Ok(())
+        }
         Cmd::Todo { ws, action } => todo::run(ws, action, cli.port),
         Cmd::AgentTool { ws, action } => agent_tool::run(ws, action, cli.port),
         Cmd::Process { ws, action } => process::run(ws, action, cli.port),

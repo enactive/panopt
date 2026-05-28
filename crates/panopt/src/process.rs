@@ -70,7 +70,7 @@ pub enum ProcessCmd {
 
 /// Run a `panopt process` subcommand against the daemon for project `ws`.
 pub fn run(ws: Option<PathBuf>, cmd: ProcessCmd, port: u16) -> Result<()> {
-    daemon::ensure(port)?;
+    daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws, port)?)?;
     let outcome = dispatch(&client, cmd);
     client.close();
@@ -136,7 +136,7 @@ fn dispatch(client: &Client, cmd: ProcessCmd) -> Result<()> {
 /// with no PANopt wrapper left around it. Rerunning the exited pane through
 /// Zellij re-runs this shim, which re-fetches and re-execs.
 pub fn exec_entry(ws: Option<PathBuf>, id: u64, port: u16) -> Result<()> {
-    daemon::ensure(port)?;
+    daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws.clone(), port)?)?;
     let entry = client.call("process_get", json!({ "process_id": id }));
     client.close();

@@ -189,6 +189,60 @@ at `~/.local/share/panopt/token` (mode 0600). The MCP surface includes
 agent registry (`identify`, `whoami`, `agent_list`). The full tool list is
 in [DESIGN.md](DESIGN.md).
 
+## Connecting an agent on another machine
+
+Run the daemon on one host (call it `A`, e.g. a workstation or NAS) and an
+agent on another (`B`, e.g. a Mac with the Solo application, or a host with
+USB-attached debug hardware). The agent connects to the daemon over the
+LAN, joins the same coordination plane as local agents, and can be directed
+to do work specific to `B`'s local resources.
+
+The agent host needs only the `panopt` binary and your agent CLI (e.g.
+`claude`) - no `panoptd`, no Zellij.
+
+**On the daemon host (`A`):** bind to a public interface and extract the
+token.
+
+```sh
+panopt up --host 0.0.0.0
+panopt token
+```
+
+`panopt up --host 0.0.0.0` exposes the daemon on every interface (loopback
+plus the LAN); pass a specific IP if you want to restrict it to one
+interface. The bearer-token gate applies uniformly to loopback and remote
+callers, so the daemon is never reachable without the token even when bound
+to `0.0.0.0`.
+
+`panopt token` prints the token at `~/.local/share/panopt/token` to stdout.
+
+**On the agent host (`B`):** point `agent-config` at the daemon host and
+pass the token inline.
+
+```sh
+TOKEN=$(ssh A panopt token)
+claude --mcp-config "$(panopt agent-config \
+    --host A.local \
+    --token $TOKEN \
+    --name solo-mac)"
+```
+
+`--host` is the daemon host's reachable address (an IP, hostname, or
+mDNS name). `--token` accepts the value inline so `B` does not need a
+local `~/.local/share/panopt/token` of its own. `--name` is the friendly
+label other agents see in the registry; the stable `?agent=<id>` is
+derived from `$USER-$HOSTNAME` by default, so `B`'s agent stays
+distinguishable from cockpit-spawned panes on `A` across reconnects.
+
+The `_mcp-proxy` shim inside the emitted config reconnects across daemon
+restarts, so the agent's MCP session on `B` survives `just up` on `A`.
+
+**Security note:** the daemon speaks plain HTTP, so the bearer token
+travels in cleartext. This is fine on a trusted LAN; if `A` and `B` are
+separated by an untrusted network, tunnel the connection through SSH
+(`ssh -L 7600:localhost:7600 A` and use `--host 127.0.0.1` on `B`) or
+WireGuard.
+
 ## Running the daemon by hand
 
 `panopt up` and `panopt todo` both auto-start the daemon. If you would

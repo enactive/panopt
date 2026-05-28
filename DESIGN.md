@@ -264,7 +264,10 @@ clients via the filesystem; remote agents copy it over a secure channel.
 Always-required auth is a uniform gate rather than a per-host policy: the
 token file is owner-readable, so a process able to read it is already in the
 same trust domain as the daemon, and a single rule is simpler to reason
-about than "loopback unauthenticated, remote authenticated."
+about than "loopback unauthenticated, remote authenticated." The user-facing
+recipe for the cross-machine case - `panopt up --host 0.0.0.0` on the
+daemon host, `panopt token` to extract the token, and `panopt agent-config
+--host <addr> --token <value>` on the agent host - lives in the README.
 
 There is one daemon instance, and it serves every project at once. A project
 is selected per connection by a `ws` query parameter on the MCP URL:

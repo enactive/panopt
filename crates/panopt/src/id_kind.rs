@@ -16,7 +16,7 @@ use crate::mcpclient::Client;
 use crate::todo::observer_url;
 
 pub fn run(ws: Option<PathBuf>, id: u64, port: u16) -> Result<()> {
-    daemon::ensure(port)?;
+    daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws, port)?)?;
     let outcome = client.call("id_kind", json!({ "id": id }));
     client.close();

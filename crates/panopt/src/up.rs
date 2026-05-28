@@ -149,12 +149,17 @@ const QUIT_BIND_TO: &str = r#"bind "Ctrl q" { Run "zellij" "action" "pipe" "--na
 
 /// `panopt up` - ensure the daemon, then create or attach this project's
 /// cockpit Zellij session.
-pub fn run(plugin: Option<PathBuf>, port: u16) -> Result<()> {
+///
+/// `host`, when supplied, is forwarded to `panoptd --host` so the daemon
+/// binds to a non-loopback interface (`0.0.0.0` to accept connections from
+/// other machines). Ignored if the daemon is already running - the bind
+/// address only matters when this call starts a fresh `panoptd`.
+pub fn run(plugin: Option<PathBuf>, host: Option<String>, port: u16) -> Result<()> {
     if std::env::var_os("ZELLIJ").is_some() {
         bail!("run `panopt up` from a plain shell, not inside Zellij");
     }
 
-    daemon::ensure(port)?;
+    daemon::ensure(host.as_deref(), port)?;
     mcp::ensure()?;
 
     let project = std::env::current_dir().context("reading the current directory")?;

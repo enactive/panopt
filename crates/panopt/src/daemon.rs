@@ -34,7 +34,14 @@ fn panoptd_path() -> PathBuf {
 /// A freshly started daemon is placed in its own session (`setsid`) so it
 /// outlives the launching terminal and any Zellij session: it is the global
 /// daemon for every project, never tied to one cockpit.
-pub fn ensure(port: u16) -> Result<()> {
+///
+/// `host` is forwarded as `panoptd --host <addr>` and selects the bind
+/// address: `None` keeps the daemon default (`127.0.0.1`); pass
+/// `Some("0.0.0.0")` to expose the daemon to other machines. The startup
+/// probe always checks loopback - `0.0.0.0` covers it, and a specific-
+/// interface bind that excludes loopback is exotic enough that the caller
+/// should start `panoptd` by hand.
+pub fn ensure(host: Option<&str>, port: u16) -> Result<()> {
     if port_open(port) {
         return Ok(());
     }
@@ -44,13 +51,14 @@ pub fn ensure(port: u16) -> Result<()> {
         .with_context(|| format!("creating daemon log {}", log.display()))?;
     let errlog = out.try_clone()?;
 
-    eprintln!("panopt: starting panoptd on 127.0.0.1:{port}");
+    let bind = host.unwrap_or("127.0.0.1");
+    eprintln!("panopt: starting panoptd on {bind}:{port}");
     let mut cmd = Command::new(panoptd_path());
-    cmd.arg("--port")
-        .arg(port.to_string())
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(errlog);
+    cmd.arg("--port").arg(port.to_string());
+    if let Some(h) = host {
+        cmd.arg("--host").arg(h);
+    }
+    cmd.stdin(Stdio::null()).stdout(out).stderr(errlog);
     // SAFETY: `setsid` is async-signal-safe, which is the contract a `pre_exec`
     // hook must honour - it runs in the child between fork and exec.
     unsafe {

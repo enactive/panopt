@@ -20,19 +20,31 @@ use serde_json::json;
 use crate::paths;
 
 /// Emit the `--mcp-config` JSON to stdout.
+///
+/// `token`, when supplied, replaces the usual read of
+/// `~/.local/share/panopt/token`. This is the seam that lets an agent host
+/// on another machine emit a config without first scp'ing the daemon
+/// host's token file into place: paste the value from `panopt token` on
+/// the daemon host directly.
 pub fn run(
     host: Option<String>,
     port: u16,
     id: Option<String>,
     name: Option<String>,
+    token: Option<String>,
     ws: Option<PathBuf>,
 ) -> Result<()> {
     let host = host.unwrap_or_else(|| "127.0.0.1".into());
     let id = id.unwrap_or_else(default_id);
     let name = name.unwrap_or_else(|| id.clone());
     let ws = resolve_ws(ws)?;
-    let token = panopt_core::auth::read_token(&paths::token()?)
-        .context("reading the panopt token (start the daemon with `panopt up`)")?;
+    let token = match token {
+        Some(t) => t,
+        None => panopt_core::auth::read_token(&paths::token()?).context(
+            "reading the panopt token (pass --token <value>, or start the daemon with \
+             `panopt up`)",
+        )?,
+    };
     // Bake in this binary's absolute path so the spawned proxy is the same
     // panopt the user invoked, regardless of what `claude`'s PATH looks like
     // when it executes the stdio child. Falls back to bare `panopt` only if

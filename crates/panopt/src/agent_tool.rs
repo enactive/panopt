@@ -77,7 +77,7 @@ pub enum AgentToolCmd {
 
 /// Run a `panopt agent-tool` subcommand against the daemon for project `ws`.
 pub fn run(ws: Option<PathBuf>, cmd: AgentToolCmd, port: u16) -> Result<()> {
-    daemon::ensure(port)?;
+    daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws, port)?)?;
     let outcome = dispatch(&client, cmd);
     client.close();

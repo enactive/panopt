@@ -96,7 +96,7 @@ pub fn run(ws: Option<PathBuf>, cmd: TodoCmd, port: u16) -> Result<()> {
     if let TodoCmd::Edit { id, new } = cmd {
         return crate::edit::run(ws, id, new, port);
     }
-    daemon::ensure(port)?;
+    daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws, port)?)?;
     let outcome = dispatch(&client, cmd);
     client.close();
