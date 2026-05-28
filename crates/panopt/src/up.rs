@@ -207,6 +207,14 @@ pub fn run(plugin: Option<PathBuf>, host: Option<String>, port: u16) -> Result<(
         None => default_plugin_wasm()
             .context("could not find the panopt-zellij plugin .wasm; pass --plugin <path>")?,
     };
+    if let Err(e) = ensure_clipboard_permission_granted(&wasm) {
+        eprintln!(
+            "warning: could not pre-grant Zellij's `WriteToClipboard` \
+             permission for the sidebar plugin ({e:#}); the cockpit will \
+             still come up but the form's drag-to-copy may not reach the \
+             system clipboard until you approve the permission prompt"
+        );
+    }
     let layout = render_layout(&project, &wasm, port)?;
     let config = match render_config() {
         Ok(path) => Some(path),
@@ -346,6 +354,120 @@ fn retarget_new_pane_binding(base: &str) -> (String, bool) {
     let tweaked = base.replace(NEW_PANE_BIND_FROM, NEW_PANE_BIND_TO);
     let changed = tweaked != base;
     (tweaked, changed)
+}
+
+/// Pre-grant Zellij's `WriteToClipboard` permission for the sidebar plugin
+/// so the auto-locked cockpit can copy form selections without a runtime
+/// permission dialog ("can the plugin access your clipboard?") that the
+/// user might not see or might dismiss with the wrong button.
+///
+/// The cache lives at `~/.cache/zellij/permissions.kdl` (Zellij's exact
+/// path on Linux; on macOS Zellij actually keeps it elsewhere - we still
+/// write to the same `dirs::cache_dir()`-derived path, which is good
+/// enough for users who run the cockpit on Linux as Zellij itself
+/// reads from the matching location there).
+///
+/// File format (Zellij's own, parsed by `PermissionCache::from_string`):
+///
+/// ```kdl
+/// "<absolute wasm path>" {
+///     ChangeApplicationState
+///     RunCommands
+///     ReadApplicationState
+///     WriteToClipboard
+/// }
+/// ```
+///
+/// If the user already approved the other three (the run dialog has been
+/// dismissed at least once), only `WriteToClipboard` is added inside the
+/// existing block. If the entry doesn't exist yet a fresh block is
+/// appended. Either way the file is created if missing.
+fn ensure_clipboard_permission_granted(wasm: &Path) -> Result<()> {
+    let cache_dir = dirs::cache_dir().context("locating the user cache directory")?;
+    let cache_file = cache_dir.join("zellij").join("permissions.kdl");
+    let wasm_str = wasm.to_string_lossy().to_string();
+
+    let existing = match std::fs::read_to_string(&cache_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", cache_file.display()));
+        }
+    };
+
+    let Some(new_content) = grant_clipboard_in_cache(&existing, &wasm_str) else {
+        // Already present; nothing to do.
+        return Ok(());
+    };
+
+    if let Some(parent) = cache_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&cache_file, new_content)
+        .with_context(|| format!("writing {}", cache_file.display()))?;
+    Ok(())
+}
+
+/// Pure transform: given the current `permissions.kdl` contents and our
+/// plugin's wasm path, return the updated contents if a write is needed
+/// (i.e. our plugin's entry was missing or did not list
+/// `WriteToClipboard`), or `None` if no change.
+///
+/// Hand-rolled string surgery rather than a KDL parser dep. Format is
+/// regular enough that finding `"<path>" {` plus brace balancing covers
+/// every shape Zellij writes itself.
+fn grant_clipboard_in_cache(existing: &str, wasm_path: &str) -> Option<String> {
+    const GRANT: &str = "WriteToClipboard";
+    let key = format!("\"{wasm_path}\"");
+    if let Some(start) = existing.find(&key) {
+        // Found a block for our plugin; splice in WriteToClipboard if
+        // missing, else no-op.
+        let rel_open = existing[start..].find('{')?;
+        let open = start + rel_open;
+        let mut depth: i32 = 0;
+        let mut close: Option<usize> = None;
+        for (i, b) in existing.as_bytes().iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        let body = &existing[open + 1..close];
+        if body.contains(GRANT) {
+            return None;
+        }
+        let mut out = String::with_capacity(existing.len() + GRANT.len() + 8);
+        out.push_str(&existing[..close]);
+        out.push_str("    ");
+        out.push_str(GRANT);
+        out.push('\n');
+        out.push_str(&existing[close..]);
+        return Some(out);
+    }
+    // No block for this plugin yet; append a fresh one with the four
+    // permissions the plugin actually requests today.
+    let mut out = String::from(existing);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\"{wasm_path}\" {{\n    \
+            ReadApplicationState\n    \
+            ChangeApplicationState\n    \
+            RunCommands\n    \
+            WriteToClipboard\n\
+         }}\n"
+    ));
+    Some(out)
 }
 
 /// Inject extra `locked`-mode keybinds into the base config's first
@@ -675,9 +797,9 @@ fn render_config() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_mouse_mode_enabled, inject_locked_keybinds, inject_page_scroll_keybinds,
-        retarget_close_bindings, retarget_new_pane_binding, retarget_scroll_binding, session_name,
-        strip_ansi, LAYOUT_TEMPLATE,
+        ensure_mouse_mode_enabled, grant_clipboard_in_cache, inject_locked_keybinds,
+        inject_page_scroll_keybinds, retarget_close_bindings, retarget_new_pane_binding,
+        retarget_scroll_binding, session_name, strip_ansi, LAYOUT_TEMPLATE,
     };
     use std::path::Path;
 
@@ -827,6 +949,81 @@ mod tests {
         let out = ensure_mouse_mode_enabled("keybinds {}\n");
         assert!(out.ends_with("mouse_mode true\n"));
         assert_eq!(out.matches("mouse_mode true").count(), 1);
+    }
+
+    #[test]
+    fn grant_clipboard_in_cache_appends_a_new_block_when_none_exists() {
+        // No entry for our plugin yet: we appended a fresh block carrying
+        // all four permissions the plugin actually requests today.
+        let updated = grant_clipboard_in_cache("", "/path/to/panopt-zellij.wasm")
+            .expect("must change when block is absent");
+        assert!(updated.contains(r#""/path/to/panopt-zellij.wasm""#));
+        assert!(updated.contains("WriteToClipboard"));
+        assert!(updated.contains("ReadApplicationState"));
+        assert!(updated.contains("ChangeApplicationState"));
+        assert!(updated.contains("RunCommands"));
+    }
+
+    #[test]
+    fn grant_clipboard_in_cache_appends_only_the_grant_inside_existing_block() {
+        // Pre-existing block from a prior run that approved the original
+        // three permissions; we splice WriteToClipboard inside it instead
+        // of appending a duplicate block.
+        let base = "\
+\"/path/to/panopt-zellij.wasm\" {
+    ChangeApplicationState
+    RunCommands
+    ReadApplicationState
+}
+";
+        let updated = grant_clipboard_in_cache(base, "/path/to/panopt-zellij.wasm")
+            .expect("must change when grant is missing");
+        // The grant is in there exactly once.
+        assert_eq!(updated.matches("WriteToClipboard").count(), 1);
+        // The existing entries survive.
+        assert!(updated.contains("ChangeApplicationState"));
+        assert!(updated.contains("RunCommands"));
+        assert!(updated.contains("ReadApplicationState"));
+        // No second block was appended (only one `{` and one `}` for this
+        // plugin).
+        assert_eq!(
+            updated.matches(r#""/path/to/panopt-zellij.wasm""#).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn grant_clipboard_in_cache_is_a_noop_when_grant_already_present() {
+        let base = "\
+\"/p.wasm\" {
+    ReadApplicationState
+    WriteToClipboard
+}
+";
+        assert_eq!(grant_clipboard_in_cache(base, "/p.wasm"), None);
+    }
+
+    #[test]
+    fn grant_clipboard_in_cache_leaves_other_plugins_alone() {
+        // The cache may carry entries for other plugins; we only touch
+        // ours, never the unrelated ones.
+        let base = "\
+\"/other.wasm\" {
+    ReadApplicationState
+}
+\"/ours.wasm\" {
+    ReadApplicationState
+}
+";
+        let updated = grant_clipboard_in_cache(base, "/ours.wasm").expect("must change");
+        // Other plugin's block is intact - same single permission, no grant.
+        let other_block_start = updated.find(r#""/other.wasm""#).unwrap();
+        let ours_block_start = updated.find(r#""/ours.wasm""#).unwrap();
+        let other_block = &updated[other_block_start..ours_block_start];
+        assert!(!other_block.contains("WriteToClipboard"));
+        // Ours got it.
+        let ours_block = &updated[ours_block_start..];
+        assert!(ours_block.contains("WriteToClipboard"));
     }
 
     #[test]
