@@ -1,0 +1,9 @@
+let's revise the readme.  it's a bit too technical.  the audience is *users* not devs.  focus more on features and less on design and implementation
+
+---
+
+no need to enumerate the key bindings.  also: they are wrong.
+
+---
+
+read the whole thing.
