@@ -210,6 +210,12 @@ pub struct TodoForm {
     /// not stale-cache. Body is intentionally not in this list - it has its
     /// own click handling for cursor positioning via `body_area`.
     field_areas: Vec<(Field, Rect)>,
+    /// Inner text-content rectangles for the single-line textarea fields
+    /// (Title, Assignee, Tags). Drives click-to-position and drag-to-select
+    /// inside those fields - separate from `field_areas` because the
+    /// clickable hitbox for "focus this field" includes labels / borders
+    /// that aren't actual text cells. Body has its own `body_area`.
+    text_field_areas: Vec<(Field, Rect)>,
 
     /// Last-known daemon-side values of the scalar fields, used by `flush` to
     /// send only the fields the user actually changed since load (or since
@@ -250,6 +256,7 @@ impl TodoForm {
             body_area: None,
             selection: None,
             field_areas: Vec::new(),
+            text_field_areas: Vec::new(),
             // A new todo's baseline matches the daemon's defaults for
             // `todo_create`: empty title/body/assignee/tags, status `open`,
             // priority `medium`. After the first save populates `id`, the
@@ -349,6 +356,7 @@ impl TodoForm {
             body_area: None,
             selection: None,
             field_areas: Vec::new(),
+            text_field_areas: Vec::new(),
             baseline,
         })
     }
@@ -433,7 +441,25 @@ impl TodoForm {
                         return TodoFormAction::Idle;
                     }
                 }
-                // Click missed the body; see if it landed on any other field.
+                // Single-line textarea field: focus, position cursor, plant
+                // a selection anchor for the impending drag.
+                if let Some((field, inner)) = self.text_field_at(m.row, m.column) {
+                    self.focus = FIELDS
+                        .iter()
+                        .position(|f| *f == field)
+                        .unwrap_or(self.focus);
+                    if let Some(area) = self.single_line_textarea_mut(field) {
+                        let col = m.column.saturating_sub(inner.x) as usize;
+                        area.cancel_selection();
+                        area.move_cursor(CursorMove::Jump(0, col as u16));
+                        area.start_selection();
+                    }
+                    self.selection = None;
+                    return TodoFormAction::Idle;
+                }
+                // Click missed every textarea; focus the surrounding field
+                // (label / border / Status / Priority / Comments / Blockers)
+                // without disturbing any cursor.
                 if let Some(field) = self.field_at(m.row, m.column) {
                     if let Some(idx) = FIELDS.iter().position(|f| *f == field) {
                         self.focus = idx;
@@ -443,23 +469,52 @@ impl TodoForm {
                 return TodoFormAction::Idle;
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // Body drag extends the body's wrap-aware selection.
                 if let Some(area) = body_area {
                     if let Some(pos) = self.body_logical_pos_at(area, m.row, m.column) {
                         if let Some((anchor, _)) = self.selection {
                             self.selection = Some((anchor, pos));
                             self.body
                                 .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                            return TodoFormAction::Idle;
                         }
+                    }
+                }
+                // Single-line textarea drag: extend the textarea's own
+                // selection by feeding shift-Right / shift-Left chords until
+                // the cursor reaches the target column. The textarea's
+                // private `move_cursor_with_shift` isn't pub, but `input` is
+                // the same code path and shift-arrow is its public face.
+                let focused_field = FIELDS[self.focus];
+                if let Some(inner) = self.text_field_inner(focused_field) {
+                    let target = m.column.saturating_sub(inner.x) as usize;
+                    if let Some(area) = self.single_line_textarea_mut(focused_field) {
+                        select_to_column(area, target);
                     }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // Body up: emit OSC 52 / clipboard for the wrap-aware sel.
                 if let Some((anchor, tip)) = self.selection {
                     if anchor == tip {
                         self.selection = None;
                     } else {
                         let text = selected_text(self.body.lines(), anchor, tip);
                         let _ = crate::clip::copy_to_clipboard(&text);
+                    }
+                    return TodoFormAction::Idle;
+                }
+                // Single-line textarea up: if the textarea now carries a
+                // selection range, copy its text to the clipboard.
+                let focused_field = FIELDS[self.focus];
+                if let Some(area) = self.single_line_textarea_mut(focused_field) {
+                    if let Some((anchor, tip)) = area.selection_range() {
+                        if anchor != tip {
+                            let text = selected_text(area.lines(), anchor, tip);
+                            if !text.is_empty() {
+                                let _ = crate::clip::copy_to_clipboard(&text);
+                            }
+                        }
                     }
                 }
             }
@@ -472,6 +527,43 @@ impl TodoForm {
             _ => {}
         }
         TodoFormAction::Idle
+    }
+
+    /// Field whose recorded text-content rectangle contains the click, plus
+    /// that rectangle. Returns `None` if the click missed every single-line
+    /// textarea (body has its own click handling).
+    fn text_field_at(&self, row: u16, col: u16) -> Option<(Field, Rect)> {
+        self.text_field_areas.iter().find_map(|(field, rect)| {
+            if row >= rect.y
+                && row < rect.y + rect.height
+                && col >= rect.x
+                && col < rect.x + rect.width
+            {
+                Some((*field, *rect))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The text-content rect recorded for `field`, if it has one.
+    fn text_field_inner(&self, field: Field) -> Option<Rect> {
+        self.text_field_areas
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, r)| *r)
+    }
+
+    /// Mutable access to the single-line textarea backing `field`, if any.
+    /// Body is intentionally not routed here - it uses its own selection
+    /// model in `handle_mouse`'s body arm.
+    fn single_line_textarea_mut(&mut self, field: Field) -> Option<&mut TextArea<'static>> {
+        match field {
+            Field::Title => Some(&mut self.title),
+            Field::Assignee => Some(&mut self.assignee),
+            Field::Tags => Some(&mut self.tags),
+            _ => None,
+        }
     }
 
     /// Field whose recorded rectangle contains terminal cell `(row, col)`,
@@ -1223,10 +1315,15 @@ impl TodoForm {
         .split(area);
 
         self.field_areas.clear();
+        self.text_field_areas.clear();
 
         self.style_field(Field::Title, "Title");
         frame.render_widget(&self.title, rows[0]);
         self.field_areas.push((Field::Title, rows[0]));
+        // Title is bordered (set by `style_field`); its text content sits
+        // inside that border.
+        self.text_field_areas
+            .push((Field::Title, Block::bordered().inner(rows[0])));
 
         let focus = FIELDS[self.focus];
         let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -1258,8 +1355,12 @@ impl TodoForm {
         );
         frame.render_widget(&self.assignee, assignee_cols[1]);
         // The clickable hitbox for Assignee includes the label so a click
-        // anywhere on the row picks the field; same for Tags.
+        // anywhere on the row picks the field; same for Tags. The
+        // text-content rect is the narrower textarea cell, used for click
+        // positioning and drag-to-select.
         self.field_areas.push((Field::Assignee, cols[0]));
+        self.text_field_areas
+            .push((Field::Assignee, assignee_cols[1]));
         let tags_cols =
             Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).split(cols[1]);
         frame.render_widget(
@@ -1268,6 +1369,7 @@ impl TodoForm {
         );
         frame.render_widget(&self.tags, tags_cols[1]);
         self.field_areas.push((Field::Tags, cols[1]));
+        self.text_field_areas.push((Field::Tags, tags_cols[1]));
 
         self.draw_body(frame, rows[3]);
 
@@ -1751,6 +1853,34 @@ pub(crate) fn selected_text(
     out
 }
 
+/// Extend a single-line `TextArea`'s selection from its current cursor
+/// column to `target_col` by feeding shift-Right / shift-Left keypresses.
+/// The `tui_textarea` `move_cursor_with_shift` API is private; shift-arrow
+/// chords are the public face of the same code path and reliably extend
+/// (or anchor) the textarea's own selection on each press.
+///
+/// No-op when the cursor is already at the target.
+pub(crate) fn select_to_column(area: &mut TextArea<'static>, target_col: usize) {
+    let (_, current) = area.cursor();
+    if target_col == current {
+        return;
+    }
+    let (key, steps) = if target_col > current {
+        (
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            target_col - current,
+        )
+    } else {
+        (
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+            current - target_col,
+        )
+    };
+    for _ in 0..steps {
+        area.input(key);
+    }
+}
+
 /// Build a [`Line`] from a soft-wrapped visual row, with the char range
 /// `[from, to)` rendered in reverse video (the standard "selected" cue
 /// across terminal emulators). Out-of-range indices clamp to the segment
@@ -2229,6 +2359,41 @@ mod tests {
         assert_eq!(action, TodoFormAction::Idle);
         assert_eq!(form.body.cursor(), (0, 6));
         assert_eq!(FIELDS[form.focus], Field::Body);
+    }
+
+    /// Drag-to-select on the Title field plants an anchor on Down, extends
+    /// the textarea's own selection on Drag, and on Up leaves a non-empty
+    /// selection range covering the dragged span.
+    #[test]
+    fn drag_in_single_line_field_builds_a_selection_range() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let mut form = TodoForm::blank("http://localhost/?ws=/x");
+        // Title is the focus on a blank form; seed some content.
+        for c in "hello world".chars() {
+            form.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        // Pretend the title textarea drew with its content rect starting at
+        // column 11 (a typical inner-of-border position).
+        form.text_field_areas
+            .push((Field::Title, Rect::new(11, 1, 30, 1)));
+        // Down at col 11 -> textarea column 0, drag to col 16 -> textarea
+        // column 5; the textarea should report a selection covering the
+        // first five characters.
+        form.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 11,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        form.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 16,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        let range = form.title.selection_range();
+        assert_eq!(range, Some(((0, 0), (0, 5))));
     }
 
     /// A click outside the body rectangle is a no-op; the form's focus and

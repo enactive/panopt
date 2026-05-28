@@ -34,8 +34,8 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::mcpclient::Client;
 use crate::todo_form::{
-    body_input, highlight_line, paste_into, paste_into_single_line, selected_text,
-    single_line_input, text_area,
+    body_input, highlight_line, paste_into, paste_into_single_line, select_to_column,
+    selected_text, single_line_input, text_area,
 };
 
 /// What [`ScratchpadForm::handle_key`] is telling the host to do next.
@@ -129,6 +129,10 @@ pub struct ScratchpadForm {
     /// the Body field still focuses the right one. Body has its own click
     /// path through `body_area`.
     field_areas: Vec<(Field, Rect)>,
+    /// Inner text-content rectangles for the single-line textarea fields
+    /// (Title, Tags). Drives click-to-position and drag-to-select inside
+    /// those fields, mirroring the same field on `TodoForm`.
+    text_field_areas: Vec<(Field, Rect)>,
 
     /// The daemon's last-observed view of the editable fields. See
     /// [`Baseline`].
@@ -155,6 +159,7 @@ impl ScratchpadForm {
             body_area: None,
             selection: None,
             field_areas: Vec::new(),
+            text_field_areas: Vec::new(),
             message: "new scratchpad - type to begin".to_string(),
             baseline: Baseline::default(),
         }
@@ -188,6 +193,7 @@ impl ScratchpadForm {
             body_area: None,
             selection: None,
             field_areas: Vec::new(),
+            text_field_areas: Vec::new(),
             message: format!("scratchpad #{id}"),
             baseline: Baseline {
                 title: title.to_string(),
@@ -280,6 +286,17 @@ impl ScratchpadForm {
                         return ScratchpadFormAction::Idle;
                     }
                 }
+                if let Some((field, inner)) = self.text_field_at(m.row, m.column) {
+                    self.focus = field;
+                    if let Some(area) = self.single_line_textarea_mut(field) {
+                        let col = m.column.saturating_sub(inner.x) as usize;
+                        area.cancel_selection();
+                        area.move_cursor(CursorMove::Jump(0, col as u16));
+                        area.start_selection();
+                    }
+                    self.selection = None;
+                    return ScratchpadFormAction::Idle;
+                }
                 if let Some(field) = self.field_at(m.row, m.column) {
                     self.focus = field;
                     self.selection = None;
@@ -293,7 +310,15 @@ impl ScratchpadForm {
                             self.selection = Some((anchor, pos));
                             self.body
                                 .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
+                            return ScratchpadFormAction::Idle;
                         }
+                    }
+                }
+                let focused = self.focus;
+                if let Some(inner) = self.text_field_inner(focused) {
+                    let target = m.column.saturating_sub(inner.x) as usize;
+                    if let Some(area) = self.single_line_textarea_mut(focused) {
+                        select_to_column(area, target);
                     }
                 }
             }
@@ -304,6 +329,18 @@ impl ScratchpadForm {
                     } else {
                         let text = selected_text(self.body.lines(), anchor, tip);
                         let _ = crate::clip::copy_to_clipboard(&text);
+                    }
+                    return ScratchpadFormAction::Idle;
+                }
+                let focused = self.focus;
+                if let Some(area) = self.single_line_textarea_mut(focused) {
+                    if let Some((anchor, tip)) = area.selection_range() {
+                        if anchor != tip {
+                            let text = selected_text(area.lines(), anchor, tip);
+                            if !text.is_empty() {
+                                let _ = crate::clip::copy_to_clipboard(&text);
+                            }
+                        }
                     }
                 }
             }
@@ -316,6 +353,43 @@ impl ScratchpadForm {
             _ => {}
         }
         ScratchpadFormAction::Idle
+    }
+
+    /// Single-line textarea field whose recorded inner content rectangle
+    /// contains the click, plus that rectangle. Returns `None` if the click
+    /// missed every single-line textarea (Body has its own routing).
+    fn text_field_at(&self, row: u16, col: u16) -> Option<(Field, Rect)> {
+        self.text_field_areas.iter().find_map(|(field, rect)| {
+            if row >= rect.y
+                && row < rect.y + rect.height
+                && col >= rect.x
+                && col < rect.x + rect.width
+            {
+                Some((*field, *rect))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The text-content rect recorded for `field`, if it has one.
+    fn text_field_inner(&self, field: Field) -> Option<Rect> {
+        self.text_field_areas
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, r)| *r)
+    }
+
+    /// Mutable access to the single-line textarea backing `field`, if any.
+    fn single_line_textarea_mut(
+        &mut self,
+        field: Field,
+    ) -> Option<&mut tui_textarea::TextArea<'static>> {
+        match field {
+            Field::Title => Some(&mut self.title),
+            Field::Tags => Some(&mut self.tags),
+            _ => None,
+        }
     }
 
     /// Field whose recorded rectangle contains the click, or `None` if the
@@ -587,13 +661,18 @@ impl ScratchpadForm {
         .split(area);
 
         self.field_areas.clear();
+        self.text_field_areas.clear();
 
         self.style_field(Field::Title, "Title");
         frame.render_widget(&self.title, rows[0]);
         self.field_areas.push((Field::Title, rows[0]));
+        self.text_field_areas
+            .push((Field::Title, Block::bordered().inner(rows[0])));
         self.style_field(Field::Tags, "Tags");
         frame.render_widget(&self.tags, rows[1]);
         self.field_areas.push((Field::Tags, rows[1]));
+        self.text_field_areas
+            .push((Field::Tags, Block::bordered().inner(rows[1])));
         self.draw_body(frame, rows[2]);
 
         let context = if !self.created.is_empty() {
