@@ -1,20 +1,20 @@
 //! Clipboard helpers for `panopt _viewer`.
 //!
-//! Two strategies, tried in order by [`copy_to_clipboard`]:
+//! Three strategies, tried in order by [`copy_to_clipboard`]:
 //!
-//! 1. **External command** (`pbcopy` / `wl-copy` / `xclip` / `xsel`). Talks
-//!    straight to the system clipboard daemon, bypassing Zellij entirely.
-//!    This is the strategy that actually works for the common case - Zellij
-//!    intercepts OSC 52 and routes it through its own `copy_command`
-//!    handler, which is unconfigured in stock setups and so silently drops
-//!    the payload.
-//! 2. **OSC 52** (`\x1b]52;c;<base64>\x07`). Fallback for the remote /
-//!    SSH'd-in case where the local box has no clipboard daemon (or none
-//!    that knows the SSH'd-from machine's clipboard). Most modern terminal
-//!    emulators forward OSC 52 to the host system clipboard.
-//!
-//! Order matters because we want the user's machine clipboard to win when
-//! they're working locally: external command first, OSC 52 second.
+//! 1. **Zellij plugin pipe**. Inside the cockpit we ship the text to the
+//!    `panopt-zellij` plugin via `zellij action pipe -- <text>`, and the
+//!    plugin calls Zellij's own `copy_to_clipboard` host API. The plugin
+//!    holds the `WriteToClipboard` permission, so Zellij does whatever the
+//!    user's clipboard config asks - including emitting OSC 52 to the host
+//!    terminal end-to-end with no intermediate layer eating it. This is
+//!    the path that actually works for the SSH'd-into-a-host case where
+//!    OSC 52 has to traverse Zellij + the user's terminal emulator.
+//! 2. **External command** (`pbcopy` / `wl-copy` / `xclip` / `xsel`).
+//!    Useful when we're not inside Zellij (a stand-alone `panopt _viewer`
+//!    for tests / hacks) and a local clipboard daemon is reachable.
+//! 3. **OSC 52** (`\x1b]52;c;<base64>\x07`), raw to stdout. Last-resort
+//!    fallback. Wrapped in tmux DCS pass-through when `$TMUX` is set.
 
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
@@ -136,12 +136,46 @@ fn copy_via_external_command(text: &str) -> bool {
     false
 }
 
-/// Put `text` in the system clipboard. Tries the external clipboard daemon
-/// commands first (the reliable path inside the cockpit, since Zellij eats
-/// OSC 52 by default), then falls back to emitting OSC 52 on stdout for
-/// the case where no clipboard daemon is reachable but the terminal can
-/// forward OSC 52 to a different machine's clipboard.
+/// Ship the text to the `panopt-zellij` plugin via `zellij action pipe`.
+/// The plugin then calls Zellij's host `copy_to_clipboard` API, which
+/// respects the user's `copy_command` / `copy_clipboard` config and emits
+/// OSC 52 to the parent terminal where appropriate - the actual cross-
+/// layer-clipboard story Zellij owns end-to-end.
+///
+/// Skipped (returns false) when `$ZELLIJ` is unset - we are running outside
+/// the cockpit, and the spawn would fail anyway.
+fn copy_via_zellij_plugin(text: &str) -> bool {
+    if std::env::var_os("ZELLIJ").is_none() {
+        return false;
+    }
+    let Ok(status) = Command::new("zellij")
+        .args([
+            "action",
+            "pipe",
+            "--name",
+            "panopt:copy-to-clipboard",
+            "--plugin-configuration",
+            "mode=todos",
+            "--",
+            text,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    else {
+        return false;
+    };
+    status.success()
+}
+
+/// Put `text` in the system clipboard. Tries the Zellij plugin pipe first
+/// (the path that works end-to-end inside the cockpit), then a local
+/// clipboard daemon command, then OSC 52 on stdout.
 pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    if copy_via_zellij_plugin(text) {
+        return Ok(());
+    }
     if copy_via_external_command(text) {
         return Ok(());
     }

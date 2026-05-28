@@ -562,6 +562,7 @@ impl ZellijPlugin for PanoptPane {
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
+            PermissionType::WriteToClipboard,
         ]);
         subscribe(&[
             EventType::PaneUpdate,
@@ -657,6 +658,21 @@ impl ZellijPlugin for PanoptPane {
             }
             "panopt:close-tab-request" => {
                 self.gate_close_tab();
+                true
+            }
+            "panopt:copy-to-clipboard" => {
+                // `panopt _viewer` ships a selection here via
+                // `zellij action pipe -- <text>`. The plugin holds the
+                // `WriteToClipboard` permission and Zellij's host machinery
+                // honours whatever `copy_command` / `copy_clipboard` the
+                // user configured (and falls back to OSC 52 to the host
+                // terminal when neither is set), so this is the most
+                // reliable way to actually land text in the user's
+                // clipboard - bypasses every "does Zellij forward OSC 52"
+                // question.
+                if let Some(text) = pipe_message.payload.as_deref() {
+                    copy_to_clipboard(text.to_string());
+                }
                 true
             }
             "panopt:quit-request" => {
