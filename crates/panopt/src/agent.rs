@@ -62,11 +62,17 @@ pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Resul
     let token = panopt_core::auth::read_token(&token_path)
         .with_context(|| format!("reading panopt token from {}", token_path.display()))?;
     let host = std::env::var("PANOPT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    // The proxy is *this* binary - bake its absolute path into the env so
+    // the MCP config template (`${PANOPT_BIN}`) expands to the same panopt
+    // the user invoked, independent of whatever PATH claude inherits.
+    let panopt_bin =
+        std::env::current_exe().context("looking up panopt's own path for the MCP config")?;
 
     // `exec` replaces this process image, so it returns only on failure.
     let err = Command::new("claude")
         .arg("--mcp-config")
         .arg(&config)
+        .env("PANOPT_BIN", &panopt_bin)
         .env("PANOPT_WS", &ws)
         .env("PANOPT_AGENT", &id)
         .env("PANOPT_NAME", &id)

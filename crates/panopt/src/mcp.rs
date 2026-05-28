@@ -4,11 +4,18 @@
 //! Claude Code spawns `panopt _mcp-proxy` as a stdio MCP server; the proxy
 //! then forwards everything to panoptd over HTTP and reconnects across
 //! daemon restarts so Claude Code's session stays up. `claude` expands
-//! `${PANOPT_HOST}` / `${PANOPT_PORT}` / `${PANOPT_WS}` / `${PANOPT_AGENT}` /
-//! `${PANOPT_NAME}` / `${PANOPT_TOKEN}` from the per-pane environment when
-//! it reads the file, so a single file gives each agent a distinct stable
-//! identity, a friendly display name, and the bearer token the daemon
-//! requires (DESIGN.md Sections 5.3 and 9).
+//! `${PANOPT_BIN}` / `${PANOPT_HOST}` / `${PANOPT_PORT}` / `${PANOPT_WS}` /
+//! `${PANOPT_AGENT}` / `${PANOPT_NAME}` / `${PANOPT_TOKEN}` from the
+//! per-pane environment when it reads the file, so a single file gives
+//! each agent a distinct stable identity, a friendly display name, and
+//! the bearer token the daemon requires (DESIGN.md Sections 5.3 and 9).
+//!
+//! `${PANOPT_BIN}` is the absolute path of the running launcher, set in
+//! `agent::exec_in_pane`. Baking in the absolute path means the spawned
+//! proxy is the exact panopt binary the user is running, regardless of
+//! what claude's PATH looks like - this matters because `cargo run` and
+//! `cargo install` land in different places, and claude inherits whichever
+//! environment its parent had.
 
 use anyhow::{Context, Result};
 
@@ -19,7 +26,7 @@ const AGENT_MCP_JSON: &str = r#"{
   "mcpServers": {
     "panopt": {
       "type": "stdio",
-      "command": "panopt",
+      "command": "${PANOPT_BIN:-panopt}",
       "args": [
         "--port", "${PANOPT_PORT:-7600}",
         "_mcp-proxy",

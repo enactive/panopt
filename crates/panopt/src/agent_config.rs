@@ -33,12 +33,21 @@ pub fn run(
     let ws = resolve_ws(ws)?;
     let token = panopt_core::auth::read_token(&paths::token()?)
         .context("reading the panopt token (start the daemon with `panopt up`)")?;
+    // Bake in this binary's absolute path so the spawned proxy is the same
+    // panopt the user invoked, regardless of what `claude`'s PATH looks like
+    // when it executes the stdio child. Falls back to bare `panopt` only if
+    // the OS refuses to tell us our own path - in which case PATH lookup is
+    // the best we can do.
+    let panopt_bin = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "panopt".to_string());
 
     let cfg = json!({
         "mcpServers": {
             "panopt": {
                 "type": "stdio",
-                "command": "panopt",
+                "command": panopt_bin,
                 "args": [
                     "--port", port.to_string(),
                     "_mcp-proxy",
