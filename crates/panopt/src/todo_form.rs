@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use serde_json::{json, Value};
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 use crate::mcpclient::Client;
 
@@ -182,6 +182,12 @@ pub struct TodoForm {
     /// `draw_body` scroll so the cursor stays on screen as the user edits or
     /// pastes past the bottom of the field.
     body_scroll: usize,
+    /// Visible row count of the Body field as of the most recent `draw_body`.
+    /// Drives the half-page step for Ctrl-U / Ctrl-D in [`body_input`], so
+    /// paging matches what the user can actually see. Starts at zero and is
+    /// refreshed on every render; a Ctrl-U press before the first draw falls
+    /// back to a minimum step of one line via [`body_input`]'s `.max(1)`.
+    body_view_height: usize,
 
     /// Last-known daemon-side values of the scalar fields, used by `flush` to
     /// send only the fields the user actually changed since load (or since
@@ -218,6 +224,7 @@ impl TodoForm {
             can_quit: true,
             message: "new todo - type to begin".to_string(),
             body_scroll: 0,
+            body_view_height: 0,
             // A new todo's baseline matches the daemon's defaults for
             // `todo_create`: empty title/body/assignee/tags, status `open`,
             // priority `medium`. After the first save populates `id`, the
@@ -313,6 +320,7 @@ impl TodoForm {
             can_quit: true,
             message: format!("editing todo #{id}"),
             body_scroll: 0,
+            body_view_height: 0,
             baseline,
         })
     }
@@ -420,7 +428,7 @@ impl TodoForm {
             ScalarField::Title => single_line_input(&mut self.title, key),
             ScalarField::Assignee => single_line_input(&mut self.assignee, key),
             ScalarField::Tags => single_line_input(&mut self.tags, key),
-            ScalarField::Body => text_input(&mut self.body, key),
+            ScalarField::Body => body_input(&mut self.body, key, self.body_view_height),
         };
         if changed {
             self.mark_dirty();
@@ -1168,6 +1176,10 @@ impl TodoForm {
 
         let width = inner.width as usize;
         let height = inner.height as usize;
+        // Remember the height so Ctrl-U / Ctrl-D in `body_input` can page by
+        // half-screen instead of by a fixed step. Stored every draw so resize
+        // is picked up automatically on the next key.
+        self.body_view_height = height;
         if width == 0 || height == 0 {
             return;
         }
@@ -1510,6 +1522,51 @@ pub(crate) fn text_input(area: &mut TextArea, key: KeyEvent) -> bool {
     }
 }
 
+/// Body-specific wrapper around [`text_input`]: intercepts `Ctrl-U` and
+/// `Ctrl-D` to page the cursor by half the visible Body height (vim/less
+/// convention), then lets every other key fall through to the textarea.
+///
+/// Why: Phase 2 of scratchpad #91 globally bound `PageUp` / `PageDown` to
+/// Zellij's `PageScrollUp` / `PageScrollDown`, which means a form pane's
+/// PageUp does nothing (the form is on the terminal's alt-screen, so Zellij
+/// scrollback is empty). The form needs its own paging gesture; `Ctrl-U` /
+/// `Ctrl-D` is the convention every vim/less user already has in muscle
+/// memory.
+///
+/// Page step is `(view_height / 2).max(1)`. A press before the first draw
+/// (when `view_height` is still zero) moves one row, so the gesture is
+/// never a no-op. The cursor moves, the existing `draw_body` viewport
+/// follow-logic then catches up to keep it on screen.
+///
+/// `Ctrl-U` and `Ctrl-D` are not content edits, so they return `false`. The
+/// viewer's `handle_key` redraws on every key regardless, so the visible
+/// scroll position updates next frame. The textarea's default `Ctrl-U`
+/// (undo) is shadowed; `Ctrl-Z` already covers undo here (see [`text_input`])
+/// so users keep an undo binding. The textarea's default `Ctrl-D`
+/// (delete-next-char) is shadowed too; `Delete` still forward-deletes.
+pub(crate) fn body_input(area: &mut TextArea, key: KeyEvent, view_height: usize) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl {
+        let step = (view_height / 2).max(1);
+        match key.code {
+            KeyCode::Char('u') => {
+                for _ in 0..step {
+                    area.move_cursor(CursorMove::Up);
+                }
+                return false;
+            }
+            KeyCode::Char('d') => {
+                for _ in 0..step {
+                    area.move_cursor(CursorMove::Down);
+                }
+                return false;
+            }
+            _ => {}
+        }
+    }
+    text_input(area, key)
+}
+
 /// Feed a key to a single-line field, swallowing anything that would add a
 /// line break (Enter, Ctrl-J, Ctrl-M) so it stays one line. All other
 /// shortcuts go through [`text_input`].
@@ -1728,6 +1785,73 @@ mod tests {
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
         );
         assert_eq!(area.lines(), vec![""]);
+    }
+
+    /// `body_input`'s Ctrl-D / Ctrl-U page the cursor by half the visible
+    /// body height, the vim/less convention. The text is unchanged so the
+    /// helper returns `false`, but the textarea's cursor must have moved.
+    #[test]
+    fn body_input_ctrl_d_and_ctrl_u_page_by_half_view_height() {
+        let mut area = text_area("");
+        for _ in 0..40 {
+            area.insert_newline();
+        }
+        // Cursor sits on the last (41st) line after the 40 inserts.
+        let (start_row, _) = area.cursor();
+        assert_eq!(start_row, 40);
+        area.move_cursor(CursorMove::Top);
+        assert_eq!(area.cursor().0, 0);
+
+        // View height 20 -> step 10. Ctrl-D pages down ten rows.
+        let changed = body_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            20,
+        );
+        assert!(!changed, "Ctrl-D is a cursor move, not a content edit");
+        assert_eq!(area.cursor().0, 10);
+
+        // Ctrl-U pages back the same distance.
+        body_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            20,
+        );
+        assert_eq!(area.cursor().0, 0);
+    }
+
+    /// Before the first draw the form has not yet learned its visible body
+    /// height. `body_input` must still respond to Ctrl-U / Ctrl-D - falling
+    /// back to a one-row step - rather than silently doing nothing.
+    #[test]
+    fn body_input_pages_at_least_one_row_before_first_draw() {
+        let mut area = text_area("");
+        for _ in 0..5 {
+            area.insert_newline();
+        }
+        area.move_cursor(CursorMove::Top);
+        body_input(
+            &mut area,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            0,
+        );
+        assert_eq!(area.cursor().0, 1);
+    }
+
+    /// Regression guard for the bracketed-paste path: `body_input` must
+    /// forward ordinary typing to the textarea unchanged (only Ctrl-U /
+    /// Ctrl-D are intercepted; the rest goes through `text_input`).
+    #[test]
+    fn body_input_forwards_typing_through_text_input() {
+        let mut area = text_area("");
+        for c in "hi".chars() {
+            body_input(
+                &mut area,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+                20,
+            );
+        }
+        assert_eq!(area.lines(), vec!["hi"]);
     }
 
     /// Ctrl-Z is our convenience binding for undo (`tui_textarea`'s native

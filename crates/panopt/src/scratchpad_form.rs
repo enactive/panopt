@@ -32,7 +32,7 @@ use tui_textarea::TextArea;
 
 use crate::mcpclient::Client;
 use crate::todo_form::{
-    paste_into, paste_into_single_line, single_line_input, text_area, text_input,
+    body_input, paste_into, paste_into_single_line, single_line_input, text_area,
 };
 
 /// What [`ScratchpadForm::handle_key`] is telling the host to do next.
@@ -109,6 +109,10 @@ pub struct ScratchpadForm {
     /// First visible visual row of the soft-wrapped Body field. Drives the
     /// `draw_body` scroll so the cursor stays on screen.
     body_scroll: usize,
+    /// Visible row count of the Body field as of the most recent `draw_body`.
+    /// Drives the half-page step for Ctrl-U / Ctrl-D in
+    /// [`crate::todo_form::body_input`], same rationale as the todo form.
+    body_view_height: usize,
 
     /// The daemon's last-observed view of the editable fields. See
     /// [`Baseline`].
@@ -131,6 +135,7 @@ impl ScratchpadForm {
             dirty: false,
             dirty_since: None,
             body_scroll: 0,
+            body_view_height: 0,
             message: "new scratchpad - type to begin".to_string(),
             baseline: Baseline::default(),
         }
@@ -160,6 +165,7 @@ impl ScratchpadForm {
             dirty: false,
             dirty_since: None,
             body_scroll: 0,
+            body_view_height: 0,
             message: format!("scratchpad #{id}"),
             baseline: Baseline {
                 title: title.to_string(),
@@ -206,7 +212,7 @@ impl ScratchpadForm {
         let changed = match self.focus {
             Field::Title => single_line_input(&mut self.title, key),
             Field::Tags => single_line_input(&mut self.tags, key),
-            Field::Body => text_input(&mut self.body, key),
+            Field::Body => body_input(&mut self.body, key, self.body_view_height),
         };
         if changed {
             self.mark_dirty();
@@ -507,6 +513,9 @@ impl ScratchpadForm {
 
         let width = inner.width as usize;
         let height = inner.height as usize;
+        // Same purpose as the matching line in todo_form: feeds the half-page
+        // step for Ctrl-U / Ctrl-D paging in `body_input`.
+        self.body_view_height = height;
         if width == 0 || height == 0 {
             return;
         }
