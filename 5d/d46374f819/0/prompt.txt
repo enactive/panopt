@@ -1,0 +1,13 @@
+read #91, break into phases and make todos for them.
+
+---
+
+i didn't say that it was a todo
+
+---
+
+launch agents to do those three todos as appropriate
+
+---
+
+create a new branch and do #93
