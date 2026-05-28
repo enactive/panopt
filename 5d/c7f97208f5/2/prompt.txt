@@ -1,0 +1,21 @@
+call agent_list
+
+---
+
+again
+
+---
+
+again
+
+---
+
+how many agents>
+
+---
+
+you get two when you call?
+
+---
+
+call again and show the results.
