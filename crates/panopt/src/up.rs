@@ -348,31 +348,72 @@ fn retarget_new_pane_binding(base: &str) -> (String, bool) {
     (tweaked, changed)
 }
 
-/// Extra `locked` keybinds appended to the generated cockpit config so the
-/// cockpit-essential keys keep working when the plugin auto-locks a content
-/// pane. Zellij's stock dump puts these in `shared_except "locked"`, which
-/// strips them in Locked mode - without this block, a user whose focused
-/// viewer / agent pane has just been auto-locked could not move to another
-/// pane (Alt-arrows), spawn a new one (the cockpit's rewritten Alt-N), or
-/// quit (the rewritten Ctrl-Q) without first pressing Ctrl-G to escape - and
-/// the plugin would immediately re-lock them on the next PaneUpdate.
+/// Inject extra `locked`-mode keybinds into the base config's first
+/// `keybinds` block so the cockpit-essential keys keep working when the
+/// plugin auto-locks a content pane. Zellij's stock dump puts these in
+/// `shared_except "locked"`, which strips them under Locked mode - without
+/// this injection a user whose focused viewer / agent pane has just been
+/// auto-locked cannot move to another pane (Alt-arrows), spawn a new one
+/// (the cockpit's rewritten Alt-N), or quit (the rewritten Ctrl-Q) without
+/// first pressing Ctrl-G to escape - and the plugin would immediately
+/// re-lock them on the next PaneUpdate.
 ///
-/// Appended as a separate `keybinds { locked { ... } }` block; Zellij merges
-/// it with the base config's existing locked block. This sidesteps a brittle
-/// string-replace, which would have to handle both `SwitchToMode "Normal"`
-/// (the stock dump form) and `"normal"` (some hand-edited configs).
-fn locked_augment_block() -> String {
+/// Appending a *second* `keybinds { ... }` block does not work: Zellij only
+/// reads the first top-level `keybinds` node and silently ignores the rest
+/// (see the `TODO` at `zellij-utils kdl/mod.rs:4862`). So we walk the base
+/// config, find the first `locked {` header, balance braces to its matching
+/// close, and splice our binds in just before it. The bool reports whether
+/// the splice succeeded - a config without a `locked` block (e.g. fully
+/// custom and unconventional) gets a warning so the user can wire it by
+/// hand.
+fn inject_locked_keybinds(base: &str) -> (String, bool) {
+    let key = "locked {";
+    let Some(start) = base.find(key) else {
+        return (base.to_string(), false);
+    };
+    // Byte index of the `{` itself - balance from here.
+    let open = start + key.len() - 1;
+    let bytes = base.as_bytes();
+    let mut depth: i32 = 0;
+    let mut close = None;
+    for (i, b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return (base.to_string(), false);
+    };
+    let extras = locked_extra_binds();
+    let mut out = String::with_capacity(base.len() + extras.len());
+    out.push_str(&base[..close]);
+    out.push_str(&extras);
+    out.push_str(&base[close..]);
+    (out, true)
+}
+
+/// The body of bindings injected into the existing locked block by
+/// [`inject_locked_keybinds`]. Indentation matches the typical eight-space
+/// inner indent of a Zellij `mode { bind ... }` body so the spliced lines
+/// sit visually alongside whatever was already there. The Alt-N and Ctrl-Q
+/// binds reuse the cockpit's pipe-gated rewrites so spawn and quit still go
+/// through the sidebar gatekeeper.
+fn locked_extra_binds() -> String {
     format!(
-        "keybinds {{\n    \
-            locked {{\n        \
-                bind \"Alt Left\" {{ MoveFocusOrTab \"Left\"; }}\n        \
-                bind \"Alt Right\" {{ MoveFocusOrTab \"Right\"; }}\n        \
-                bind \"Alt Up\" {{ MoveFocus \"Up\"; }}\n        \
-                bind \"Alt Down\" {{ MoveFocus \"Down\"; }}\n        \
-                {NEW_PANE_BIND_TO}\n        \
-                {QUIT_BIND_TO}\n    \
-            }}\n\
-         }}\n"
+        "        bind \"Alt Left\" {{ MoveFocusOrTab \"Left\"; }}\n        \
+         bind \"Alt Right\" {{ MoveFocusOrTab \"Right\"; }}\n        \
+         bind \"Alt Up\" {{ MoveFocus \"Up\"; }}\n        \
+         bind \"Alt Down\" {{ MoveFocus \"Down\"; }}\n        \
+         {NEW_PANE_BIND_TO}\n        \
+         {QUIT_BIND_TO}\n    "
     )
 }
 
@@ -514,7 +555,17 @@ fn render_config() -> Result<PathBuf> {
         );
     }
     let tweaked = ensure_mouse_mode_enabled(&tweaked);
-    let augment = locked_augment_block();
+    let (tweaked, locked_injected) = inject_locked_keybinds(&tweaked);
+    if !locked_injected {
+        eprintln!(
+            "warning: no `locked {{ ... }}` block was found in your Zellij \
+             config, so the cockpit could not inject Alt-arrow navigation \
+             and the rewritten Alt-N / Ctrl-Q binds into Locked mode; while \
+             focused on a content pane (which the sidebar auto-locks), those \
+             keys will be inert and you will have to press Ctrl-G to escape \
+             before moving focus or quitting"
+        );
+    }
     let body = format!(
         "// PANopt cockpit Zellij config - generated by `panopt up`, regenerated\n\
          // each run from your own Zellij config. Zellij's Ctrl-S (scroll mode)\n\
@@ -527,12 +578,13 @@ fn render_config() -> Result<PathBuf> {
          // `mouse_mode true` is forced so the auto-locked input mode (set by\n\
          // the plugin when focus lands on a content pane) doesn't strand the\n\
          // user without mouse events reaching the viewer / terminal panes.\n\
-         // A trailing `keybinds {{ locked {{ ... }} }}` block keeps Alt-arrow\n\
-         // pane navigation plus the rewritten Alt-N and Ctrl-Q alive under the\n\
-         // auto-locked mode, so the user can still leave a content pane,\n\
-         // spawn a new one, or quit the cockpit without a Ctrl-G escape.\n\
-         {tweaked}\n\
-         {augment}"
+         // Alt-arrow pane navigation plus the rewritten Alt-N and Ctrl-Q are\n\
+         // spliced into the existing `locked` block (a second top-level\n\
+         // `keybinds` block does not work - Zellij only reads the first one),\n\
+         // so the user can leave a content pane, spawn a new one, or quit\n\
+         // without a Ctrl-G escape that would just be re-locked on the next\n\
+         // PaneUpdate.\n\
+         {tweaked}"
     );
     let path = paths::cockpit_config()?;
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
@@ -542,7 +594,7 @@ fn render_config() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_mouse_mode_enabled, locked_augment_block, retarget_close_bindings,
+        ensure_mouse_mode_enabled, inject_locked_keybinds, retarget_close_bindings,
         retarget_new_pane_binding, retarget_scroll_binding, session_name, strip_ansi,
         LAYOUT_TEMPLATE,
     };
@@ -697,31 +749,77 @@ mod tests {
     }
 
     #[test]
-    fn locked_augment_block_carries_nav_and_cockpit_keys() {
-        let block = locked_augment_block();
-        // Wraps a `keybinds { locked { ... } }` block; Zellij merges this
-        // with the base config's own locked block.
-        assert!(block.starts_with("keybinds {"));
-        assert!(block.contains("locked {"));
-        // All four arrow directions are bound. MoveFocusOrTab on horizontal
-        // matches the stock Zellij default, so the user gets tab fall-through
-        // at the row edges.
-        assert!(block.contains(r#"bind "Alt Left" { MoveFocusOrTab "Left"; }"#));
-        assert!(block.contains(r#"bind "Alt Right" { MoveFocusOrTab "Right"; }"#));
-        assert!(block.contains(r#"bind "Alt Up" { MoveFocus "Up"; }"#));
-        assert!(block.contains(r#"bind "Alt Down" { MoveFocus "Down"; }"#));
-        // The cockpit-rewritten Alt-N and Ctrl-Q must use the same pipe form
-        // they have outside locked, so spawn and quit are still gated by the
-        // sidebar plugin.
-        assert!(block.contains(r#""panopt:spawn-blank-pane""#));
-        assert!(block.contains(r#""panopt:quit-request""#));
-        // Both pipes are narrowed to the gatekeeper.
+    fn inject_locked_keybinds_splices_into_first_locked_block() {
+        // A minimal config with a single-bind locked block. After injection
+        // the original `Ctrl g` bind must still be present (we splice ahead
+        // of the closing brace, not in place of it) and the Alt-arrow +
+        // pipe-gated cockpit binds must appear inside the same block.
+        let base = "\
+keybinds clear-defaults=true {
+    locked {
+        bind \"Ctrl g\" { SwitchToMode \"normal\"; }
+    }
+    shared_except \"locked\" {
+        bind \"Alt h\" \"Alt Left\" { MoveFocusOrTab \"Left\"; }
+    }
+}
+";
+        let (out, ok) = inject_locked_keybinds(base);
+        assert!(ok);
+        assert!(out.contains(r#"bind "Ctrl g" { SwitchToMode "normal"; }"#));
+        assert!(out.contains(r#"bind "Alt Left" { MoveFocusOrTab "Left"; }"#));
+        assert!(out.contains(r#"bind "Alt Right" { MoveFocusOrTab "Right"; }"#));
+        assert!(out.contains(r#"bind "Alt Up" { MoveFocus "Up"; }"#));
+        assert!(out.contains(r#"bind "Alt Down" { MoveFocus "Down"; }"#));
+        // The cockpit-rewritten Alt-N and Ctrl-Q binds use the same pipe
+        // form they have outside locked so the gatekeeper still sees them.
+        assert!(out.contains(r#""panopt:spawn-blank-pane""#));
+        assert!(out.contains(r#""panopt:quit-request""#));
+        // Each pipe binding includes its gatekeeper narrowing once.
         assert_eq!(
-            block
-                .matches(r#""--plugin-configuration" "mode=todos""#)
+            out.matches(r#""--plugin-configuration" "mode=todos""#)
                 .count(),
             2
         );
+        // The splice lands inside the `locked` block, not after it. The
+        // locked block in the fixture is followed by `shared_except`, so
+        // every spliced bind must appear before that header.
+        let alt_left = out.find(r#"bind "Alt Left""#).unwrap();
+        let shared_except = out.find("shared_except").unwrap();
+        assert!(
+            alt_left < shared_except,
+            "Alt Left bind must be spliced inside the locked block, before \
+             the next mode block starts"
+        );
+    }
+
+    #[test]
+    fn inject_locked_keybinds_balances_braces_through_nested_binds() {
+        // The locked block already contains an inner `{ ... }` action; the
+        // injector must close on the *outer* `}`, not the inner one.
+        let base = "\
+keybinds {
+    locked {
+        bind \"Ctrl g\" { SwitchToMode \"normal\"; }
+    }
+}
+";
+        let (out, ok) = inject_locked_keybinds(base);
+        assert!(ok);
+        // The original bind survives and the new binds follow.
+        let g_bind = out.find(r#"bind "Ctrl g""#).unwrap();
+        let alt_left = out.find(r#"bind "Alt Left""#).unwrap();
+        assert!(g_bind < alt_left);
+        // The outer `keybinds` block closer survives.
+        assert!(out.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn inject_locked_keybinds_reports_when_no_locked_block() {
+        let (out, ok) = inject_locked_keybinds("keybinds {\n    normal {}\n}\n");
+        assert!(!ok);
+        // The base is returned unchanged when there is nothing to splice into.
+        assert_eq!(out, "keybinds {\n    normal {}\n}\n");
     }
 
     #[test]
