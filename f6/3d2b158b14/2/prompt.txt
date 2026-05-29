@@ -1,0 +1,193 @@
+re difficulties in copy-paste, scrolling selection, etc: someone else had this to say (read and respond):
+
+
+Right — once you need pane-bounded selection and autoscroll, the outer terminal’s selection is the wrong layer. Panopt has to own selection for that pane.
+
+Thought for a few seconds
+
+Yeah — then outer WezTerm selection is not acceptable. It is screen-cell selection across the whole terminal viewport. It cannot know Panopt’s pane boundaries or Panopt’s off-screen pane scrollback.
+
+For your use case, Panopt needs to own selection inside the terminal pane.
+
+Best design
+
+For each TerminalPane, maintain:
+
+PTY output stream
+  -> terminal emulator state
+    -> pane-local screen grid
+    -> pane-local scrollback
+    -> pane-local selection
+
+Then implement mouse selection against that pane’s terminal buffer, not against the outer WezTerm buffer.
+
+That gives you:
+
+drag starts inside Claude pane
+  selection constrained to that pane
+
+drag above/below pane
+  autoscroll that pane’s terminal scrollback
+
+Cmd-C / Ctrl-Shift-C / copy command
+  copies Panopt terminal-pane selection
+
+Ctrl-C
+  still sends interrupt to Claude
+This means Panopt must include a terminal emulator
+
+Not just a PTY bridge.
+
+You need something equivalent to:
+
+TerminalPane
+  PTY child process
+  VT/xterm parser
+  screen grid
+  alternate screen
+  scrollback
+  selection model
+  mouse protocol encoder
+  renderer clipped to pane rectangle
+
+Libraries that can do the terminal-state part:
+
+libvterm
+alacritty_terminal
+wezterm/termwiz ecosystem
+vte
+xterm.js
+
+If Panopt is itself a terminal TUI running inside WezTerm, this is nested emulation:
+
+WezTerm
+  Panopt TUI
+    Panopt TerminalPane emulator
+      PTY
+        Claude Code
+
+That is absolutely possible. It is how tmux/screen-style nesting works conceptually, except you need pane-local selection and copy.
+
+Mouse routing
+
+Panopt should decide mouse behavior per terminal pane:
+
+Normal click/drag
+  if child app has mouse reporting enabled:
+    send mouse events to Claude
+  else:
+    start Panopt terminal-pane selection
+
+Modified click/drag, e.g. Alt-drag or Cmd-drag
+  force Panopt selection even if Claude enabled mouse reporting
+
+Do not use Shift if the outer WezTerm intercepts it. Pick a modifier that reaches Panopt reliably in your environment, or add a mode toggle.
+
+Example:
+
+Ctrl-Space      enter pane selection mode
+Esc             exit pane selection mode
+drag            select within current pane
+wheel/edge drag autoscroll pane scrollback
+Enter/Cmd-C     copy selection
+
+A mode toggle is more reliable than modifier detection across terminals.
+
+Autoscroll while selecting
+
+Implement it inside Panopt:
+
+on mouse drag:
+  if y < pane.top:
+    scroll selection pane up
+  if y > pane.bottom:
+    scroll selection pane down
+  update selection endpoint using new scroll offset
+
+Keep selection endpoints in terminal-buffer coordinates, not visible screen coordinates:
+
+Selection {
+  anchor: BufferCell { row, col }
+  cursor: BufferCell { row, col }
+}
+
+Then rendering clips/highlights the visible portion.
+
+Copy to macOS clipboard
+
+For local:
+
+mac → WezTerm → panopt → claude
+
+Panopt can copy by emitting OSC 52 to the outer terminal. WezTerm supports writing to the clipboard via OSC 52, while clipboard reads are restricted/opt-in because they are riskier.
+
+For remote:
+
+mac → WezTerm → ssh → panopt → claude
+
+OSC 52 is still the right mechanism: remote Panopt writes an OSC 52 sequence to stdout, SSH carries it to local WezTerm, and WezTerm sets the macOS clipboard. This is the standard “copy from remote terminal app to local clipboard” path.
+
+So Panopt copy should be:
+
+selected_text = terminalPane.selectionText()
+emit_osc52(selected_text)
+
+Also provide fallback:
+
+write selected text to a temp file
+show copied text in a copy buffer
+pipe to pbcopy only when local macOS
+pipe to wl-copy/xclip/xsel on Linux if available
+
+But OSC 52 is the right default for wezterm → ssh → remote app.
+
+Do not depend on Cmd-C reaching Panopt
+
+In this stack:
+
+mac GUI shortcut layer
+  -> WezTerm
+    -> terminal byte stream
+      -> Panopt
+
+Cmd-C is normally consumed by WezTerm/menu handling. Treat it as unreliable for Panopt-internal copy.
+
+Use a terminal-native Panopt binding:
+
+Ctrl-Shift-C   copy Panopt selection
+Enter          copy while in selection mode
+y              yank while in selection mode
+
+But Ctrl-Shift-C may collide with WezTerm’s own default copy binding. WezTerm binds CTRL-SHIFT-c to copy by default.
+
+So I would use:
+
+Ctrl-Space     enter selection mode
+arrows/hjkl     move selection cursor
+v               begin/extend selection
+y               copy via OSC 52
+Esc             exit
+
+And optionally support mouse drag inside that mode.
+
+Practical recommendation
+
+For Panopt terminal panes:
+
+Default mode:
+  keyboard/mouse go to Claude as faithfully as possible
+
+Pane selection mode:
+  Panopt captures mouse/keyboard
+  selection is constrained to focused pane
+  dragging past pane edge autoscrolls pane scrollback
+  y or Enter copies via OSC 52
+  Esc returns control to Claude
+
+That avoids breaking WezTerm, works over SSH, respects pane boundaries, and allows off-screen selection.
+
+So the answer is: yes, but Panopt must implement terminal-pane-local selection and clipboard export. The outer terminal cannot do what you want.
+
+---
+
+you mention ctrl-s to get into zellij scroll mode, but that isn't working in agent panes, at least.
