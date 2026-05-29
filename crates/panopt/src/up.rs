@@ -408,8 +408,15 @@ fn ensure_copy_helper_script() -> Result<PathBuf> {
 # server is daemonized so its stdout points at /dev/null - writes
 # succeed but go nowhere. The only fd in the system that's actually
 # connected to the user's WezTerm-via-SSH pty is the Zellij CLIENT
-# process's fd/1; we find that process by walking /proc and looking
-# for a `comm=zellij*` whose fd/1 resolves to a /dev/pts/* device.
+# process's fd/1; we narrow to zellij processes with `pgrep -x` and
+# pick the first whose fd/1 resolves to a /dev/pts/* device.
+#
+# Why pgrep, not `for p in /proc/[0-9]*; cat $p/comm`: Zellij's
+# `copy_command` hard-times-out after 1 second
+# (zellij-server/src/tab/copy_command.rs:46) and kills the script. A
+# walk over ~500 entries with a fork-per-cat lands right at 1.0s on
+# this box, so half of every selection silently dies. `pgrep -x
+# zellij` returns in ~50ms.
 LOG={log_path}
 tmp=$(mktemp) || tmp=/tmp/panopt-copy-$$.tmp
 cat > "$tmp"
@@ -421,16 +428,13 @@ cat > "$tmp"
 b=$(base64 -w 0 < "$tmp" 2>/dev/null || base64 < "$tmp" | tr -d '\n')
 echo "base64:      $b" >> "$LOG" 2>/dev/null
 target=""
-for p in /proc/[0-9]*; do
-  comm=$(cat "$p/comm" 2>/dev/null) || continue
-  case "$comm" in zellij*) ;; *) continue ;; esac
-  fd1="$p/fd/1"
-  [ -e "$fd1" ] || continue
+for pid in $(pgrep -x zellij 2>/dev/null); do
+  fd1="/proc/$pid/fd/1"
   link=$(readlink "$fd1" 2>/dev/null) || continue
   case "$link" in
     /dev/pts/*|/dev/tty*)
       target=$fd1
-      echo "target pid=$(basename "$p") comm=$comm fd1=$link" >> "$LOG"
+      echo "target pid=$pid fd1=$link" >> "$LOG"
       break
       ;;
   esac
