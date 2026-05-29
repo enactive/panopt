@@ -376,16 +376,19 @@ fn send_close() -> Result<()> {
     pipe_to_plugin("panopt:close-search", None)
 }
 
+/// Pipe a message to the sidebar plugin.
+///
+/// Deliberately omits `--plugin-configuration mode=todos` so the message
+/// broadcasts to every sidebar plugin instance. `Alt-/` on a non-Todos
+/// sidebar pane spawns the popup locally on that instance, so the holder of
+/// `search_pane` is not necessarily Todos; broadcasting lets the actual
+/// holder receive close-search / show-result regardless. Non-holders no-op
+/// because their `search_pane` is `None`. The locked-content-pane keybind
+/// in `up::SEARCH_BIND_TO` does the opposite for `panopt:open-search` -
+/// filters to `mode=todos` so only Todos spawns from there.
 fn pipe_to_plugin(name: &str, payload: Option<&str>) -> Result<()> {
     let mut cmd = Command::new("zellij");
-    cmd.args([
-        "action",
-        "pipe",
-        "--name",
-        name,
-        "--plugin-configuration",
-        "mode=todos",
-    ]);
+    cmd.args(["action", "pipe", "--name", name]);
     if let Some(p) = payload {
         cmd.arg("--").arg(p);
     }

@@ -677,6 +677,24 @@ impl ZellijPlugin for PanoptPane {
     /// `--plugin-configuration "mode=todos"`, and this guard provides
     /// belt-and-braces idempotency if a custom config slips that filter.
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        // Search lifecycle pipes route on every sidebar instance, not just
+        // Todos: `Alt-/` from a non-Todos sidebar pane spawns the popup
+        // locally on that instance, so the holder of `search_pane` is not
+        // necessarily Todos. The search CLI broadcasts close-search and
+        // show-result without a `mode=todos` filter so every instance
+        // receives them; non-holders no-op via the `search_pane.is_none()`
+        // guard inside `close_search_pane` / `handle_search_result`.
+        match pipe_message.name.as_str() {
+            "panopt:close-search" => {
+                self.close_search_pane();
+                return true;
+            }
+            "panopt:show-result" => {
+                self.handle_search_result(pipe_message.payload.as_deref());
+                return true;
+            }
+            _ => {}
+        }
         if self.mode != Mode::Todos {
             return false;
         }
@@ -724,14 +742,6 @@ impl ZellijPlugin for PanoptPane {
             }
             "panopt:open-search" => {
                 self.spawn_search_dialog();
-                true
-            }
-            "panopt:show-result" => {
-                self.handle_search_result(pipe_message.payload.as_deref());
-                true
-            }
-            "panopt:close-search" => {
-                self.close_search_pane();
                 true
             }
             _ => false,
@@ -1540,23 +1550,20 @@ impl PanoptPane {
             // the match so `?` falls through the dismissal path on a second
             // press.
             BareKey::Char('?') => self.show_help = true,
-            // `Alt-/` opens the cockpit's popup search. Both the Zellij-level
-            // keybind for locked content panes (see up::SEARCH_BIND_TO) and
-            // this sidebar-pane arm forward to the Todos plugin instance,
-            // which is the canonical owner of the popup's lifecycle (see the
-            // invariant comment on `pipe()`). Spawning the popup locally on
-            // a non-Todos instance would store `search_pane` on the wrong
-            // instance, leaving the `panopt:close-search` / `panopt:show-
-            // result` pipes - both filtered to `mode=todos` - unable to
-            // reach the holder, so Esc and Enter would silently no-op.
-            // Bare `/` is left as a no-op stub so it can still reach an
-            // inner program if the user's mental model expects that.
+            // `Alt-/` opens the cockpit's popup search. Spawned locally on
+            // whichever sidebar plugin instance has focus; the resulting
+            // `search_pane` lives on that instance. The popup's
+            // `panopt:close-search` and `panopt:show-result` pipes broadcast
+            // to every sidebar instance (the search CLI omits the
+            // `--plugin-configuration mode=todos` filter on these two pipes
+            // specifically), so the holder always handles its own popup -
+            // regardless of which sidebar pane invoked Alt-/. The
+            // locked-content-pane keybind in `up::SEARCH_BIND_TO` still
+            // routes through `mode=todos` so only Todos spawns from there.
+            // Bare `/` stays a no-op stub so it can still reach an inner
+            // program if the user's mental model expects that.
             BareKey::Char('/') if key.key_modifiers.contains(&KeyModifier::Alt) => {
-                pipe_message_to_plugin(
-                    MessageToPlugin::new("panopt:open-search").with_plugin_config(BTreeMap::from(
-                        [("mode".to_string(), "todos".to_string())],
-                    )),
-                );
+                self.spawn_search_dialog()
             }
             BareKey::Char('/') => {}
             _ => return false,
@@ -1758,7 +1765,16 @@ impl PanoptPane {
     /// sidebar row takes. The popup close happens before `open_document`'s
     /// focus shift so the close action lands on the search pane rather than
     /// the (about-to-be-focused) viewer.
+    ///
+    /// Early-returns on instances that don't hold the popup, because the
+    /// search CLI broadcasts show-result without a `mode=todos` filter so
+    /// the holder (which can be any sidebar instance) gets the message
+    /// reliably. Only one instance has `search_pane = Some(_)`; the other
+    /// four would otherwise duplicate-route the viewer.
     fn handle_search_result(&mut self, payload: Option<&str>) {
+        if self.search_pane.is_none() {
+            return;
+        }
         let Some(payload) = payload else { return };
         let mut kind: Option<&str> = None;
         let mut id: Option<u64> = None;
