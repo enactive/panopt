@@ -213,14 +213,33 @@ impl ScratchpadForm {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        // Ctrl-Shift-C: copy current Body selection to the system clipboard.
-        // Handled ahead of the Ctrl-C close arm so the shift modifier
-        // disambiguates the two.
+        // Ctrl-Shift-C: copy the current selection. Body uses our
+        // wrap-aware `self.selection`; single-line textareas (Title /
+        // Tags) keep their own `selection_range()`. Handled ahead of
+        // the Ctrl-C close arm so the shift modifier disambiguates the
+        // two. See `TodoForm::handle_key` for the WezTerm ⌘C mapping.
         if ctrl && shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-            if let Some((anchor, tip)) = self.selection {
-                if anchor != tip {
+            let focused = self.focus;
+            let copied = match (focused, self.selection) {
+                (Field::Body, Some((anchor, tip))) if anchor != tip => {
                     let text = selected_text(self.body.lines(), anchor, tip);
-                    let _ = crate::clip::copy_to_clipboard(&text);
+                    if !text.is_empty() {
+                        let _ = crate::clip::copy_to_clipboard(&text);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if !copied {
+                if let Some(area) = self.single_line_textarea_mut(focused) {
+                    if let Some((anchor, tip)) = area.selection_range() {
+                        if anchor != tip {
+                            let text = selected_text(area.lines(), anchor, tip);
+                            if !text.is_empty() {
+                                let _ = crate::clip::copy_to_clipboard(&text);
+                            }
+                        }
+                    }
                 }
             }
             return ScratchpadFormAction::Idle;
@@ -323,24 +342,13 @@ impl ScratchpadForm {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // No auto-copy on release - drag = select, Ctrl-Shift-C =
+                // copy. Drop a zero-length body selection (bare click);
+                // the textarea's own selection survives until the next
+                // keystroke or Ctrl-Shift-C reads it out.
                 if let Some((anchor, tip)) = self.selection {
                     if anchor == tip {
                         self.selection = None;
-                    } else {
-                        let text = selected_text(self.body.lines(), anchor, tip);
-                        let _ = crate::clip::copy_to_clipboard(&text);
-                    }
-                    return ScratchpadFormAction::Idle;
-                }
-                let focused = self.focus;
-                if let Some(area) = self.single_line_textarea_mut(focused) {
-                    if let Some((anchor, tip)) = area.selection_range() {
-                        if anchor != tip {
-                            let text = selected_text(area.lines(), anchor, tip);
-                            if !text.is_empty() {
-                                let _ = crate::clip::copy_to_clipboard(&text);
-                            }
-                        }
                     }
                 }
             }

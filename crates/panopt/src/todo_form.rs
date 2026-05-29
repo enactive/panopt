@@ -370,14 +370,40 @@ impl TodoForm {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        // Ctrl-Shift-C: copy the current Body selection to the system
-        // clipboard without releasing a drag. Handled before the Ctrl-C
-        // close arm below so the shift modifier disambiguates the two.
+        // Ctrl-Shift-C: copy the current selection to the system clipboard.
+        // Body uses our wrap-aware `self.selection`; single-line textareas
+        // (Title / Assignee / Tags) keep their own `selection_range()` after
+        // a mouse drag. Handled before the Ctrl-C close arm below so the
+        // shift modifier disambiguates the two.
+        //
+        // On Mac, ⌘C is intercepted by WezTerm (its built-in Copy) and
+        // never reaches the app. Users who want ⌘C to behave the same way
+        // can map it to Ctrl-Shift-C in their WezTerm config:
+        //
+        //   { key = 'c', mods = 'CMD',
+        //     action = wezterm.action.SendKey { key = 'c', mods = 'CTRL|SHIFT' } }
         if ctrl && shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-            if let Some((anchor, tip)) = self.selection {
-                if anchor != tip {
+            let focused_field = FIELDS[self.focus];
+            let copied = match (focused_field, self.selection) {
+                (Field::Body, Some((anchor, tip))) if anchor != tip => {
                     let text = selected_text(self.body.lines(), anchor, tip);
-                    let _ = crate::clip::copy_to_clipboard(&text);
+                    if !text.is_empty() {
+                        let _ = crate::clip::copy_to_clipboard(&text);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if !copied {
+                if let Some(area) = self.single_line_textarea_mut(focused_field) {
+                    if let Some((anchor, tip)) = area.selection_range() {
+                        if anchor != tip {
+                            let text = selected_text(area.lines(), anchor, tip);
+                            if !text.is_empty() {
+                                let _ = crate::clip::copy_to_clipboard(&text);
+                            }
+                        }
+                    }
                 }
             }
             return TodoFormAction::Idle;
@@ -494,29 +520,18 @@ impl TodoForm {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                // Body up: emit OSC 52 / clipboard for the wrap-aware sel.
+                // Body up: leave the selection in place so Ctrl-Shift-C
+                // can pick it up. Auto-copy on release is surprising -
+                // users expect drag = select, then a deliberate chord =
+                // copy. Drop a zero-length selection (bare click).
                 if let Some((anchor, tip)) = self.selection {
                     if anchor == tip {
                         self.selection = None;
-                    } else {
-                        let text = selected_text(self.body.lines(), anchor, tip);
-                        let _ = crate::clip::copy_to_clipboard(&text);
-                    }
-                    return TodoFormAction::Idle;
-                }
-                // Single-line textarea up: if the textarea now carries a
-                // selection range, copy its text to the clipboard.
-                let focused_field = FIELDS[self.focus];
-                if let Some(area) = self.single_line_textarea_mut(focused_field) {
-                    if let Some((anchor, tip)) = area.selection_range() {
-                        if anchor != tip {
-                            let text = selected_text(area.lines(), anchor, tip);
-                            if !text.is_empty() {
-                                let _ = crate::clip::copy_to_clipboard(&text);
-                            }
-                        }
                     }
                 }
+                // Single-line textarea up: also no auto-copy. The
+                // textarea's own selection survives until the next
+                // keystroke (or Ctrl-Shift-C reads it out).
             }
             MouseEventKind::ScrollUp => {
                 self.body.move_cursor(CursorMove::Up);
