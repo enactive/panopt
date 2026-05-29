@@ -1,0 +1,1 @@
+still not working.  I can give a clue, tho: copy does seem to clear the clipboard
