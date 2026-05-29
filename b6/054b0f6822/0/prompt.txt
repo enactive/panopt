@@ -1,0 +1,14 @@
+nope: 
+
+=== viewer copy_to_clipboard pid=113956 bytes=30 ===
+viewer body: "tup before showing the todo li"
+=== Thu May 28 05:40:55 PM PDT 2026 pid=114038 tty=not a tty ===
+stdin bytes: 30
+stdin head:  tup before showing the todo li
+base64:      REDACTED
+osc52 stdout rc: 0
+=== Thu May 28 05:40:55 PM PDT 2026 pid=114055 tty=not a tty ===
+stdin bytes: 30
+stdin head:  tup before showing the todo li
+base64:      REDACTED
+osc52 stdout rc: 0
