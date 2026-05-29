@@ -1,0 +1,131 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "f63d2b158b14",
+  "session_id": "fa48ae5f-5ce7-41f1-9035-c499ab72ee5d",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-29T07:17:46.182574847Z",
+  "branch": "right-pane-terminal-ux-phase1",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "crates/panopt-core/src/projection.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/search.rs",
+    "crates/panopt/src/up.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-7[1m]",
+  "turn_id": "03ded1c3a894",
+  "token_usage": {
+    "input_tokens": 5386,
+    "cache_creation_tokens": 928725,
+    "cache_read_tokens": 23569250,
+    "output_tokens": 126760,
+    "api_call_count": 129
+  },
+  "session_metrics": {
+    "turn_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-29T07:17:46.121706323Z",
+    "agent_lines": 1001,
+    "agent_removed": 167,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 85,
+    "total_committed": 1001,
+    "total_lines_changed": 1253,
+    "agent_percentage": 93.21628092577812,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 41,
+      "user_lines_removed": 85,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1,
+        "crates/panopt/src/up.rs": 40
+      },
+      "user_removed_per_file": {
+        "crates/panopt/src/up.rs": 85
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 41,
+      "agent_lines_removed": 85
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 294,
+      "agent_lines_removed": 89
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 294,
+      "agent_lines_removed": 89
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 320,
+      "agent_lines_removed": 219
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 320,
+      "agent_lines_removed": 219
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 320,
+      "agent_lines_removed": 219
+    },
+    {
+      "checkpoint_number": 8,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 937,
+      "agent_lines_removed": 226
+    },
+    {
+      "checkpoint_number": 9,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1063,
+      "agent_lines_removed": 251
+    },
+    {
+      "checkpoint_number": 10,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1115,
+      "agent_lines_removed": 251
+    },
+    {
+      "checkpoint_number": 11,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1127,
+      "agent_lines_removed": 252
+    }
+  ]
+}

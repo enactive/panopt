@@ -1,0 +1,37 @@
+plan #33
+
+---
+
+go
+
+---
+
+how do I *use* it/
+
+---
+
+need to wire it into the app so I can search!  what's the UI?  press '/' in the todos  pane? make it a custom filter?  discuss
+
+---
+
+would having a dedicated search pop up pane help?
+
+---
+
+yes
+
+---
+
+go
+
+---
+
+can't have just '/'.  how will i type that character?
+
+---
+
+pressing enter on a result row show the popup pane empty wiht "EXIT CODE: 0" at the bottom and "<ENTER> re-run"
+
+---
+
+okay.  now when i hti enter the popup goes away. IT DOESN"T OPEN THE ITEM
