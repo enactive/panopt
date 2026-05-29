@@ -1,0 +1,57 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "5834131d46ba",
+  "session_id": "fa48ae5f-5ce7-41f1-9035-c499ab72ee5d",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-29T17:57:40.346663167Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/search.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "3b07a0b22f7c",
+  "token_usage": {
+    "input_tokens": 5936,
+    "cache_creation_tokens": 1278640,
+    "cache_read_tokens": 34102343,
+    "output_tokens": 151612,
+    "api_call_count": 162
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-29T17:57:40.272712729Z",
+    "agent_lines": 51,
+    "agent_removed": 32,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 51,
+    "total_lines_changed": 83,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 52,
+      "agent_lines_removed": 32
+    }
+  ]
+}

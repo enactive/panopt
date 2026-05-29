@@ -1,0 +1,5 @@
+merge to main and push
+
+---
+
+now the seach pane doesn't open in any of the sidebar panels and esc from the search pane is broken again.  I think that we lost something with the merge to main.
