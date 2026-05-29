@@ -1,0 +1,21 @@
+copy isn't working. need to copy text from fields in form panes and from anywhere in an agent/terminal pane.  drag-select works with the mouse, but not copy
+
+---
+
+i don't want to copy on release.  i never said that. why are you so dumb?
+
+---
+
+why are you not listening to me? i want to copy with cmd-c  .
+
+---
+
+you are so fucking dense.  copy or close?  that's genius.  fuck.  i don't wnat to remap the most basic of keystrokes in my terminal .  that will break EVERY OTHER APPLICATINO ON THE PLANET>
+
+---
+
+when I do shift+drag in panopt, rows across the entire screen are highlighted.  pane boundaries are not respected
+
+---
+
+i give up.  i will accept click-drag-copy-on-release.  confirm that this works in both forms (all appropriate field) and in agent/terminal panes
