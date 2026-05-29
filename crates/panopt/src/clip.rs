@@ -178,6 +178,7 @@ fn copy_via_zellij_plugin(text: &str) -> bool {
 /// it, so running every path is cheaper than diagnosing which one is
 /// silently broken in their setup.
 pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    log_copy_request(text);
     // Cheapest path first: a direct OSC 52 to our own stdout. Zellij sees
     // the bytes and decides whether to forward them to the host terminal
     // or eat them; users with a working OSC-52 chain (most modern setups)
@@ -191,6 +192,27 @@ pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
     // External daemon for the non-Zellij dev cases.
     let _ = copy_via_external_command(text);
     osc52_result
+}
+
+/// Append a diagnostic line to the cockpit's copy-debug log alongside the
+/// helper script's own log entries, so a mismatch between "what the viewer
+/// asked to copy" and "what the script saw on stdin" points at the
+/// corruption layer. Silent on any write failure (debug, not load-bearing).
+fn log_copy_request(text: &str) {
+    let Some(path) = crate::paths::copy_debug_log().ok() else {
+        return;
+    };
+    let line = format!(
+        "=== viewer copy_to_clipboard pid={pid} bytes={bytes} ===\nviewer body: {head:?}\n",
+        pid = std::process::id(),
+        bytes = text.len(),
+        head = &text.chars().take(200).collect::<String>(),
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 #[cfg(test)]

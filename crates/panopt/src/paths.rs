@@ -57,3 +57,12 @@ pub fn cockpit_config() -> Result<PathBuf> {
 pub fn copy_helper_script() -> Result<PathBuf> {
     Ok(data_dir()?.join("copy-to-osc52.sh"))
 }
+
+/// Shared diagnostic log for the cockpit's clipboard chain: the viewer logs
+/// each `copy_to_clipboard` call here, and the helper script logs each
+/// invocation here. A mismatch between the two points at the corruption
+/// layer (viewer asked for "X", script saw ""? layer between them dropped
+/// the bytes).
+pub fn copy_debug_log() -> Result<PathBuf> {
+    Ok(data_dir()?.join("copy-debug.log"))
+}
