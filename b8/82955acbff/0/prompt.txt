@@ -1,0 +1,18 @@
+=== viewer copy_to_clipboard pid=117020 bytes=27 ===
+viewer body: "ing the todo list in the ri"
+=== Thu May 28 05:45:55 PM PDT 2026 pid=117285 tty=not a tty ===
+stdin bytes: 27
+stdin head:  ing the todo list in the ri
+base64:      REDACTED
+=== Thu May 28 05:45:55 PM PDT 2026 pid=117315 tty=not a tty ===
+stdin bytes: 27
+stdin head:  ing the todo list in the ri
+base64:      REDACTED
+target pid=116630 comm=zellij fd1=/dev/pts/8
+osc52 rc: 0
+target pid=116630 comm=zellij fd1=/dev/pts/8
+osc52 rc: 0
+
+---
+
+WTH? drag does the copy.  i can paste that.  if I drag, then command-c the clipboard is still empty.  this drag-copy is not expaected behavior
