@@ -125,11 +125,12 @@ pub(crate) fn render_todos_index_md(todos: &[Todo]) -> String {
             _ => ' ',
         };
         out.push_str(&format!(
-            "- [{mark}] [#{id}](todos/{id}.md) {title} - {status}, {priority}\n",
+            "- [{mark}] [#{id}](todos/{id}.md) {title} - {status}, {priority}, updated {updated}\n",
             id = todo.id,
             title = todo.title,
             status = todo.status.as_str(),
             priority = todo.priority.as_str(),
+            updated = todo.updated_at,
         ));
     }
     out
@@ -485,15 +486,18 @@ mod tests {
 
     #[test]
     fn todo_index_links_each_todo() {
-        let todos = vec![
-            todo(1, "wire up auth", TodoStatus::Open),
-            todo(2, "write readme", TodoStatus::Completed),
-        ];
+        // The lower-id row has the more recent `updated_at` so the sidebar
+        // sort-by-modified path has something non-trivial to compare on; if
+        // the index ever loses the timestamp the regression shows up here.
+        let mut a = todo(1, "wire up auth", TodoStatus::Open);
+        a.updated_at = "2026-05-23 18:05:21".into();
+        let mut b = todo(2, "write readme", TodoStatus::Completed);
+        b.updated_at = "2026-05-21 10:00:00".into();
         assert_eq!(
-            render_todos_index_md(&todos),
+            render_todos_index_md(&[a, b]),
             "# Todos\n\n\
-             - [ ] [#1](todos/1.md) wire up auth - open, medium\n\
-             - [x] [#2](todos/2.md) write readme - completed, medium\n"
+             - [ ] [#1](todos/1.md) wire up auth - open, medium, updated 2026-05-23 18:05:21\n\
+             - [x] [#2](todos/2.md) write readme - completed, medium, updated 2026-05-21 10:00:00\n"
         );
     }
 

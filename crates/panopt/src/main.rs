@@ -19,6 +19,7 @@ mod paths;
 mod process;
 mod scratchpad;
 mod scratchpad_form;
+mod search;
 mod todo;
 mod todo_form;
 mod up;
@@ -131,6 +132,15 @@ enum Cmd {
         ws: Option<PathBuf>,
         #[command(subcommand)]
         action: scratchpad::ScratchpadCmd,
+    },
+    /// Popup search across the project's todos and scratchpads. Intended for
+    /// the cockpit (the sidebar plugin spawns this in a floating pane via the
+    /// search keybind), but also runs standalone — Enter prints `kind:id` to
+    /// stdout when not under Zellij.
+    Search {
+        /// Project root to search (default: the current directory).
+        #[arg(long)]
+        ws: Option<PathBuf>,
     },
     /// Resolve a numeric id to its resource kind (todo / scratchpad /
     /// agent-tool / process) via the daemon's `id_kind` MCP tool.
@@ -259,6 +269,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::AgentTool { ws, action } => agent_tool::run(ws, action, cli.port),
         Cmd::Process { ws, action } => process::run(ws, action, cli.port),
         Cmd::Scratchpad { ws, action } => scratchpad::run(ws, action, cli.port),
+        Cmd::Search { ws } => search::run(ws, cli.port),
         Cmd::IdKind { ws, id } => id_kind::run(ws, id, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),
         Cmd::AgentLeave { ws, id } => agent::leave(ws, id, cli.port),

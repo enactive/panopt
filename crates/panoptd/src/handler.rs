@@ -26,10 +26,11 @@ use panopt_tool_surface::params::{
     AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
     IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs,
     ProcessGetArgs, ProcessUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
-    ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadUpdateArgs,
-    TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs, TodoCommentUpdateArgs,
-    TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs, TodoLockArgs,
-    TodoSetBlockersArgs, TodoStartArgs, TodoUnlockArgs, TodoUpdateArgs,
+    ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadSearchArgs,
+    ScratchpadUpdateArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs,
+    TodoCommentUpdateArgs, TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs,
+    TodoLockArgs, TodoSearchArgs, TodoSetBlockersArgs, TodoStartArgs, TodoUnlockArgs,
+    TodoUpdateArgs,
 };
 use panopt_tool_surface::TOOL_SURFACE;
 use rmcp::{
@@ -712,6 +713,24 @@ impl Handler {
         json_result(&dtos)
     }
 
+    async fn scratchpad_search(
+        &self,
+        parts: Parts,
+        args: ScratchpadSearchArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let dtos: Vec<ScratchpadDto> = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            let tags = args.tags.unwrap_or_default();
+            st.scratchpad_search(project, args.query.as_deref(), &tags)
+                .map_err(map_core_err)?
+                .into_iter()
+                .map(|(id, title)| ScratchpadDto { id, title })
+                .collect()
+        };
+        json_result(&dtos)
+    }
+
     async fn scratchpad_append(
         &self,
         parts: Parts,
@@ -820,6 +839,39 @@ impl Handler {
                 .iter()
                 .map(TodoSummaryDto::from_todo)
                 .collect()
+        };
+        json_result(&dtos)
+    }
+
+    async fn todo_search(
+        &self,
+        parts: Parts,
+        args: TodoSearchArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let status = match &args.status {
+            Some(s) => Some(parse_status(s)?),
+            None => None,
+        };
+        let priority = match &args.priority {
+            Some(p) => Some(parse_priority(p)?),
+            None => None,
+        };
+        let tags = args.tags.unwrap_or_default();
+        let dtos: Vec<TodoSummaryDto> = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.todo_search(
+                project,
+                args.query.as_deref(),
+                status,
+                priority,
+                args.assignee.as_deref(),
+                &tags,
+            )
+            .map_err(map_core_err)?
+            .iter()
+            .map(TodoSummaryDto::from_todo)
+            .collect()
         };
         json_result(&dtos)
     }
@@ -1273,6 +1325,7 @@ enum Tool {
     LockStatus,
     ScratchpadCreate,
     ScratchpadList,
+    ScratchpadSearch,
     ScratchpadAppend,
     ScratchpadRead,
     ScratchpadGet,
@@ -1281,6 +1334,7 @@ enum Tool {
     ScratchpadTagsList,
     TodoCreate,
     TodoList,
+    TodoSearch,
     TodoGet,
     TodoUpdate,
     TodoComplete,
@@ -1320,6 +1374,7 @@ impl Tool {
             "lock_status" => Tool::LockStatus,
             "scratchpad_create" => Tool::ScratchpadCreate,
             "scratchpad_list" => Tool::ScratchpadList,
+            "scratchpad_search" => Tool::ScratchpadSearch,
             "scratchpad_append" => Tool::ScratchpadAppend,
             "scratchpad_read" => Tool::ScratchpadRead,
             "scratchpad_get" => Tool::ScratchpadGet,
@@ -1328,6 +1383,7 @@ impl Tool {
             "scratchpad_tags_list" => Tool::ScratchpadTagsList,
             "todo_create" => Tool::TodoCreate,
             "todo_list" => Tool::TodoList,
+            "todo_search" => Tool::TodoSearch,
             "todo_get" => Tool::TodoGet,
             "todo_update" => Tool::TodoUpdate,
             "todo_complete" => Tool::TodoComplete,
@@ -1429,6 +1485,10 @@ async fn dispatch_local<'a>(
             handler.scratchpad_create(parts, args).await
         }
         Tool::ScratchpadList => handler.scratchpad_list(parts).await,
+        Tool::ScratchpadSearch => {
+            let args: ScratchpadSearchArgs = parse_json_object(raw_args)?;
+            handler.scratchpad_search(parts, args).await
+        }
         Tool::ScratchpadAppend => {
             let args: ScratchpadAppendArgs = parse_json_object(raw_args)?;
             handler.scratchpad_append(parts, args).await
@@ -1455,6 +1515,10 @@ async fn dispatch_local<'a>(
             handler.todo_create(parts, args).await
         }
         Tool::TodoList => handler.todo_list(parts).await,
+        Tool::TodoSearch => {
+            let args: TodoSearchArgs = parse_json_object(raw_args)?;
+            handler.todo_search(parts, args).await
+        }
         Tool::TodoGet => {
             let args: TodoGetArgs = parse_json_object(raw_args)?;
             handler.todo_get(parts, args).await

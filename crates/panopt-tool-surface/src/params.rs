@@ -64,6 +64,18 @@ pub struct ScratchpadDeleteArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ScratchpadSearchArgs {
+    /// Case-insensitive substring matched against title and body. Omit to
+    /// match every scratchpad (subject to other filters).
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Require every listed tag to be present on the scratchpad (AND
+    /// semantics). Omit or pass an empty list to skip the tag filter.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TodoCreateArgs {
     /// Short description of the todo.
     pub title: String,
@@ -125,6 +137,30 @@ pub struct TodoUpdateArgs {
     #[serde(default)]
     pub assignee: Option<String>,
     /// New complete tag list, replacing the old one. Omit to leave unchanged.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TodoSearchArgs {
+    /// Case-insensitive substring matched against title and body. Omit to
+    /// match every todo (subject to other filters).
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Restrict to this status. One of open, in_progress, backlog, draft,
+    /// completed, not_done. Omit to ignore status.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Restrict to this priority. One of high, medium, low. Omit to ignore
+    /// priority.
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Case-insensitive exact match on assignee name. Pass an empty string
+    /// to match only unassigned todos; omit to ignore assignee.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// Require every listed tag to be present on the todo (AND semantics).
+    /// Omit or pass an empty list to skip the tag filter.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
 }

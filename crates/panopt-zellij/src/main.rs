@@ -225,27 +225,45 @@ fn parse_status_suffix(label: &str) -> Option<&str> {
 }
 
 /// Extract the wire priority token from a projection-index label suffix
-/// like `wire up auth - open, high`. Returns `None` for labels without a
-/// known suffix.
+/// like `wire up auth - open, high, updated 2026-05-23 18:05:21`. Returns
+/// `None` for labels without a known suffix. The suffix now carries a
+/// third comma-separated token (`updated <ts>`), so we explicitly slice
+/// the *second* token rather than "everything after the first comma".
 fn parse_priority_suffix(label: &str) -> Option<&str> {
     let start = suffix_start(label)?;
     let rest = &label[start..];
-    let comma = rest.find(',')?;
-    let token = rest[comma + 1..].trim();
+    let first = rest.find(',')?;
+    let after_first = &rest[first + 1..];
+    let end = after_first.find(',').unwrap_or(after_first.len());
+    let token = after_first[..end].trim();
     matches!(token, "high" | "medium" | "low").then_some(token)
+}
+
+/// Extract the `updated_at` timestamp from a projection-index label suffix
+/// like `wire up auth - open, high, updated 2026-05-23 18:05:21`. Returns
+/// `None` when the row has no recognizable `updated <ts>` token (older
+/// projections that predate the timestamp suffix), so callers can degrade
+/// gracefully on a stale on-disk file rather than panicking mid-sort.
+fn parse_updated_suffix(label: &str) -> Option<&str> {
+    let start = suffix_start(label)?;
+    label[start..]
+        .split(',')
+        .map(str::trim)
+        .find_map(|token| token.strip_prefix("updated "))
+        .map(str::trim)
 }
 
 /// One axis of the two-level todo sort. The sidebar carries two of these
 /// (level 1 / level 2) and applies them as a stable two-pass sort, so equal
 /// keys on level 1 are broken by level 2.
 ///
-/// The sidebar reads only the projection index, which carries status and
-/// priority but no per-todo timestamps. The created/modified axes therefore
-/// degrade to **id order** (project ids are monotonic, so id asc ≡
-/// creation order asc; modified date falls back to the same proxy). This
-/// mirrors the existing `OpenUnblocked → Open` degradation in
-/// [`TodoFilter::includes_label`]. The viewer pane on the right uses MCP
-/// and applies the full timestamp-aware sort.
+/// The sidebar reads only the projection index, which carries status,
+/// priority, and `updated_at` per row. The `Modified` axes compare on
+/// `updated_at` directly (the daemon writes `datetime('now')` text, which
+/// is lexicographically orderable). The `Created` axes still degrade to
+/// **id order**, which is correct given per-project ids are monotonic and
+/// never reused: `id asc ≡ creation order asc`. This mirrors the existing
+/// `OpenUnblocked → Open` degradation in [`TodoFilter::includes_label`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum TodoSort {
     #[default]
@@ -289,8 +307,11 @@ impl TodoSort {
     }
 
     /// Compare two projection rows on this axis. The sidebar's row shape is
-    /// `(id, label)`; priority comes from [`parse_priority_suffix`], and the
-    /// time-based axes degrade to comparing ids (see the type doc).
+    /// `(id, label)`; priority comes from [`parse_priority_suffix`], the
+    /// `updated_at` timestamp from [`parse_updated_suffix`], and `Created`
+    /// degrades to id comparison (see the type doc). Rows missing the
+    /// `updated <ts>` token (stale projection) fall back to id so a
+    /// half-rewritten index doesn't panic.
     fn cmp_rows(self, a: &(u64, String), b: &(u64, String)) -> std::cmp::Ordering {
         match self {
             TodoSort::PriorityDesc => {
@@ -302,8 +323,19 @@ impl TodoSort {
                 };
                 rank(&b.1).cmp(&rank(&a.1))
             }
-            TodoSort::CreatedAsc | TodoSort::ModifiedAsc => a.0.cmp(&b.0),
-            TodoSort::CreatedDesc | TodoSort::ModifiedDesc => b.0.cmp(&a.0),
+            TodoSort::CreatedAsc => a.0.cmp(&b.0),
+            TodoSort::CreatedDesc => b.0.cmp(&a.0),
+            TodoSort::ModifiedAsc => match (parse_updated_suffix(&a.1), parse_updated_suffix(&b.1))
+            {
+                (Some(ua), Some(ub)) => ua.cmp(ub),
+                _ => a.0.cmp(&b.0),
+            },
+            TodoSort::ModifiedDesc => {
+                match (parse_updated_suffix(&a.1), parse_updated_suffix(&b.1)) {
+                    (Some(ua), Some(ub)) => ub.cmp(ua),
+                    _ => b.0.cmp(&a.0),
+                }
+            }
         }
     }
 }
@@ -382,6 +414,11 @@ struct PanoptPane {
     /// plugin pane took focus, updated in place whenever the plugin swaps
     /// the slot itself.
     slot_pane: Option<PaneId>,
+    /// The floating `panopt search` popup pane when one is open, so the
+    /// plugin can close it from its own dispatch (avoiding a race with the
+    /// search CLI's own `zellij action close-pane` against the focus-shift
+    /// that lands on the viewer when a selection swaps). Cleared on close.
+    search_pane: Option<PaneId>,
     /// How many ad-hoc agents this instance has numbered. Only meaningful in
     /// the Todos (gatekeeper) pane, which is the only pane that handles the
     /// `panopt:spawn-agent` pipe; other panes pick up labels from the
@@ -683,6 +720,18 @@ impl ZellijPlugin for PanoptPane {
             }
             "panopt:delete-gate-decision" => {
                 self.handle_delete_decision(pipe_message.payload.as_deref());
+                true
+            }
+            "panopt:open-search" => {
+                self.spawn_search_dialog();
+                true
+            }
+            "panopt:show-result" => {
+                self.handle_search_result(pipe_message.payload.as_deref());
+                true
+            }
+            "panopt:close-search" => {
+                self.close_search_pane();
                 true
             }
             _ => false,
@@ -1043,7 +1092,13 @@ impl PanoptPane {
                     continue;
                 }
                 let id = PaneId::Terminal(p.id);
-                if p.is_focused {
+                // Floating panes - the search popup, the delete-gate and
+                // close-gate dialogs - overlay on top of the tiled layout;
+                // they are not the content the sidebar's selections route
+                // into. Keeping them out of `focused_non_plugin` is what
+                // stops e.g. `open_document` from misrouting through a
+                // search popup that briefly held focus.
+                if p.is_focused && !p.is_floating {
                     focused_non_plugin = Some(id);
                 }
                 let role = classify_pane(p.terminal_command.as_deref());
@@ -1099,6 +1154,11 @@ impl PanoptPane {
         if let Some(slot) = self.slot_pane {
             if !self.panes.iter().any(|p| p.id == slot) {
                 self.slot_pane = None;
+            }
+        }
+        if let Some(search) = self.search_pane {
+            if !self.panes.iter().any(|p| p.id == search) {
+                self.search_pane = None;
             }
         }
         if self.slot_pane.is_none() {
@@ -1480,8 +1540,15 @@ impl PanoptPane {
             // the match so `?` falls through the dismissal path on a second
             // press.
             BareKey::Char('?') => self.show_help = true,
-            // `/` is a stub - the key is reserved for future filter behavior
-            // but does nothing today.
+            // `Alt-/` opens the cockpit's popup search. The same gesture is
+            // also bound at the Zellij level for locked content panes (see
+            // up::SEARCH_BIND_TO); this arm covers focus on a sidebar plugin
+            // pane, where Zellij delivers the key directly to the plugin.
+            // Bare `/` is left as a no-op stub so it can still reach an
+            // inner program if the user's mental model expects that.
+            BareKey::Char('/') if key.key_modifiers.contains(&KeyModifier::Alt) => {
+                self.spawn_search_dialog()
+            }
             BareKey::Char('/') => {}
             _ => return false,
         }
@@ -1631,6 +1698,80 @@ impl PanoptPane {
             None,
             BTreeMap::new(),
         );
+    }
+
+    /// Spawn the cockpit-wide search popup: a floating pane running
+    /// `panopt search`. Mirrors [`Self::spawn_delete_gate_dialog`]'s shape - a
+    /// transient interactive CLI in a floating pane. The TUI pipes the
+    /// selection back via `panopt:show-result` and the sidebar plugin (here)
+    /// dispatches that to the viewer.
+    ///
+    /// Captures the spawned pane's id into [`Self::search_pane`] so
+    /// [`Self::close_search_pane`] can shut it down without racing the
+    /// search CLI's own exit (which is what made the user see Zellij's
+    /// `EXIT CODE: 0 / <ENTER> re-run` prompt). Idempotent: if a search
+    /// popup is already open, do nothing.
+    fn spawn_search_dialog(&mut self) {
+        if self.search_pane.is_some() {
+            return;
+        }
+        let Some(cwd) = self.launch_cwd() else {
+            return;
+        };
+        let args = vec![
+            "search".to_string(),
+            "--port".to_string(),
+            self.port.clone(),
+        ];
+        let pane = open_command_pane_floating(
+            CommandToRun {
+                path: PathBuf::from(&self.panopt_bin),
+                args,
+                cwd: Some(cwd),
+            },
+            None,
+            BTreeMap::new(),
+        );
+        self.search_pane = pane;
+    }
+
+    /// Close the floating search popup pane (if any) and clear the tracking
+    /// field. Used by both the show-result and close-search pipe arms.
+    fn close_search_pane(&mut self) {
+        if let Some(pane) = self.search_pane.take() {
+            close_pane_with_id(pane);
+        }
+    }
+
+    /// Handle the `panopt:show-result` pipe from `panopt search`: parse
+    /// `kind`/`id`, close the search popup, then route the chosen item into
+    /// the cockpit's viewer slot via the same path that an Enter on a
+    /// sidebar row takes. The popup close happens before `open_document`'s
+    /// focus shift so the close action lands on the search pane rather than
+    /// the (about-to-be-focused) viewer.
+    fn handle_search_result(&mut self, payload: Option<&str>) {
+        let Some(payload) = payload else { return };
+        let mut kind: Option<&str> = None;
+        let mut id: Option<u64> = None;
+        for kv in payload.split(';') {
+            let Some((k, v)) = kv.split_once('=') else {
+                continue;
+            };
+            match k {
+                "kind" => kind = Some(v),
+                "id" => id = v.parse().ok(),
+                _ => {}
+            }
+        }
+        let (Some(kind), Some(id)) = (kind, id) else {
+            return;
+        };
+        self.close_search_pane();
+        match kind {
+            "todo" => self.open_document("todo", Some(id), true),
+            "scratchpad" => self.open_document("scratchpad", Some(id), true),
+            _ => {}
+        }
     }
 
     /// Handle the `panopt:delete-gate-decision` pipe: parse `kind`/`id`/
@@ -2529,10 +2670,68 @@ mod tests {
 
     #[test]
     fn parses_a_todo_index_line() {
-        let (id, label) =
-            parse_index_line("- [ ] [#3](todos/3.md) wire the form - open, high").unwrap();
+        let (id, label) = parse_index_line(
+            "- [ ] [#3](todos/3.md) wire the form - open, high, updated 2026-05-23 18:05:21",
+        )
+        .unwrap();
         assert_eq!(id, 3);
-        assert_eq!(label, "wire the form - open, high");
+        assert_eq!(
+            label,
+            "wire the form - open, high, updated 2026-05-23 18:05:21"
+        );
+    }
+
+    #[test]
+    fn parse_priority_suffix_skips_the_trailing_updated_token() {
+        // The third token (`updated <ts>`) was added so the sidebar can sort
+        // by modified; the priority parser must keep returning the middle
+        // token rather than "high, updated 2026-...".
+        let label = "wire the form - open, high, updated 2026-05-23 18:05:21";
+        assert_eq!(parse_priority_suffix(label), Some("high"));
+        assert_eq!(parse_status_suffix(label), Some("open"));
+    }
+
+    #[test]
+    fn parse_updated_suffix_extracts_the_timestamp() {
+        let label = "wire the form - open, high, updated 2026-05-23 18:05:21";
+        assert_eq!(parse_updated_suffix(label), Some("2026-05-23 18:05:21"));
+    }
+
+    #[test]
+    fn parse_updated_suffix_returns_none_when_absent() {
+        // Stale on-disk projection (predates the timestamp) - the parser
+        // returns None so cmp_rows degrades to id ordering instead of
+        // panicking.
+        assert_eq!(parse_updated_suffix("wire the form - open, high"), None);
+        assert_eq!(parse_updated_suffix("plain title"), None);
+    }
+
+    #[test]
+    fn modified_desc_sorts_by_timestamp_not_id() {
+        // The lower-id row has the newer timestamp; ModifiedDesc must put it
+        // first. If the cmp falls back to id, this returns Greater (b before
+        // a) instead of Less, and the assertion fails.
+        let a = (
+            1u64,
+            "wire the form - open, high, updated 2026-05-29 09:00:00".to_string(),
+        );
+        let b = (
+            2u64,
+            "write readme - open, medium, updated 2026-05-21 10:00:00".to_string(),
+        );
+        assert_eq!(
+            TodoSort::ModifiedDesc.cmp_rows(&a, &b),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            TodoSort::ModifiedAsc.cmp_rows(&a, &b),
+            std::cmp::Ordering::Greater
+        );
+        // Sanity check that Created still uses id, unchanged.
+        assert_eq!(
+            TodoSort::CreatedAsc.cmp_rows(&a, &b),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

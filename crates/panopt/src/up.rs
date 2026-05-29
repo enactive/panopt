@@ -93,16 +93,6 @@ layout {
 }
 "#;
 
-/// Zellij's stock keybinding that enters scroll mode, and the cockpit's
-/// replacement. [`render_config`] rewrites the first to the second so a bare
-/// Ctrl-S is left unbound and reaches the focused pane - the todo form
-/// (`panopt todo edit`) saves on it. Scroll mode moves to Ctrl-Shift-S.
-///
-/// Zellij layouts cannot carry keybindings (`keybinds` is not a layout node),
-/// so this is applied to a generated config handed to Zellij via `--config`.
-const SCROLL_BIND_FROM: &str = r#"bind "Ctrl s" { SwitchToMode "scroll"; }"#;
-const SCROLL_BIND_TO: &str = r#"bind "Ctrl Shift s" { SwitchToMode "scroll"; }"#;
-
 /// Zellij's stock Alt-N binding opens a shell pane. The cockpit retargets it
 /// to send the `panopt:spawn-blank-pane` pipe to the Todos plugin pane,
 /// which (as cockpit gatekeeper) spawns a fresh empty-viewer pane with its
@@ -127,6 +117,17 @@ const SCROLL_BIND_TO: &str = r#"bind "Ctrl Shift s" { SwitchToMode "scroll"; }"#
 /// the filter ever fails to match.
 const NEW_PANE_BIND_FROM: &str = r#"bind "Alt n" { NewPane; }"#;
 const NEW_PANE_BIND_TO: &str = r#"bind "Alt n" { Run "zellij" "action" "pipe" "--name" "panopt:spawn-blank-pane" "--plugin-configuration" "mode=todos" { close_on_exit true; }; }"#;
+
+/// `Alt-/` opens the cockpit's popup search across todos and scratchpads. Bare
+/// `/` would intercept every search keystroke in vim, less, shells, etc. on
+/// locked content panes, so the binding wears the Alt modifier to stay clear
+/// of the inner program's namespace. There is no stock Zellij binding to
+/// retarget, so this is appended into the locked block by
+/// [`locked_extra_binds`]. The pipe is delivered to the Todos sidebar plugin,
+/// which spawns the floating `panopt search` TUI. On sidebar plugin panes
+/// (Normal mode), `Alt-/` is handled inside the plugin's own `handle_key`
+/// rather than by Zellij - so the gesture works everywhere in the cockpit.
+const SEARCH_BIND_TO: &str = r#"bind "Alt /" { Run "zellij" "action" "pipe" "--name" "panopt:open-search" "--plugin-configuration" "mode=todos" { close_on_exit true; }; }"#;
 
 /// Zellij's stock close/quit keybinds, rewritten to pipe a request to the
 /// Todos plugin pane (cockpit gatekeeper) instead of acting immediately.
@@ -232,9 +233,9 @@ pub fn run(plugin: Option<PathBuf>, host: Option<String>, port: u16) -> Result<(
         Err(e) => {
             eprintln!(
                 "warning: could not prepare the cockpit's Zellij config ({e:#}); \
-                 starting with your default keybindings - Ctrl-S in the todo form \
-                 may be swallowed by Zellij, and Alt-N opens a shell instead of a \
-                 blank viewer pane"
+                 starting with your default keybindings - Alt-N will open a shell \
+                 instead of a blank viewer pane, and scrolling / navigating out \
+                 of a locked content pane will require Ctrl-G first"
             );
             None
         }
@@ -243,7 +244,9 @@ pub fn run(plugin: Option<PathBuf>, host: Option<String>, port: u16) -> Result<(
     // `--new-session-with-layout` always creates a fresh session; plain
     // `--layout` alongside `--session` would instead try to add tabs to an
     // existing session of that name. `--config` points Zellij at the generated
-    // cockpit config, which frees Ctrl-S for panes so the todo form saves on it.
+    // cockpit config, which retargets pane-close / quit / Alt-N through the
+    // sidebar plugin, splices scroll mode and pane navigation into the locked
+    // block, and wires the copy_command helper for OSC-52 clipboard egress.
     let mut zellij = Command::new("zellij");
     zellij.arg("--session").arg(&session);
     if let Some(config) = &config {
@@ -346,16 +349,6 @@ fn render_layout(project: &Path, wasm: &Path, port: u16) -> Result<PathBuf> {
     let path = paths::cockpit_layout()?;
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
-}
-
-/// Free Ctrl-S for panes by retargeting Zellij's scroll-mode keybinding to
-/// Ctrl-Shift-S. Returns the rewritten config and whether the binding was
-/// actually found - a reformatted or unusually customized config may not carry
-/// it in the expected form.
-fn retarget_scroll_binding(base: &str) -> (String, bool) {
-    let tweaked = base.replace(SCROLL_BIND_FROM, SCROLL_BIND_TO);
-    let changed = tweaked != base;
-    (tweaked, changed)
 }
 
 /// Retarget Zellij's Alt-N keybinding to `Run` of `zellij action pipe`, which
@@ -609,10 +602,11 @@ fn grant_clipboard_in_cache(existing: &str, wasm_path: &str) -> Option<String> {
 /// plugin auto-locks a content pane. Zellij's stock dump puts these in
 /// `shared_except "locked"`, which strips them under Locked mode - without
 /// this injection a user whose focused viewer / agent pane has just been
-/// auto-locked cannot move to another pane (Alt-arrows), spawn a new one
-/// (the cockpit's rewritten Alt-N), or quit (the rewritten Ctrl-Q) without
-/// first pressing Ctrl-G to escape - and the plugin would immediately
-/// re-lock them on the next PaneUpdate.
+/// auto-locked cannot enter scroll mode for pane-bounded selection (Ctrl-S),
+/// move to another pane (Alt-arrows), spawn a new one (the cockpit's
+/// rewritten Alt-N), or quit (the rewritten Ctrl-Q) without first pressing
+/// Ctrl-G to escape - and the plugin would immediately re-lock them on the
+/// next PaneUpdate.
 ///
 /// Appending a *second* `keybinds { ... }` block does not work: Zellij only
 /// reads the first top-level `keybinds` node and silently ignores the rest
@@ -656,88 +650,34 @@ fn inject_locked_keybinds(base: &str) -> (String, bool) {
     (out, true)
 }
 
-/// Inject a `shared { ... }` block carrying global `PageUp`/`PageDown`
-/// bindings into the base config's first `keybinds` block. Directly binding
-/// the action - rather than entering scroll mode first - keeps the gesture
-/// transparent: Zellij scrolls the focused pane's scrollback and
-/// auto-returns to the bottom on the next input or output. Because
-/// `shared` applies to every mode (including locked), the bindings reach
-/// the user whether the plugin has auto-locked the pane or not, and the
-/// keypress never reaches the inner program (so Claude can't repurpose
-/// PageUp for prompt history).
-///
-/// Splice strategy mirrors [`inject_locked_keybinds`]: find the first
-/// `keybinds` node, jump to its opening `{`, balance braces to the matching
-/// close, and insert the `shared { ... }` block just before that close so
-/// it sits at the same depth as the other mode blocks.
-fn inject_page_scroll_keybinds(base: &str) -> (String, bool) {
-    let key = "keybinds";
-    let Some(kb_start) = base.find(key) else {
-        return (base.to_string(), false);
-    };
-    // The `keybinds` node may carry attributes (e.g. `clear-defaults=true`)
-    // before its opening brace; skip ahead to that brace.
-    let Some(open_offset) = base[kb_start + key.len()..].find('{') else {
-        return (base.to_string(), false);
-    };
-    let open = kb_start + key.len() + open_offset;
-    let bytes = base.as_bytes();
-    let mut depth: i32 = 0;
-    let mut close = None;
-    for (i, b) in bytes.iter().enumerate().skip(open) {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some(close) = close else {
-        return (base.to_string(), false);
-    };
-    let extras = page_scroll_shared_block();
-    let mut out = String::with_capacity(base.len() + extras.len());
-    out.push_str(&base[..close]);
-    out.push_str(&extras);
-    out.push_str(&base[close..]);
-    (out, true)
-}
-
-/// The `shared { ... }` block spliced in by [`inject_page_scroll_keybinds`].
-/// Four-space indent (one level inside the surrounding `keybinds { ... }`)
-/// to match the mode blocks already there.
-///
-/// `PageScrollUp` / `PageScrollDown` (not `ScrollUp` / `ScrollDown`) move a
-/// full visible-height page at a time, matching the gesture users expect
-/// from PageUp; the bare `ScrollUp` is a single-line action and would feel
-/// like a slow arrow-key.
-fn page_scroll_shared_block() -> String {
-    "    shared {\n        \
-        bind \"PageUp\" { PageScrollUp; }\n        \
-        bind \"PageDown\" { PageScrollDown; }\n    \
-    }\n"
-    .to_string()
-}
-
 /// The body of bindings injected into the existing locked block by
 /// [`inject_locked_keybinds`]. Indentation matches the typical eight-space
 /// inner indent of a Zellij `mode { bind ... }` body so the spliced lines
 /// sit visually alongside whatever was already there. The Alt-N and Ctrl-Q
 /// binds reuse the cockpit's pipe-gated rewrites so spawn and quit still go
-/// through the sidebar gatekeeper.
+/// through the sidebar gatekeeper. Ctrl-S mirrors Zellij's stock scroll-mode
+/// entry binding so a one-keystroke pane-bounded selection / scrollback path
+/// is available even while a content pane is auto-locked.
+///
+/// PageUp / PageDown go here (rather than a top-level `shared { ... }`
+/// block) so they only fire on the auto-locked content pane - directly
+/// binding to `PageScrollUp` / `PageScrollDown` keeps the gesture
+/// transparent (Zellij scrolls the pane's scrollback and auto-returns on
+/// next I/O) without intercepting the keys on the sidebar plugin panes,
+/// which stay in Normal mode and whose own `handle_key` page-steps the
+/// list cursor.
 fn locked_extra_binds() -> String {
     format!(
-        "        bind \"Alt Left\" {{ MoveFocusOrTab \"Left\"; }}\n        \
+        "        bind \"Ctrl s\" {{ SwitchToMode \"scroll\"; }}\n        \
+         bind \"PageUp\" {{ PageScrollUp; }}\n        \
+         bind \"PageDown\" {{ PageScrollDown; }}\n        \
+         bind \"Alt Left\" {{ MoveFocusOrTab \"Left\"; }}\n        \
          bind \"Alt Right\" {{ MoveFocusOrTab \"Right\"; }}\n        \
          bind \"Alt Up\" {{ MoveFocus \"Up\"; }}\n        \
          bind \"Alt Down\" {{ MoveFocus \"Down\"; }}\n        \
          {NEW_PANE_BIND_TO}\n        \
-         {QUIT_BIND_TO}\n    "
+         {QUIT_BIND_TO}\n        \
+         {SEARCH_BIND_TO}\n    "
     )
 }
 
@@ -832,22 +772,15 @@ fn base_zellij_config() -> Result<String> {
     String::from_utf8(out.stdout).context("`zellij setup --dump-config` produced invalid UTF-8")
 }
 
-/// Generate the cockpit's Zellij config - the user's config with Ctrl-S freed
-/// for panes so the todo form's save keybinding reaches it, and Alt-N
-/// retargeted to spawn a blank viewer pane via the sidebar plugin - write it
-/// to disk, and return its path. Regenerated on each run, so it tracks the
+/// Generate the cockpit's Zellij config - the user's config with Alt-N
+/// retargeted to spawn a blank viewer pane via the sidebar plugin, the
+/// close/quit binds gated through the sidebar, mouse mode forced on, and
+/// scroll mode + pane navigation spliced into the locked block - write it to
+/// disk, and return its path. Regenerated on each run, so it tracks the
 /// user's own config.
 fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
     let base = base_zellij_config()?;
-    let (tweaked, scroll_changed) = retarget_scroll_binding(&base);
-    if !scroll_changed {
-        eprintln!(
-            "warning: Zellij's `Ctrl s` scroll binding was not found in the \
-             expected form, so it could not be remapped; Ctrl-S in the todo \
-             form may be swallowed by Zellij"
-        );
-    }
-    let (tweaked, new_pane_changed) = retarget_new_pane_binding(&tweaked);
+    let (tweaked, new_pane_changed) = retarget_new_pane_binding(&base);
     if !new_pane_changed {
         eprintln!(
             "warning: Zellij's `Alt n` `NewPane` binding was not found in the \
@@ -890,41 +823,31 @@ fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
              before moving focus or quitting"
         );
     }
-    let (tweaked, page_scroll_injected) = inject_page_scroll_keybinds(&tweaked);
-    if !page_scroll_injected {
-        eprintln!(
-            "warning: no top-level `keybinds {{ ... }}` block was found in \
-             your Zellij config, so the cockpit could not bind PageUp / \
-             PageDown to direct scroll actions; those keys will instead \
-             reach the inner program (Claude may repurpose them for prompt \
-             history) and the scrollback gesture will not work"
-        );
-    }
     let tweaked = match copy_helper {
         Some(path) => append_copy_command_if_unset(&tweaked, path),
         None => tweaked,
     };
     let body = format!(
         "// PANopt cockpit Zellij config - generated by `panopt up`, regenerated\n\
-         // each run from your own Zellij config. Zellij's Ctrl-S (scroll mode)\n\
-         // is remapped to Ctrl-Shift-S so a bare Ctrl-S reaches panes: the todo\n\
-         // form (`panopt todo edit`) saves on it. Alt-N is retargeted to pipe\n\
-         // a `panopt:spawn-blank-pane` message to the sidebar plugin, which\n\
-         // spawns a blank viewer pane with its own routing slot. CloseFocus,\n\
-         // CloseTab, and Quit are retargeted to pipe close-request messages to\n\
-         // the sidebar, which gates them against active agents/commands/terminals.\n\
-         // `mouse_mode true` is forced so the auto-locked input mode (set by\n\
-         // the plugin when focus lands on a content pane) doesn't strand the\n\
-         // user without mouse events reaching the viewer / terminal panes.\n\
-         // Alt-arrow pane navigation plus the rewritten Alt-N and Ctrl-Q are\n\
-         // spliced into the existing `locked` block (a second top-level\n\
+         // each run from your own Zellij config. Alt-N is retargeted to pipe a\n\
+         // `panopt:spawn-blank-pane` message to the sidebar plugin, which spawns\n\
+         // a blank viewer pane with its own routing slot. CloseFocus, CloseTab,\n\
+         // and Quit are retargeted to pipe close-request messages to the sidebar,\n\
+         // which gates them against active agents/commands/terminals. `mouse_mode\n\
+         // true` is forced so the auto-locked input mode (set by the plugin when\n\
+         // focus lands on a content pane) doesn't strand the user without mouse\n\
+         // events reaching the viewer / terminal panes. Alt-arrow pane\n\
+         // navigation, Ctrl-S (scroll mode), PageUp / PageDown (direct\n\
+         // PageScrollUp / PageScrollDown), and the rewritten Alt-N and Ctrl-Q\n\
+         // are spliced into the existing `locked` block (a second top-level\n\
          // `keybinds` block does not work - Zellij only reads the first one),\n\
-         // so the user can leave a content pane, spawn a new one, or quit\n\
-         // without a Ctrl-G escape that would just be re-locked on the next\n\
-         // PaneUpdate. PageUp / PageDown go into a `shared {{ ... }}` block\n\
-         // so they hit ScrollUp/ScrollDown directly in every mode - the\n\
-         // pane's Zellij scrollback scrolls and auto-returns on next I/O,\n\
-         // and the keys never reach the inner program.\n\
+         // so the user can scroll, select, page through scrollback, leave the\n\
+         // pane, spawn a new one, or quit without a Ctrl-G escape that would\n\
+         // just be re-locked on the next PaneUpdate. PageUp / PageDown live in\n\
+         // the locked block rather than a top-level `shared {{ ... }}` so they\n\
+         // only intercept on auto-locked content panes; sidebar plugin panes\n\
+         // stay in Normal mode and receive the keys directly, where the\n\
+         // plugin's own `handle_key` page-steps the list cursor.\n\
          {tweaked}"
     );
     let path = paths::cockpit_config()?;
@@ -936,9 +859,8 @@ fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
 mod tests {
     use super::{
         append_copy_command_if_unset, ensure_mouse_mode_enabled, grant_clipboard_in_cache,
-        inject_locked_keybinds, inject_page_scroll_keybinds, retarget_close_bindings,
-        retarget_new_pane_binding, retarget_scroll_binding, session_name, strip_ansi,
-        LAYOUT_TEMPLATE,
+        inject_locked_keybinds, retarget_close_bindings, retarget_new_pane_binding, session_name,
+        strip_ansi, LAYOUT_TEMPLATE,
     };
     use std::path::Path;
 
@@ -962,28 +884,6 @@ mod tests {
     #[test]
     fn strip_ansi_removes_escape_sequences() {
         assert_eq!(strip_ansi("\u{1b}[32;1mname\u{1b}[m rest"), "name rest");
-    }
-
-    #[test]
-    fn retarget_scroll_binding_moves_ctrl_s_to_ctrl_shift_s() {
-        let base = "    bind \"Ctrl s\" { SwitchToMode \"scroll\"; }\n";
-        let (tweaked, changed) = retarget_scroll_binding(base);
-        assert!(changed);
-        assert_eq!(
-            tweaked,
-            "    bind \"Ctrl Shift s\" { SwitchToMode \"scroll\"; }\n"
-        );
-        // The scroll-mode exit binding (`Ctrl s` -> normal) is a different
-        // string and must be left untouched.
-        let exit = "bind \"Ctrl s\" { SwitchToMode \"normal\"; }";
-        assert_eq!(retarget_scroll_binding(exit), (exit.to_string(), false));
-    }
-
-    #[test]
-    fn retarget_scroll_binding_reports_when_absent() {
-        let (text, changed) = retarget_scroll_binding("keybinds {}\n");
-        assert!(!changed);
-        assert_eq!(text, "keybinds {}\n");
     }
 
     #[test]
@@ -1209,29 +1109,45 @@ keybinds clear-defaults=true {
         let (out, ok) = inject_locked_keybinds(base);
         assert!(ok);
         assert!(out.contains(r#"bind "Ctrl g" { SwitchToMode "normal"; }"#));
+        assert!(out.contains(r#"bind "Ctrl s" { SwitchToMode "scroll"; }"#));
+        // PageUp/PageDown are bound to direct scroll actions inside the
+        // locked block (rather than a top-level `shared` block) so they
+        // only intercept on auto-locked content panes - sidebar plugin
+        // panes stay in Normal mode and receive the keys themselves.
+        assert!(out.contains(r#"bind "PageUp" { PageScrollUp; }"#));
+        assert!(out.contains(r#"bind "PageDown" { PageScrollDown; }"#));
         assert!(out.contains(r#"bind "Alt Left" { MoveFocusOrTab "Left"; }"#));
         assert!(out.contains(r#"bind "Alt Right" { MoveFocusOrTab "Right"; }"#));
         assert!(out.contains(r#"bind "Alt Up" { MoveFocus "Up"; }"#));
         assert!(out.contains(r#"bind "Alt Down" { MoveFocus "Down"; }"#));
-        // The cockpit-rewritten Alt-N and Ctrl-Q binds use the same pipe
-        // form they have outside locked so the gatekeeper still sees them.
+        // The cockpit-rewritten Alt-N and Ctrl-Q binds plus the popup-search
+        // `/` bind use the same pipe form they have outside locked so the
+        // gatekeeper still sees them.
         assert!(out.contains(r#""panopt:spawn-blank-pane""#));
         assert!(out.contains(r#""panopt:quit-request""#));
+        assert!(out.contains(r#""panopt:open-search""#));
         // Each pipe binding includes its gatekeeper narrowing once.
         assert_eq!(
             out.matches(r#""--plugin-configuration" "mode=todos""#)
                 .count(),
-            2
+            3
         );
         // The splice lands inside the `locked` block, not after it. The
         // locked block in the fixture is followed by `shared_except`, so
         // every spliced bind must appear before that header.
         let alt_left = out.find(r#"bind "Alt Left""#).unwrap();
+        let page_up = out.find(r#"bind "PageUp""#).unwrap();
         let shared_except = out.find("shared_except").unwrap();
         assert!(
             alt_left < shared_except,
             "Alt Left bind must be spliced inside the locked block, before \
              the next mode block starts"
+        );
+        assert!(
+            page_up < shared_except,
+            "PageUp bind must land inside the locked block - if it leaks \
+             into a `shared` block it will intercept on sidebar plugin \
+             panes too and the plugin's page-step handler will never fire"
         );
     }
 
@@ -1262,57 +1178,6 @@ keybinds {
         assert!(!ok);
         // The base is returned unchanged when there is nothing to splice into.
         assert_eq!(out, "keybinds {\n    normal {}\n}\n");
-    }
-
-    #[test]
-    fn inject_page_scroll_keybinds_splices_a_shared_block() {
-        let base = "\
-keybinds clear-defaults=true {
-    locked {
-        bind \"Ctrl g\" { SwitchToMode \"normal\"; }
-    }
-    normal {
-        bind \"Ctrl p\" { SwitchToMode \"pane\"; }
-    }
-}
-";
-        let (out, ok) = inject_page_scroll_keybinds(base);
-        assert!(ok);
-        // PageUp/PageDown go to direct scroll actions, not into scroll mode -
-        // so they don't enter a modal state and auto-return on next I/O.
-        assert!(out.contains(r#"bind "PageUp" { PageScrollUp; }"#));
-        assert!(out.contains(r#"bind "PageDown" { PageScrollDown; }"#));
-        // The block lives inside the top-level `keybinds` body so Zellij's
-        // parser actually picks it up (a second top-level `keybinds` block
-        // would be silently ignored - see the note in render_config).
-        assert!(out.contains("shared {"));
-        let shared = out.find("shared {").unwrap();
-        let keybinds_open = out.find("keybinds").unwrap();
-        let last_brace = out.rfind('}').unwrap();
-        assert!(keybinds_open < shared && shared < last_brace);
-        // The pre-existing mode blocks survive.
-        assert!(out.contains(r#"bind "Ctrl g""#));
-        assert!(out.contains(r#"bind "Ctrl p""#));
-    }
-
-    #[test]
-    fn inject_page_scroll_keybinds_handles_clear_defaults_attribute() {
-        // The `clear-defaults=true` attribute sits between `keybinds` and its
-        // opening `{`; the brace finder must skip past it rather than match
-        // an `=` or `t` as a structural character.
-        let base = "keybinds clear-defaults=true {\n    locked {}\n}\n";
-        let (out, ok) = inject_page_scroll_keybinds(base);
-        assert!(ok);
-        assert!(out.contains(r#"bind "PageUp" { PageScrollUp; }"#));
-        assert!(out.contains(r#"bind "PageDown" { PageScrollDown; }"#));
-    }
-
-    #[test]
-    fn inject_page_scroll_keybinds_reports_when_no_keybinds_block() {
-        let base = "themes { Catppuccin {} }\n";
-        let (out, ok) = inject_page_scroll_keybinds(base);
-        assert!(!ok);
-        assert_eq!(out, base);
     }
 
     #[test]

@@ -361,6 +361,62 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Search a project's scratchpads, returning `(id, title)` pairs in the
+    /// same shape as [`Store::scratchpad_list`].
+    ///
+    /// `query` substring-matches `title`/`body` case-insensitively at the SQL
+    /// layer; `require_tags` is applied in Rust against the JSON tag column
+    /// (AND semantics), matching the parse-in-Rust pattern that
+    /// [`Store::tags_list`] uses for the same column. With no filters this is
+    /// equivalent to `scratchpad_list`.
+    pub fn scratchpad_search(
+        &self,
+        project: ProjectId,
+        query: Option<&str>,
+        require_tags: &[String],
+    ) -> Result<Vec<(u64, String)>, CoreError> {
+        let mut sql = String::from(
+            "SELECT id, title, tags FROM scratchpads \
+             WHERE project_id = ?1 AND deleted_at IS NULL",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project.0)];
+        if let Some(q) = query {
+            let pat = format!("%{}%", q.to_lowercase());
+            sql.push_str(&format!(
+                " AND (LOWER(title) LIKE ?{0} OR LOWER(body) LIKE ?{0})",
+                binds.len() + 1
+            ));
+            binds.push(Box::new(pat));
+        }
+        sql.push_str(" ORDER BY id");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        let rows: Vec<(u64, String, String)> = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, tags_json)| {
+                if require_tags.is_empty() {
+                    return true;
+                }
+                let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+                require_tags
+                    .iter()
+                    .all(|wanted| tags.iter().any(|got| got == wanted))
+            })
+            .map(|(id, title, _)| (id, title))
+            .collect())
+    }
+
     /// Append `content` to a scratchpad, separating it from existing content
     /// with a single newline.
     pub fn scratchpad_append(
@@ -899,6 +955,81 @@ impl Store {
         ids.into_iter()
             .map(|id| self.fetch_todo(project, id))
             .collect()
+    }
+
+    /// Search a project's todos, returning the same fully-hydrated
+    /// [`Todo`] shape as [`Store::todo_list`].
+    ///
+    /// `query` substring-matches `title`/`body` case-insensitively at the SQL
+    /// layer; `status`, `priority`, and `assignee` are equality predicates
+    /// (assignee is case-insensitive, the others compare against the canonical
+    /// token from [`TodoStatus::as_str`] / [`Priority::as_str`]); and
+    /// `require_tags` is applied in Rust after hydration (AND semantics),
+    /// since tags are stored as a JSON-encoded column. With every filter
+    /// absent or empty this matches `todo_list` exactly.
+    pub fn todo_search(
+        &self,
+        project: ProjectId,
+        query: Option<&str>,
+        status: Option<TodoStatus>,
+        priority: Option<Priority>,
+        assignee: Option<&str>,
+        require_tags: &[String],
+    ) -> Result<Vec<Todo>, CoreError> {
+        let mut sql = String::from(
+            "SELECT id FROM todos \
+             WHERE project_id = ?1 AND deleted_at IS NULL",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project.0)];
+        if let Some(q) = query {
+            let pat = format!("%{}%", q.to_lowercase());
+            sql.push_str(&format!(
+                " AND (LOWER(title) LIKE ?{0} OR LOWER(body) LIKE ?{0})",
+                binds.len() + 1
+            ));
+            binds.push(Box::new(pat));
+        }
+        if let Some(s) = status {
+            sql.push_str(&format!(" AND status = ?{}", binds.len() + 1));
+            binds.push(Box::new(s.as_str().to_string()));
+        }
+        if let Some(p) = priority {
+            sql.push_str(&format!(" AND priority = ?{}", binds.len() + 1));
+            binds.push(Box::new(p.as_str().to_string()));
+        }
+        if let Some(a) = assignee {
+            sql.push_str(&format!(
+                " AND LOWER(assignee) = LOWER(?{})",
+                binds.len() + 1
+            ));
+            binds.push(Box::new(a.to_string()));
+        }
+        sql.push_str(" ORDER BY id");
+
+        let ids: Vec<u64> = {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+                |r| Ok(r.get::<_, i64>(0)? as u64),
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let todos: Vec<Todo> = ids
+            .into_iter()
+            .map(|id| self.fetch_todo(project, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        if require_tags.is_empty() {
+            Ok(todos)
+        } else {
+            Ok(todos
+                .into_iter()
+                .filter(|t| {
+                    require_tags
+                        .iter()
+                        .all(|wanted| t.tags.iter().any(|got| got == wanted))
+                })
+                .collect())
+        }
     }
 
     /// Fetch one todo in full, or [`CoreError::TodoNotFound`] if it is absent.

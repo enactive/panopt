@@ -125,6 +125,14 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         schema_fn: schema_for_no_args,
     },
     ToolDef {
+        name: "scratchpad_search",
+        description: "Find scratchpads. Optional `query` substring-matches title and body \
+                      (case-insensitive). Optional `tags` requires every listed tag to be \
+                      present (AND semantics). Returns the same {id, title} shape as \
+                      scratchpad_list; an empty-arg call is equivalent to scratchpad_list.",
+        schema_fn: schema_for::<ScratchpadSearchArgs>,
+    },
+    ToolDef {
         name: "scratchpad_append",
         description: "Append text to an existing scratchpad, addressed by numeric id.",
         schema_fn: schema_for::<ScratchpadAppendArgs>,
@@ -172,6 +180,16 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
                       assignee, tags, blockers, comment_count, created_at, updated_at}. \
                       Use todo_get for a todo's body and comment thread.",
         schema_fn: schema_for_no_args,
+    },
+    ToolDef {
+        name: "todo_search",
+        description: "Find todos. Optional `query` substring-matches title and body \
+                      (case-insensitive). Optional status/priority/assignee narrow by \
+                      exact match (assignee is case-insensitive); pass an empty assignee \
+                      string to find unassigned todos. Optional `tags` requires every \
+                      listed tag (AND semantics). Returns the same shape as todo_list; \
+                      an empty-arg call is equivalent to todo_list.",
+        schema_fn: schema_for::<TodoSearchArgs>,
     },
     ToolDef {
         name: "todo_get",
