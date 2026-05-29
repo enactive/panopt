@@ -1540,14 +1540,23 @@ impl PanoptPane {
             // the match so `?` falls through the dismissal path on a second
             // press.
             BareKey::Char('?') => self.show_help = true,
-            // `Alt-/` opens the cockpit's popup search. The same gesture is
-            // also bound at the Zellij level for locked content panes (see
-            // up::SEARCH_BIND_TO); this arm covers focus on a sidebar plugin
-            // pane, where Zellij delivers the key directly to the plugin.
+            // `Alt-/` opens the cockpit's popup search. Both the Zellij-level
+            // keybind for locked content panes (see up::SEARCH_BIND_TO) and
+            // this sidebar-pane arm forward to the Todos plugin instance,
+            // which is the canonical owner of the popup's lifecycle (see the
+            // invariant comment on `pipe()`). Spawning the popup locally on
+            // a non-Todos instance would store `search_pane` on the wrong
+            // instance, leaving the `panopt:close-search` / `panopt:show-
+            // result` pipes - both filtered to `mode=todos` - unable to
+            // reach the holder, so Esc and Enter would silently no-op.
             // Bare `/` is left as a no-op stub so it can still reach an
             // inner program if the user's mental model expects that.
             BareKey::Char('/') if key.key_modifiers.contains(&KeyModifier::Alt) => {
-                self.spawn_search_dialog()
+                pipe_message_to_plugin(
+                    MessageToPlugin::new("panopt:open-search").with_plugin_config(BTreeMap::from(
+                        [("mode".to_string(), "todos".to_string())],
+                    )),
+                );
             }
             BareKey::Char('/') => {}
             _ => return false,
