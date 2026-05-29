@@ -2084,6 +2084,15 @@ impl PanoptPane {
         let Some(target) = self.slot_pane else {
             return;
         };
+        // Closing the last visible right-side pane would leave the user with
+        // no content slot and no obvious way to summon one back - the sidebar
+        // swap-in-place model assumes a slot exists. Refuse absolutely, same
+        // shape as the sidebar refusal above; no override dialog (the dialog's
+        // confirm path would otherwise bypass this check).
+        if self.visible_content_panes_in_focused_tab() <= 1 {
+            self.refuse_gate("cannot close the last content pane");
+            return;
+        }
         if let Some(item) = self.pane_active(target) {
             self.spawn_close_gate_dialog("focus", Some(target), &[item]);
             return;
@@ -2264,6 +2273,23 @@ impl PanoptPane {
             .iter()
             .filter_map(|p| self.pane_active(p.id))
             .collect()
+    }
+
+    /// Count right-side content panes currently on screen in the focused tab.
+    /// Plugin panes are `PaneId::Plugin` and excluded by construction, so a
+    /// non-suppressed, non-exited `PaneId::Terminal` is by definition a
+    /// right-side pane. Used by [`PanoptPane::gate_close_focus`] to refuse the
+    /// last-pane close that would leave the sidebar with no swap target.
+    fn visible_content_panes_in_focused_tab(&self) -> usize {
+        let Some(tab) = self.focused_tab else {
+            return 0;
+        };
+        self.panes
+            .iter()
+            .filter(|p| p.tab == tab)
+            .filter(|p| matches!(p.id, PaneId::Terminal(_)))
+            .filter(|p| !p.suppressed && !p.exited)
+            .count()
     }
 
     fn refuse_gate(&mut self, reason: &str) {
