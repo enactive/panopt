@@ -34,8 +34,8 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::mcpclient::Client;
 use crate::todo_form::{
-    body_input, highlight_line, paste_into, paste_into_single_line, select_to_column,
-    selected_text, single_line_input, text_area,
+    body_input, field_border_color, highlight_line, paste_into, paste_into_single_line,
+    select_to_column, selected_text, single_line_input, text_area,
 };
 
 /// What [`ScratchpadForm::handle_key`] is telling the host to do next.
@@ -737,11 +737,7 @@ impl ScratchpadForm {
     /// `tui_textarea` limitation drove this widget here.
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Field::Body;
-        let border = if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
+        let border = field_border_color(focused);
         let block = Block::bordered()
             .title("Body")
             .border_style(Style::default().fg(border));
@@ -811,11 +807,7 @@ impl ScratchpadForm {
             Field::Tags => &mut self.tags,
             Field::Body => return,
         };
-        let border = if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
+        let border = field_border_color(focused);
         area.set_block(
             Block::bordered()
                 .title(label)

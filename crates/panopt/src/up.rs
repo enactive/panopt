@@ -191,6 +191,52 @@ const QUIT_BIND_TO: &str = r#"bind "Ctrl q" { Run "zellij" "action" "pipe" "--na
 const MOUSE_MODE_OFF: &str = "mouse_mode false";
 const MOUSE_MODE_ON: &str = "mouse_mode true";
 
+/// Frame coloring is the cockpit's focus cue, so pane frames must be on.
+/// Zellij defaults `pane_frames` to true; [`ensure_pane_frames_enabled`] only
+/// has to undo an explicit opt-out.
+const PANE_FRAMES_OFF: &str = "pane_frames false";
+const PANE_FRAMES_ON: &str = "pane_frames true";
+
+/// Name of the focus-emphasis theme the cockpit defines and activates.
+const FOCUS_THEME_NAME: &str = "panopt";
+
+/// The `panopt` theme body, indented to sit inside a `themes { ... }` block.
+/// It is a *partial* theme: only the three frame components are set, so every
+/// other color falls back to Zellij's default theme. The focused pane's border
+/// (`frame_selected`) is loud and `frame_unselected` is dim, so focus reads at
+/// a glance and the other panes recede - this is the only focus signal Zellij
+/// paints uniformly on every pane (sidebar plugin, viewer, and agent shells
+/// alike), since it has no active/inactive pane *background* styling. Each
+/// component must carry `base` plus `emphasis_0..3` (Zellij 0.44 theme schema;
+/// `background` is omitted because Zellij ignores it on pane frames - a frame
+/// `background` fill simply does not render, so the focused frame can only be a
+/// single-line border in the `base` color, with no double/thick/filled option.
+/// Emphasis on contrast: `base` bright, `frame_unselected` dim).
+const FOCUS_THEME_DEF: &str = r##"    panopt {
+        frame_selected {
+            base "#00ffff"
+            emphasis_0 "#ff5000"
+            emphasis_1 "#ff5000"
+            emphasis_2 "#ff5000"
+            emphasis_3 "#ff5000"
+        }
+        frame_highlight {
+            base "#ff4444"
+            emphasis_0 "#ff5000"
+            emphasis_1 "#ff5000"
+            emphasis_2 "#ff5000"
+            emphasis_3 "#ff5000"
+        }
+        frame_unselected {
+            base "#444444"
+            emphasis_0 "#444444"
+            emphasis_1 "#444444"
+            emphasis_2 "#444444"
+            emphasis_3 "#444444"
+        }
+    }
+"##;
+
 /// `panopt up` - ensure the daemon, then create or attach this project's
 /// cockpit Zellij session.
 ///
@@ -741,6 +787,110 @@ fn ensure_mouse_mode_enabled(base: &str) -> String {
     out
 }
 
+/// Force pane frames on. The cockpit signals focus through the focused pane's
+/// frame color (see [`apply_focus_theme`]), which is invisible with frames off.
+/// Zellij's stock default is already on, so this only rewrites an explicit
+/// `pane_frames false`; an unset config keeps the on-by-default behavior.
+fn ensure_pane_frames_enabled(base: &str) -> String {
+    base.replace(PANE_FRAMES_OFF, PANE_FRAMES_ON)
+}
+
+/// Make the focused pane unmistakable by defining and activating the cockpit's
+/// `panopt` frame theme - unless the user has chosen their own theme, in which
+/// case we leave it alone (activating ours would swap every non-frame color
+/// back to Zellij's default, since our theme is intentionally partial). When
+/// skipped, the returned `Option` carries the user's theme name so the caller
+/// can explain the gap.
+///
+/// When applying: the `panopt` theme body is spliced into an existing
+/// top-level `themes { ... }` block if the base config has one (Zellij reads
+/// only the *first* such block, so a second appended block would be silently
+/// ignored - the same gotcha as keybinds), otherwise a fresh `themes` block is
+/// appended. Either way a `theme "panopt"` directive is appended to activate it.
+fn apply_focus_theme(base: &str) -> (String, Option<String>) {
+    if let Some(name) = active_theme_name(base) {
+        return (base.to_string(), Some(name));
+    }
+    let with_def = match splice_into_themes_block(base, FOCUS_THEME_DEF) {
+        Some(spliced) => spliced,
+        None => {
+            let mut out = String::from(base);
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("themes {\n");
+            out.push_str(FOCUS_THEME_DEF);
+            out.push_str("}\n");
+            out
+        }
+    };
+    let mut out = with_def;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("theme \"{FOCUS_THEME_NAME}\"\n"));
+    (out, None)
+}
+
+/// The name in an *active* (uncommented) top-level `theme "<name>"` directive,
+/// or `None` when the base config leaves the theme at Zellij's default - the
+/// stock dump keeps that line commented. The trailing space in the `theme `
+/// prefix keeps `theme_dir` from matching.
+fn active_theme_name(base: &str) -> Option<String> {
+    base.lines().find_map(|line| {
+        let line = line.trim_start();
+        if line.starts_with("//") {
+            return None;
+        }
+        let rest = line.strip_prefix("theme ")?.trim_start();
+        let inner = rest.strip_prefix('"')?;
+        let end = inner.find('"')?;
+        Some(inner[..end].to_string())
+    })
+}
+
+/// Splice `def` (an indented `name { ... }` theme body) in just before the
+/// closing brace of the first top-level `themes {` block, returning the new
+/// config - or `None` when the base config has no such block. Walks from the
+/// block's opening brace and balances braces to find its matching close, the
+/// same hand-rolled approach [`inject_locked_keybinds`] uses (no KDL-parser
+/// dep). Only the *first* `themes` block is honored by Zellij, so that is the
+/// one we extend.
+fn splice_into_themes_block(base: &str, def: &str) -> Option<String> {
+    let key = "themes {";
+    let start = base.find(key)?;
+    // Skip a commented occurrence (`// themes {`): require the line to start
+    // with `themes` after trimming, otherwise keep looking is overkill - the
+    // dumped config never comments a `themes {` header, and a user one is
+    // uncommented. Guard the obvious comment case all the same.
+    let line_start = base[..start].rfind('\n').map_or(0, |i| i + 1);
+    if base[line_start..start].trim_start().starts_with("//") {
+        return None;
+    }
+    let open = start + key.len() - 1;
+    let mut depth: i32 = 0;
+    let mut close = None;
+    for (i, b) in base.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let mut out = String::with_capacity(base.len() + def.len());
+    out.push_str(&base[..close]);
+    out.push_str(def);
+    out.push_str(&base[close..]);
+    Some(out)
+}
+
 /// Retarget every CloseFocus/CloseTab/Quit keybind to `Run` of
 /// `zellij action pipe`, sending the request to the sidebar plugin instead of
 /// acting immediately. The plugin gates these against active items and either
@@ -867,6 +1017,18 @@ fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
         Some(path) => append_copy_command_if_unset(&tweaked, path),
         None => tweaked,
     };
+    let tweaked = ensure_pane_frames_enabled(&tweaked);
+    let (tweaked, user_theme) = apply_focus_theme(&tweaked);
+    if let Some(name) = user_theme {
+        eprintln!(
+            "warning: your Zellij config sets `theme \"{name}\"`, so the cockpit \
+             left it untouched and did not apply its focus-emphasis frame \
+             colors (activating the cockpit theme would override that theme's \
+             other colors); to brighten the focused-pane border, copy the \
+             `frame_selected` / `frame_unselected` colors from panopt's \
+             `panopt` theme into \"{name}\""
+        );
+    }
     let body = format!(
         "// PANopt cockpit Zellij config - generated by `panopt up`, regenerated\n\
          // each run from your own Zellij config. Alt-N is retargeted to pipe a\n\
@@ -887,7 +1049,11 @@ fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
          // the locked block rather than a top-level `shared {{ ... }}` so they\n\
          // only intercept on auto-locked content panes; sidebar plugin panes\n\
          // stay in Normal mode and receive the keys directly, where the\n\
-         // plugin's own `handle_key` page-steps the list cursor.\n\
+         // plugin's own `handle_key` page-steps the list cursor. Finally a\n\
+         // `panopt` theme is appended and activated (unless you set your own\n\
+         // theme): it overrides only the frame colors so the focused pane's\n\
+         // border is loud and unfocused ones recede, with `pane_frames` forced\n\
+         // on so that cue is visible.\n\
          {tweaked}"
     );
     let path = paths::cockpit_config()?;
@@ -898,9 +1064,10 @@ fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_copy_command_if_unset, ensure_mouse_mode_enabled, grant_clipboard_in_cache,
+        active_theme_name, append_copy_command_if_unset, apply_focus_theme,
+        ensure_mouse_mode_enabled, ensure_pane_frames_enabled, grant_clipboard_in_cache,
         inject_locked_keybinds, retarget_close_bindings, retarget_new_pane_binding, session_name,
-        strip_ansi, LAYOUT_TEMPLATE,
+        splice_into_themes_block, strip_ansi, FOCUS_THEME_NAME, LAYOUT_TEMPLATE,
     };
     use std::path::Path;
 
@@ -924,6 +1091,69 @@ mod tests {
     #[test]
     fn strip_ansi_removes_escape_sequences() {
         assert_eq!(strip_ansi("\u{1b}[32;1mname\u{1b}[m rest"), "name rest");
+    }
+
+    #[test]
+    fn ensure_pane_frames_flips_an_explicit_off() {
+        assert_eq!(
+            ensure_pane_frames_enabled("pane_frames false\n"),
+            "pane_frames true\n"
+        );
+        // Unset config keeps Zellij's on-by-default; nothing to rewrite.
+        let unset = "default_mode \"normal\"\n";
+        assert_eq!(ensure_pane_frames_enabled(unset), unset);
+    }
+
+    #[test]
+    fn active_theme_name_ignores_the_commented_default() {
+        // The stock dump keeps the theme line commented - treated as unset.
+        assert_eq!(active_theme_name("// theme \"dracula\"\n"), None);
+        // `theme_dir` must not be mistaken for a theme directive.
+        assert_eq!(active_theme_name("theme_dir \"/tmp\"\n"), None);
+        assert_eq!(
+            active_theme_name("theme \"dracula\"\n").as_deref(),
+            Some("dracula")
+        );
+    }
+
+    #[test]
+    fn apply_focus_theme_activates_when_user_has_none() {
+        // No active theme: define + activate the cockpit's frame theme.
+        let (out, skipped) = apply_focus_theme("// theme \"dracula\"\n");
+        assert!(skipped.is_none());
+        assert!(out.contains(&format!("theme \"{FOCUS_THEME_NAME}\"")));
+        assert!(out.contains("frame_selected"));
+        assert!(out.contains("frame_unselected"));
+        // A fresh themes block, since the base had none.
+        assert!(out.contains("themes {"));
+    }
+
+    #[test]
+    fn apply_focus_theme_respects_a_user_theme() {
+        let base = "theme \"dracula\"\n";
+        let (out, skipped) = apply_focus_theme(base);
+        // Left untouched, and the caller is told which theme blocked it.
+        assert_eq!(out, base);
+        assert_eq!(skipped.as_deref(), Some("dracula"));
+    }
+
+    #[test]
+    fn apply_focus_theme_splices_into_an_existing_themes_block() {
+        // A user themes block exists; Zellij reads only the first one, so the
+        // cockpit theme must land *inside* it rather than in a second block.
+        let base = "themes {\n    mine {\n        text_unselected { base \"#fff\"; }\n    }\n}\n";
+        let (out, skipped) = apply_focus_theme(base);
+        assert!(skipped.is_none());
+        // Exactly one themes block - ours was spliced, not appended.
+        assert_eq!(out.matches("themes {").count(), 1);
+        assert!(out.contains("mine {"));
+        assert!(out.contains("panopt {"));
+        assert!(out.contains(&format!("theme \"{FOCUS_THEME_NAME}\"")));
+    }
+
+    #[test]
+    fn splice_into_themes_block_reports_when_absent() {
+        assert!(splice_into_themes_block("default_mode \"normal\"\n", "    x {}\n").is_none());
     }
 
     #[test]

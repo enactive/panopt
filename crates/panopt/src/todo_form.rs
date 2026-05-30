@@ -1465,11 +1465,7 @@ impl TodoForm {
     /// visual representation is ours.
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         let focused = FIELDS[self.focus] == Field::Body;
-        let border = if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
+        let border = field_border_color(focused);
         let block = Block::bordered()
             .title("Body")
             .border_style(Style::default().fg(border));
@@ -1534,11 +1530,7 @@ impl TodoForm {
 
     fn draw_comments(&mut self, frame: &mut Frame, area: Rect) {
         let focused = FIELDS[self.focus] == Field::Comments;
-        let border = if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
+        let border = field_border_color(focused);
         let block = Block::bordered()
             .title(format!("Comments ({})", self.comments.len()))
             .border_style(Style::default().fg(border));
@@ -1739,11 +1731,7 @@ impl TodoForm {
             | Field::Comments
             | Field::Blockers => return,
         };
-        let border = if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
+        let border = field_border_color(focused);
         area.set_block(
             Block::bordered()
                 .title(label)
@@ -1797,6 +1785,20 @@ pub(crate) fn text_area(initial: &str) -> TextArea<'static> {
 /// Render a cyclable enum field as a one-line `Label: < value >`.
 fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
     Paragraph::new(format!(" {label}: < {value} >")).style(label_style(focused))
+}
+
+/// Border color for a bordered form field, keyed on whether it has focus.
+/// Shared by both the todo and scratchpad forms (Title, Body, Comments, Tags).
+/// The focused field takes the accent; every unfocused border drops to a dim
+/// `#444444` so the focused field stands alone and the rest recede. An absolute
+/// RGB, rather than `Color::DarkGray`, keeps the de-emphasis from being undone
+/// by a terminal palette that renders the gray ANSI slot bright.
+pub(crate) fn field_border_color(focused: bool) -> Color {
+    if focused {
+        Color::Yellow
+    } else {
+        Color::Rgb(0x44, 0x44, 0x44)
+    }
 }
 
 /// Style for an inline field's leading label. Matches `enum_line`'s palette so
