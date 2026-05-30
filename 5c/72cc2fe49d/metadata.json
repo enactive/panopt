@@ -1,0 +1,52 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "5c72cc2fe49d",
+  "strategy": "manual-commit",
+  "branch": "todo-110-sidebar-focus-hotkeys",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "CLAUDE.md",
+    "DESIGN.md",
+    "README.md",
+    "crates/panopt-core/src/db.rs",
+    "crates/panopt-core/src/error.rs",
+    "crates/panopt-core/src/lib.rs",
+    "crates/panopt-core/src/model.rs",
+    "crates/panopt-core/src/projection.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/delete_gate.rs",
+    "crates/panopt/src/id_kind.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/note.rs",
+    "crates/panopt/src/note_form.rs",
+    "crates/panopt/src/scratchpad.rs",
+    "crates/panopt/src/scratchpad_form.rs",
+    "crates/panopt/src/search.rs",
+    "crates/panopt/src/todo.rs",
+    "crates/panopt/src/todo_form.rs",
+    "crates/panopt/src/up.rs",
+    "crates/panopt/src/viewer.rs",
+    "crates/panopt/src/viewstate.rs",
+    "crates/panopt/src/wrap.rs",
+    "crates/panoptd/src/handler.rs",
+    "panopt.kdl"
+  ],
+  "sessions": [
+    {
+      "metadata": "/5c/72cc2fe49d/0/metadata.json",
+      "transcript": "/5c/72cc2fe49d/0/full.jsonl",
+      "content_hash": "/5c/72cc2fe49d/0/content_hash.txt",
+      "prompt": "/5c/72cc2fe49d/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 6093,
+    "cache_creation_tokens": 312685,
+    "cache_read_tokens": 6641689,
+    "output_tokens": 47371,
+    "api_call_count": 66
+  }
+}

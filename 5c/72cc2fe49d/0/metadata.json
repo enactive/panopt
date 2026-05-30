@@ -1,0 +1,89 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "5c72cc2fe49d",
+  "session_id": "66d6f6a0-abfa-473c-a7f3-a48a7277dbac",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-30T07:20:41.25067359Z",
+  "branch": "todo-110-sidebar-focus-hotkeys",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "CLAUDE.md",
+    "DESIGN.md",
+    "README.md",
+    "crates/panopt-core/src/db.rs",
+    "crates/panopt-core/src/error.rs",
+    "crates/panopt-core/src/lib.rs",
+    "crates/panopt-core/src/model.rs",
+    "crates/panopt-core/src/projection.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/delete_gate.rs",
+    "crates/panopt/src/id_kind.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/note.rs",
+    "crates/panopt/src/note_form.rs",
+    "crates/panopt/src/scratchpad.rs",
+    "crates/panopt/src/scratchpad_form.rs",
+    "crates/panopt/src/search.rs",
+    "crates/panopt/src/todo.rs",
+    "crates/panopt/src/todo_form.rs",
+    "crates/panopt/src/up.rs",
+    "crates/panopt/src/viewer.rs",
+    "crates/panopt/src/viewstate.rs",
+    "crates/panopt/src/wrap.rs",
+    "crates/panoptd/src/handler.rs",
+    "panopt.kdl"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "0a1c82ed481f",
+  "checkpoint_transcript_start": 87,
+  "transcript_lines_at_start": 87,
+  "token_usage": {
+    "input_tokens": 6093,
+    "cache_creation_tokens": 312685,
+    "cache_read_tokens": 6641689,
+    "output_tokens": 47371,
+    "api_call_count": 66
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-30T07:20:41.216220645Z",
+    "agent_lines": 1867,
+    "agent_removed": 1760,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1867,
+    "total_lines_changed": 3627,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1868,
+      "agent_lines_removed": 1760
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1868,
+      "agent_lines_removed": 1760
+    }
+  ]
+}
