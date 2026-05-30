@@ -30,7 +30,7 @@ Logs: `~/.local/share/panopt/panoptd.log` (tail with `just logs`). Database: `~/
 
 ## Invariants
 
-- **One per-project id counter (`projects.next_id`) is shared across todos, scratchpads, agent tools, and processes**, not derived from `MAX(id)`. A `#N` reference resolves to exactly one resource. Deleting the highest-numbered item must not free that id for reuse. See `db.rs` schema notes.
+- **One per-project id counter (`projects.next_id`) is shared across todos, notes, agent tools, and processes**, not derived from `MAX(id)`. A `#N` reference resolves to exactly one resource. Deleting the highest-numbered item must not free that id for reuse. See `db.rs` schema notes.
 - **Schema migrations are forward-only** via `PRAGMA user_version`. Add a new `V<n>` block in `db.rs` and an `if version < n` step — do not rewrite earlier versions.
 - **The plugin never closes panes**, only suppresses them. Swap-in-place is the model: a suppressed pane keeps running hidden, the user owns its lifecycle.
 - **Filesystem projection is atomic**: write to a temp file, then `rename` over the target. Never write directly to `.panopt/*.md`.
@@ -44,7 +44,7 @@ Logs: `~/.local/share/panopt/panoptd.log` (tail with `just logs`). Database: `~/
 
 ## Coordination plane (MCP)
 
-The daemon exposes todos, scratchpads, locks, agent registry, and roster as MCP tools. Each MCP connection is scoped to one project via `?ws=<absolute-path>` on the URL. State mirrors to `.panopt/*.md` on every mutation — those files are read-mostly for humans and the Zellij plugin, not a write surface.
+The daemon exposes todos, notes, locks, agent registry, and roster as MCP tools. Each MCP connection is scoped to one project via `?ws=<absolute-path>` on the URL. State mirrors to `.panopt/*.md` on every mutation — those files are read-mostly for humans and the Zellij plugin, not a write surface.
 
 ## Hand-launching a first-class agent
 

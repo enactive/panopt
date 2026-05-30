@@ -1,7 +1,7 @@
-//! [`Store`] - PANopt's coordination state: persistent todos and scratchpads,
+//! [`Store`] - PANopt's coordination state: persistent todos and notes,
 //! plus the in-memory registry of connected agents and their advisory locks.
 //!
-//! Todos and scratchpads live in a single SQLite database, scoped by a
+//! Todos and notes live in a single SQLite database, scoped by a
 //! `project_id`. The agent registry and the lock table are in-memory only -
 //! they track *currently connected* agents and the locks they hold, which a
 //! daemon restart correctly forgets. Every mutating method commits its database
@@ -19,8 +19,8 @@ use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
 use crate::model::{
-    Agent, AgentTool, AgentToolPatch, KeySource, Lock, Priority, Process, ProcessKind,
-    ProcessPatch, ProjectId, Scratchpad, ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
+    Agent, AgentTool, AgentToolPatch, KeySource, Lock, Note, NotePatch, Priority, Process,
+    ProcessKind, ProcessPatch, ProjectId, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 use crate::projection;
 use crate::registry::Registry;
@@ -321,20 +321,16 @@ impl Store {
             .unwrap_or_else(|| key.to_string())
     }
 
-    // --- scratchpads ---
+    // --- notes ---
 
-    /// Create a new, empty scratchpad in `project` and return its id.
-    pub fn scratchpad_create(
-        &mut self,
-        project: ProjectId,
-        title: String,
-    ) -> Result<u64, CoreError> {
+    /// Create a new, empty note in `project` and return its id.
+    pub fn note_create(&mut self, project: ProjectId, title: String) -> Result<u64, CoreError> {
         let pid = project.0;
         let id = {
             let tx = self.conn.transaction()?;
             let next = next_id(&tx, pid)?;
             tx.execute(
-                "INSERT INTO scratchpads (project_id, id, title, body, tags, created_at, updated_at)
+                "INSERT INTO notes (project_id, id, title, body, tags, created_at, updated_at)
                  VALUES (?1, ?2, ?3, '', '[]', datetime('now'), datetime('now'))",
                 params![pid, next, title],
             )?;
@@ -345,14 +341,14 @@ impl Store {
             tx.commit()?;
             next as u64
         };
-        self.reproject_scratchpad_full(project, id)?;
+        self.reproject_note_full(project, id)?;
         Ok(id)
     }
 
-    /// List a project's scratchpads as `(id, title)` pairs, id-ascending.
-    pub fn scratchpad_list(&self, project: ProjectId) -> Result<Vec<(u64, String)>, CoreError> {
+    /// List a project's notes as `(id, title)` pairs, id-ascending.
+    pub fn note_list(&self, project: ProjectId) -> Result<Vec<(u64, String)>, CoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title FROM scratchpads
+            "SELECT id, title FROM notes
               WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([project.0], |r| {
@@ -361,22 +357,22 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Search a project's scratchpads, returning `(id, title)` pairs in the
-    /// same shape as [`Store::scratchpad_list`].
+    /// Search a project's notes, returning `(id, title)` pairs in the
+    /// same shape as [`Store::note_list`].
     ///
     /// `query` substring-matches `title`/`body` case-insensitively at the SQL
     /// layer; `require_tags` is applied in Rust against the JSON tag column
     /// (AND semantics), matching the parse-in-Rust pattern that
     /// [`Store::tags_list`] uses for the same column. With no filters this is
-    /// equivalent to `scratchpad_list`.
-    pub fn scratchpad_search(
+    /// equivalent to `note_list`.
+    pub fn note_search(
         &self,
         project: ProjectId,
         query: Option<&str>,
         require_tags: &[String],
     ) -> Result<Vec<(u64, String)>, CoreError> {
         let mut sql = String::from(
-            "SELECT id, title, tags FROM scratchpads \
+            "SELECT id, title, tags FROM notes \
              WHERE project_id = ?1 AND deleted_at IS NULL",
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project.0)];
@@ -417,47 +413,47 @@ impl Store {
             .collect())
     }
 
-    /// Append `content` to a scratchpad, separating it from existing content
+    /// Append `content` to a note, separating it from existing content
     /// with a single newline.
-    pub fn scratchpad_append(
+    pub fn note_append(
         &mut self,
         project: ProjectId,
         id: u64,
         content: &str,
     ) -> Result<(), CoreError> {
-        let mut body = self.scratchpad_body(project, id)?;
+        let mut body = self.note_body(project, id)?;
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
         }
         body.push_str(content);
         self.conn.execute(
-            "UPDATE scratchpads
+            "UPDATE notes
                 SET body = ?1, updated_at = datetime('now')
               WHERE project_id = ?2 AND id = ?3",
             params![body, project.0, id as i64],
         )?;
-        self.reproject_scratchpad_full(project, id)
+        self.reproject_note_full(project, id)
     }
 
-    /// Read the full body of a scratchpad.
-    pub fn scratchpad_read(&self, project: ProjectId, id: u64) -> Result<String, CoreError> {
-        self.scratchpad_body(project, id)
+    /// Read the full body of a note.
+    pub fn note_read(&self, project: ProjectId, id: u64) -> Result<String, CoreError> {
+        self.note_body(project, id)
     }
 
-    /// Fetch one scratchpad in full - title, body, and timestamps.
-    pub fn scratchpad_get(&self, project: ProjectId, id: u64) -> Result<Scratchpad, CoreError> {
-        self.fetch_scratchpad(project, id)
+    /// Fetch one note in full - title, body, and timestamps.
+    pub fn note_get(&self, project: ProjectId, id: u64) -> Result<Note, CoreError> {
+        self.fetch_note(project, id)
     }
 
-    /// Apply `patch` to scratchpad `id`. Each `None` field is left untouched.
-    /// Re-projects both the per-scratchpad file and the index.
-    pub fn scratchpad_update(
+    /// Apply `patch` to note `id`. Each `None` field is left untouched.
+    /// Re-projects both the per-note file and the index.
+    pub fn note_update(
         &mut self,
         project: ProjectId,
         id: u64,
-        patch: ScratchpadPatch,
+        patch: NotePatch,
     ) -> Result<(), CoreError> {
-        let mut pad = self.fetch_scratchpad(project, id)?;
+        let mut pad = self.fetch_note(project, id)?;
         if let Some(v) = patch.title {
             pad.title = v;
         }
@@ -471,53 +467,53 @@ impl Store {
         // always serializable); the fallback keeps the column valid regardless.
         let tags_json = serde_json::to_string(&pad.tags).unwrap_or_else(|_| "[]".into());
         self.conn.execute(
-            "UPDATE scratchpads
+            "UPDATE notes
                 SET title = ?1, body = ?2, tags = ?3, updated_at = datetime('now')
               WHERE project_id = ?4 AND id = ?5",
             params![pad.title, pad.body, tags_json, project.0, id as i64],
         )?;
-        self.reproject_scratchpad_full(project, id)
+        self.reproject_note_full(project, id)
     }
 
-    /// Soft-delete a scratchpad: stamp `deleted_at` so list / read / index
+    /// Soft-delete a note: stamp `deleted_at` so list / read / index
     /// paths skip it. The row stays behind so a later undelete surface has
-    /// something to revive; the per-scratchpad projection file is swept by
-    /// the index reprojection below (its sweep keys off "scratchpad is in the
+    /// something to revive; the per-note projection file is swept by
+    /// the index reprojection below (its sweep keys off "note is in the
     /// live index", which the row no longer is).
-    pub fn scratchpad_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+    pub fn note_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let changed = self.conn.execute(
-            "UPDATE scratchpads SET deleted_at = datetime('now')
+            "UPDATE notes SET deleted_at = datetime('now')
               WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
             params![project.0, id as i64],
         )?;
         if changed == 0 {
-            return Err(CoreError::ScratchpadNotFound(id));
+            return Err(CoreError::NoteNotFound(id));
         }
-        // reproject_scratchpads_index sweeps the now-orphaned per-pad file.
-        self.reproject_scratchpads_index(project)
+        // reproject_notes_index sweeps the now-orphaned per-pad file.
+        self.reproject_notes_index(project)
     }
 
-    fn scratchpad_body(&self, project: ProjectId, id: u64) -> Result<String, CoreError> {
+    fn note_body(&self, project: ProjectId, id: u64) -> Result<String, CoreError> {
         self.conn
             .query_row(
-                "SELECT body FROM scratchpads
+                "SELECT body FROM notes
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| r.get(0),
             )
             .optional()?
-            .ok_or(CoreError::ScratchpadNotFound(id))
+            .ok_or(CoreError::NoteNotFound(id))
     }
 
-    fn fetch_scratchpad(&self, project: ProjectId, id: u64) -> Result<Scratchpad, CoreError> {
+    fn fetch_note(&self, project: ProjectId, id: u64) -> Result<Note, CoreError> {
         self.conn
             .query_row(
-                "SELECT title, body, tags, created_at, updated_at FROM scratchpads
+                "SELECT title, body, tags, created_at, updated_at FROM notes
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
                 |r| {
                     let tags: String = r.get(2)?;
-                    Ok(Scratchpad {
+                    Ok(Note {
                         id,
                         title: r.get(0)?,
                         body: r.get(1)?,
@@ -530,7 +526,7 @@ impl Store {
                 },
             )
             .optional()?
-            .ok_or(CoreError::ScratchpadNotFound(id))
+            .ok_or(CoreError::NoteNotFound(id))
     }
 
     // --- agent_tools ---
@@ -1312,16 +1308,16 @@ impl Store {
         self.reproject_todos(project)
     }
 
-    /// The sorted, deduped union of every tag used by any todo *or* scratchpad
+    /// The sorted, deduped union of every tag used by any todo *or* note
     /// in `project`. The two surfaces share one project-wide vocabulary (todo
     /// #61) so a tag picked on one offers up on the other; this is the single
-    /// source of truth behind both `todo_tags_list` and `scratchpad_tags_list`
+    /// source of truth behind both `todo_tags_list` and `note_tags_list`
     /// MCP tools, which return identical output.
     pub fn tags_list(&self, project: ProjectId) -> Result<Vec<String>, CoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT tags FROM todos       WHERE project_id = ?1 AND deleted_at IS NULL
              UNION ALL
-             SELECT tags FROM scratchpads WHERE project_id = ?1 AND deleted_at IS NULL",
+             SELECT tags FROM notes WHERE project_id = ?1 AND deleted_at IS NULL",
         )?;
         let rows = stmt.query_map([project.0], |r| r.get::<_, String>(0))?;
         let mut set: HashSet<String> = HashSet::new();
@@ -1342,7 +1338,7 @@ impl Store {
     }
 
     /// Back-compat alias for [`Self::tags_list`]. Both `todo_tags_list` and
-    /// `scratchpad_tags_list` MCP tools call the unified method now (todo #61),
+    /// `note_tags_list` MCP tools call the unified method now (todo #61),
     /// so this just exists so callsites that already imported the todo-only
     /// name keep compiling.
     pub fn todo_tags_list(&self, project: ProjectId) -> Result<Vec<String>, CoreError> {
@@ -1474,37 +1470,34 @@ impl Store {
         Ok(())
     }
 
-    fn reproject_scratchpad(&self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+    fn reproject_note(&self, project: ProjectId, id: u64) -> Result<(), CoreError> {
         let root = self.project_root(project)?;
-        projection::project_scratchpad(&root, &self.fetch_scratchpad(project, id)?)?;
+        projection::project_note(&root, &self.fetch_note(project, id)?)?;
         Ok(())
     }
 
-    fn reproject_scratchpads_index(&self, project: ProjectId) -> Result<(), CoreError> {
+    fn reproject_notes_index(&self, project: ProjectId) -> Result<(), CoreError> {
         let root = self.project_root(project)?;
-        projection::project_scratchpads_index(&root, &self.scratchpad_index_rows(project)?)?;
+        projection::project_notes_index(&root, &self.note_index_rows(project)?)?;
         Ok(())
     }
 
-    /// Rewrite both the per-scratchpad file and the scratchpad index, so every
-    /// mutation that touches a scratchpad refreshes the projection completely.
+    /// Rewrite both the per-note file and the note index, so every
+    /// mutation that touches a note refreshes the projection completely.
     /// The single helper makes the index step impossible for a caller to skip,
     /// matching the all-or-nothing shape `reproject_todos` already has.
-    fn reproject_scratchpad_full(&self, project: ProjectId, id: u64) -> Result<(), CoreError> {
-        self.reproject_scratchpad(project, id)?;
-        self.reproject_scratchpads_index(project)
+    fn reproject_note_full(&self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        self.reproject_note(project, id)?;
+        self.reproject_notes_index(project)
     }
 
-    /// `(id, title, updated_at)` for every scratchpad in `project`, id-ascending.
+    /// `(id, title, updated_at)` for every note in `project`, id-ascending.
     /// The projection layer renders the `updated_at` into each index line; the
-    /// public `scratchpad_list` stays the narrow `(id, title)` shape the MCP
+    /// public `note_list` stays the narrow `(id, title)` shape the MCP
     /// wire summary expects.
-    fn scratchpad_index_rows(
-        &self,
-        project: ProjectId,
-    ) -> Result<Vec<(u64, String, String)>, CoreError> {
+    fn note_index_rows(&self, project: ProjectId) -> Result<Vec<(u64, String, String)>, CoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, updated_at FROM scratchpads
+            "SELECT id, title, updated_at FROM notes
               WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY id",
         )?;
         let rows = stmt.query_map([project.0], |r| {
@@ -1557,9 +1550,9 @@ impl Store {
             std::time::SystemTime::now(),
         )?;
         projection::project_locks(root, &self.lock_list(project))?;
-        projection::project_scratchpads_index(root, &self.scratchpad_index_rows(project)?)?;
-        for (id, _) in self.scratchpad_list(project)? {
-            projection::project_scratchpad(root, &self.fetch_scratchpad(project, id)?)?;
+        projection::project_notes_index(root, &self.note_index_rows(project)?)?;
+        for (id, _) in self.note_list(project)? {
+            projection::project_note(root, &self.fetch_note(project, id)?)?;
         }
         Ok(())
     }
@@ -1567,7 +1560,7 @@ impl Store {
 
 /// Read a project's global `next_id` counter, mapping a missing project row to
 /// [`CoreError::ProjectNotFound`]. The counter is shared across todos,
-/// scratchpads, agent tools, and processes, so a `#N` reference is unambiguous.
+/// notes, agent tools, and processes, so a `#N` reference is unambiguous.
 fn next_id(conn: &Connection, pid: i64) -> Result<i64, CoreError> {
     conn.query_row("SELECT next_id FROM projects WHERE id = ?1", [pid], |r| {
         r.get(0)
@@ -1616,12 +1609,12 @@ mod tests {
     #[test]
     fn ids_are_globally_unique_across_resource_types() {
         // Todo #16 + #27: one shared sequence so `#N` resolves to exactly one
-        // resource. A todo, scratchpad, agent tool, and process all draw from
+        // resource. A todo, note, agent tool, and process all draw from
         // the same counter in creation order.
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
         assert_eq!(fx.store.todo_create(p, "a".into()).unwrap(), 1);
-        assert_eq!(fx.store.scratchpad_create(p, "pad".into()).unwrap(), 2);
+        assert_eq!(fx.store.note_create(p, "pad".into()).unwrap(), 2);
         assert_eq!(
             fx.store
                 .agent_tool_create(
@@ -1651,7 +1644,7 @@ mod tests {
             4
         );
         assert_eq!(fx.store.todo_create(p, "b".into()).unwrap(), 5);
-        assert_eq!(fx.store.scratchpad_create(p, "pad2".into()).unwrap(), 6);
+        assert_eq!(fx.store.note_create(p, "pad2".into()).unwrap(), 6);
     }
 
     #[test]
@@ -1749,40 +1742,40 @@ mod tests {
     fn append_concatenates_with_single_newline() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
-        fx.store.scratchpad_append(p, id, "first").unwrap();
-        fx.store.scratchpad_append(p, id, "second").unwrap();
-        assert_eq!(fx.store.scratchpad_read(p, id).unwrap(), "first\nsecond");
+        let id = fx.store.note_create(p, "notes".into()).unwrap();
+        fx.store.note_append(p, id, "first").unwrap();
+        fx.store.note_append(p, id, "second").unwrap();
+        assert_eq!(fx.store.note_read(p, id).unwrap(), "first\nsecond");
     }
 
     #[test]
-    fn scratchpad_create_sets_created_and_updated_timestamps() {
+    fn note_create_sets_created_and_updated_timestamps() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
-        let pad = fx.store.fetch_scratchpad(p, id).unwrap();
+        let id = fx.store.note_create(p, "notes".into()).unwrap();
+        let pad = fx.store.fetch_note(p, id).unwrap();
         assert!(!pad.created_at.is_empty(), "created_at is set on create");
         assert!(!pad.updated_at.is_empty(), "updated_at is set on create");
     }
 
     #[test]
-    fn scratchpad_append_bumps_updated_at_and_rewrites_index() {
+    fn note_append_bumps_updated_at_and_rewrites_index() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
-        let before = fx.store.fetch_scratchpad(p, id).unwrap().updated_at;
+        let id = fx.store.note_create(p, "notes".into()).unwrap();
+        let before = fx.store.fetch_note(p, id).unwrap().updated_at;
 
         // datetime('now') has 1-second resolution, so cross a second boundary
         // to be sure the timestamp moves; the same constraint todos face.
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        fx.store.scratchpad_append(p, id, "more").unwrap();
+        fx.store.note_append(p, id, "more").unwrap();
 
-        let after = fx.store.fetch_scratchpad(p, id).unwrap().updated_at;
+        let after = fx.store.fetch_note(p, id).unwrap().updated_at;
         assert!(after > before, "updated_at must advance on append");
 
         // And the index file now carries the new timestamp - the bytes change
         // so the cockpit's 1s file poller observes the refresh.
-        let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
+        let index = std::fs::read_to_string(root.join(".panopt/notes.md")).unwrap();
         assert!(
             index.contains(&format!("updated {after}")),
             "index reflects the bumped updated_at\n{index}",
@@ -1790,66 +1783,66 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_update_writes_only_the_some_fields() {
+    fn note_update_writes_only_the_some_fields() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "first-title".into()).unwrap();
-        fx.store.scratchpad_append(p, id, "first-body").unwrap();
+        let id = fx.store.note_create(p, "first-title".into()).unwrap();
+        fx.store.note_append(p, id, "first-body").unwrap();
 
         // Patching only title leaves the body alone.
         fx.store
-            .scratchpad_update(
+            .note_update(
                 p,
                 id,
-                ScratchpadPatch {
+                NotePatch {
                     title: Some("renamed".into()),
                     ..Default::default()
                 },
             )
             .unwrap();
-        let pad = fx.store.scratchpad_get(p, id).unwrap();
+        let pad = fx.store.note_get(p, id).unwrap();
         assert_eq!(pad.title, "renamed");
         assert_eq!(pad.body, "first-body");
 
         // Patching only body leaves the title alone.
         fx.store
-            .scratchpad_update(
+            .note_update(
                 p,
                 id,
-                ScratchpadPatch {
+                NotePatch {
                     body: Some("rewritten".into()),
                     ..Default::default()
                 },
             )
             .unwrap();
-        let pad = fx.store.scratchpad_get(p, id).unwrap();
+        let pad = fx.store.note_get(p, id).unwrap();
         assert_eq!(pad.title, "renamed");
         assert_eq!(pad.body, "rewritten");
     }
 
     #[test]
-    fn scratchpad_update_bumps_updated_at_and_reprojects() {
+    fn note_update_bumps_updated_at_and_reprojects() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
-        let before = fx.store.scratchpad_get(p, id).unwrap().updated_at;
+        let id = fx.store.note_create(p, "notes".into()).unwrap();
+        let before = fx.store.note_get(p, id).unwrap().updated_at;
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fx.store
-            .scratchpad_update(
+            .note_update(
                 p,
                 id,
-                ScratchpadPatch {
+                NotePatch {
                     body: Some("new body".into()),
                     ..Default::default()
                 },
             )
             .unwrap();
 
-        let after = fx.store.scratchpad_get(p, id).unwrap().updated_at;
+        let after = fx.store.note_get(p, id).unwrap().updated_at;
         assert!(after > before, "updated_at must advance on update");
 
-        let pad_file = std::fs::read_to_string(root.join(".panopt/scratchpad/1.md")).unwrap();
+        let pad_file = std::fs::read_to_string(root.join(".panopt/note/1.md")).unwrap();
         assert!(
             pad_file.contains("new body"),
             "per-pad projection refreshed"
@@ -1857,58 +1850,60 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_update_errors_when_missing() {
+    fn note_update_errors_when_missing() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
         let err = fx
             .store
-            .scratchpad_update(p, 999, ScratchpadPatch::default())
+            .note_update(p, 999, NotePatch::default())
             .unwrap_err();
-        assert!(matches!(err, CoreError::ScratchpadNotFound(999)));
+        assert!(matches!(err, CoreError::NoteNotFound(999)));
     }
 
     #[test]
-    fn scratchpad_delete_removes_row_and_per_pad_file() {
+    fn note_delete_removes_row_and_per_pad_file() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
-        let pad_path = root.join(".panopt/scratchpad/1.md");
+        let id = fx.store.note_create(p, "deletable-title".into()).unwrap();
+        let pad_path = root.join(".panopt/note/1.md");
         assert!(pad_path.exists(), "per-pad file projected on create");
 
-        fx.store.scratchpad_delete(p, id).unwrap();
+        fx.store.note_delete(p, id).unwrap();
 
         assert!(!pad_path.exists(), "per-pad file swept on delete");
         assert!(
-            fx.store.scratchpad_list(p).unwrap().is_empty(),
+            fx.store.note_list(p).unwrap().is_empty(),
             "row gone from the listing",
         );
 
-        let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
+        // The title is distinct from the index chrome ("# Notes", "_(no
+        // notes)_") so this only trips when the deleted pad still appears.
+        let index = std::fs::read_to_string(root.join(".panopt/notes.md")).unwrap();
         assert!(
-            !index.contains("notes"),
+            !index.contains("deletable-title"),
             "index no longer lists the pad\n{index}"
         );
     }
 
     #[test]
-    fn scratchpad_delete_errors_when_missing() {
+    fn note_delete_errors_when_missing() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
-        let err = fx.store.scratchpad_delete(p, 999).unwrap_err();
-        assert!(matches!(err, CoreError::ScratchpadNotFound(999)));
+        let err = fx.store.note_delete(p, 999).unwrap_err();
+        assert!(matches!(err, CoreError::NoteNotFound(999)));
     }
 
     #[test]
-    fn scratchpad_append_rewrites_the_index_even_after_deletion() {
+    fn note_append_rewrites_the_index_even_after_deletion() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "notes".into()).unwrap();
-        // Remove the index to prove `scratchpad_append` rewrites it - this
+        let id = fx.store.note_create(p, "notes".into()).unwrap();
+        // Remove the index to prove `note_append` rewrites it - this
         // is what guards against the pre-fix asymmetry where append skipped
         // the index reprojection entirely.
-        std::fs::remove_file(root.join(".panopt/scratchpads.md")).unwrap();
-        fx.store.scratchpad_append(p, id, "more").unwrap();
-        assert!(root.join(".panopt/scratchpads.md").exists());
+        std::fs::remove_file(root.join(".panopt/notes.md")).unwrap();
+        fx.store.note_append(p, id, "more").unwrap();
+        assert!(root.join(".panopt/notes.md").exists());
     }
 
     #[test]
@@ -2201,11 +2196,11 @@ mod tests {
     }
 
     #[test]
-    fn tags_list_unions_todos_and_scratchpads() {
+    fn tags_list_unions_todos_and_notes() {
         let mut fx = Fixture::new();
         let (p, _) = fx.project("proj");
         let t = fx.store.todo_create(p, "t".into()).unwrap();
-        let s = fx.store.scratchpad_create(p, "s".into()).unwrap();
+        let s = fx.store.note_create(p, "s".into()).unwrap();
         fx.store
             .todo_update(
                 p,
@@ -2217,46 +2212,46 @@ mod tests {
             )
             .unwrap();
         fx.store
-            .scratchpad_update(
+            .note_update(
                 p,
                 s,
-                ScratchpadPatch {
+                NotePatch {
                     tags: Some(vec!["y".into(), "z".into()]),
                     ..Default::default()
                 },
             )
             .unwrap();
         // Identical via both the unified core method and the back-compat alias,
-        // and identical to the future `scratchpad_tags_list` MCP tool's source.
+        // and identical to the future `note_tags_list` MCP tool's source.
         assert_eq!(fx.store.tags_list(p).unwrap(), vec!["x", "y", "z"]);
         assert_eq!(fx.store.todo_tags_list(p).unwrap(), vec!["x", "y", "z"]);
     }
 
     #[test]
-    fn scratchpad_update_round_trips_tags() {
+    fn note_update_round_trips_tags() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        let id = fx.store.scratchpad_create(p, "n".into()).unwrap();
+        let id = fx.store.note_create(p, "n".into()).unwrap();
         // Fresh pads start with empty tags (V8 column default).
-        assert!(fx.store.scratchpad_get(p, id).unwrap().tags.is_empty());
+        assert!(fx.store.note_get(p, id).unwrap().tags.is_empty());
 
         fx.store
-            .scratchpad_update(
+            .note_update(
                 p,
                 id,
-                ScratchpadPatch {
+                NotePatch {
                     tags: Some(vec!["foo".into(), "bar".into()]),
                     ..Default::default()
                 },
             )
             .unwrap();
         assert_eq!(
-            fx.store.scratchpad_get(p, id).unwrap().tags,
+            fx.store.note_get(p, id).unwrap().tags,
             vec!["foo".to_string(), "bar".to_string()]
         );
 
         // Tags land in the per-pad projection frontmatter.
-        let pad_file = std::fs::read_to_string(root.join(".panopt/scratchpad/1.md")).unwrap();
+        let pad_file = std::fs::read_to_string(root.join(".panopt/note/1.md")).unwrap();
         assert!(
             pad_file.contains("\ntags: foo, bar\n"),
             "projection carries `tags: foo, bar`:\n{pad_file}"
@@ -2264,16 +2259,16 @@ mod tests {
 
         // An empty list clears the tags.
         fx.store
-            .scratchpad_update(
+            .note_update(
                 p,
                 id,
-                ScratchpadPatch {
+                NotePatch {
                     tags: Some(vec![]),
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert!(fx.store.scratchpad_get(p, id).unwrap().tags.is_empty());
+        assert!(fx.store.note_get(p, id).unwrap().tags.is_empty());
     }
 
     #[test]
@@ -2315,12 +2310,12 @@ mod tests {
             Err(CoreError::TodoNotFound(999))
         ));
         assert!(matches!(
-            fx.store.scratchpad_append(p, 999, "x"),
-            Err(CoreError::ScratchpadNotFound(999))
+            fx.store.note_append(p, 999, "x"),
+            Err(CoreError::NoteNotFound(999))
         ));
         assert!(matches!(
-            fx.store.scratchpad_read(p, 999),
-            Err(CoreError::ScratchpadNotFound(999))
+            fx.store.note_read(p, 999),
+            Err(CoreError::NoteNotFound(999))
         ));
     }
 
@@ -2383,11 +2378,10 @@ mod tests {
         let todo_md = std::fs::read_to_string(root.join(".panopt/todos/1.md")).unwrap();
         assert!(todo_md.contains("status: completed"), "{todo_md}");
 
-        let sid = fx.store.scratchpad_create(p, "notes".into()).unwrap();
-        fx.store.scratchpad_append(p, sid, "first").unwrap();
-        fx.store.scratchpad_append(p, sid, "second").unwrap();
-        let sp_md =
-            std::fs::read_to_string(root.join(format!(".panopt/scratchpad/{sid}.md"))).unwrap();
+        let sid = fx.store.note_create(p, "notes".into()).unwrap();
+        fx.store.note_append(p, sid, "first").unwrap();
+        fx.store.note_append(p, sid, "second").unwrap();
+        let sp_md = std::fs::read_to_string(root.join(format!(".panopt/note/{sid}.md"))).unwrap();
         // Per-pad files now carry a `created`/`updated` frontmatter block;
         // the wall-clock timestamps inside are checked structurally rather
         // than by exact match.
@@ -2408,7 +2402,7 @@ mod tests {
             let mut store = Store::open(&db).unwrap();
             let p = store.ensure_project(&root).unwrap();
             store.todo_create(p, "persist me".into()).unwrap();
-            store.scratchpad_create(p, "kept".into()).unwrap();
+            store.note_create(p, "kept".into()).unwrap();
         }
         {
             let mut store = Store::open(&db).unwrap();
@@ -2417,7 +2411,7 @@ mod tests {
             assert_eq!(todos.len(), 1);
             assert_eq!(todos[0].title, "persist me");
             // The shared id counter resumes past the persisted todo (id 1)
-            // and persisted scratchpad (id 2), so the next id is 3.
+            // and persisted note (id 2), so the next id is 3.
             assert_eq!(store.todo_create(p, "another".into()).unwrap(), 3);
         }
     }
@@ -2706,19 +2700,14 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_create_projects_the_index() {
+    fn note_create_projects_the_index() {
         let mut fx = Fixture::new();
         let (p, root) = fx.project("proj");
-        fx.store
-            .scratchpad_create(p, "design notes".into())
-            .unwrap();
-        fx.store.scratchpad_create(p, "scratch".into()).unwrap();
-        let index = std::fs::read_to_string(root.join(".panopt/scratchpads.md")).unwrap();
-        assert!(
-            index.contains("- [#1](scratchpad/1.md) design notes"),
-            "{index}"
-        );
-        assert!(index.contains("- [#2](scratchpad/2.md) scratch"), "{index}");
+        fx.store.note_create(p, "design notes".into()).unwrap();
+        fx.store.note_create(p, "scratch".into()).unwrap();
+        let index = std::fs::read_to_string(root.join(".panopt/notes.md")).unwrap();
+        assert!(index.contains("- [#1](note/1.md) design notes"), "{index}");
+        assert!(index.contains("- [#2](note/2.md) scratch"), "{index}");
     }
 
     /// Soft delete keeps the row in SQLite but hides it from every live read

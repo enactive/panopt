@@ -1,8 +1,8 @@
-//! The `panopt scratchpad` subcommand: a thin MCP client of the daemon's
-//! `scratchpad_*` tools.
+//! The `panopt note` subcommand: a thin MCP client of the daemon's
+//! `note_*` tools.
 //!
 //! Only the destructive surface lives here for now - the rest of the
-//! scratchpad UX runs through the in-cockpit editor form. `rm` exists so the
+//! note UX runs through the in-cockpit editor form. `rm` exists so the
 //! sidebar's delete confirmation dialog has a CLI to dispatch to, mirroring
 //! how `todo rm` and `process delete` are wired (see [`crate::delete_gate`]).
 
@@ -16,17 +16,17 @@ use crate::daemon;
 use crate::mcpclient::Client;
 use crate::todo::{insert_opt, observer_url};
 
-/// What to do to the project's scratchpads.
+/// What to do to the project's notes.
 #[derive(Subcommand)]
-pub enum ScratchpadCmd {
-    /// Delete a scratchpad.
+pub enum NoteCmd {
+    /// Delete a note.
     Rm {
-        /// Numeric id of the scratchpad to delete.
+        /// Numeric id of the note to delete.
         id: u64,
     },
-    /// Edit a scratchpad's title, body, or tags. Omitted options are left unchanged.
+    /// Edit a note's title, body, or tags. Omitted options are left unchanged.
     Set {
-        /// Numeric id of the scratchpad to edit.
+        /// Numeric id of the note to edit.
         id: u64,
         #[arg(long)]
         title: Option<String>,
@@ -38,8 +38,8 @@ pub enum ScratchpadCmd {
     },
 }
 
-/// Run a `panopt scratchpad` subcommand against the daemon for project `ws`.
-pub fn run(ws: Option<PathBuf>, cmd: ScratchpadCmd, port: u16) -> Result<()> {
+/// Run a `panopt note` subcommand against the daemon for project `ws`.
+pub fn run(ws: Option<PathBuf>, cmd: NoteCmd, port: u16) -> Result<()> {
     daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws, port)?)?;
     let outcome = dispatch(&client, cmd);
@@ -47,20 +47,20 @@ pub fn run(ws: Option<PathBuf>, cmd: ScratchpadCmd, port: u16) -> Result<()> {
     outcome
 }
 
-fn dispatch(client: &Client, cmd: ScratchpadCmd) -> Result<()> {
+fn dispatch(client: &Client, cmd: NoteCmd) -> Result<()> {
     match cmd {
-        ScratchpadCmd::Rm { id } => {
-            client.call("scratchpad_delete", json!({ "scratchpad_id": id }))?;
-            println!("deleted scratchpad #{id}");
+        NoteCmd::Rm { id } => {
+            client.call("note_delete", json!({ "note_id": id }))?;
+            println!("deleted note #{id}");
         }
-        ScratchpadCmd::Set {
+        NoteCmd::Set {
             id,
             title,
             body,
             tags,
         } => {
             let mut args = Map::new();
-            args.insert("scratchpad_id".into(), json!(id));
+            args.insert("note_id".into(), json!(id));
             insert_opt(&mut args, "title", title);
             insert_opt(&mut args, "body", body);
             if let Some(tags) = tags {
@@ -71,8 +71,8 @@ fn dispatch(client: &Client, cmd: ScratchpadCmd) -> Result<()> {
                     .collect();
                 args.insert("tags".into(), json!(list));
             }
-            client.call("scratchpad_update", Value::Object(args))?;
-            println!("updated scratchpad #{id}");
+            client.call("note_update", Value::Object(args))?;
+            println!("updated note #{id}");
         }
     }
     Ok(())

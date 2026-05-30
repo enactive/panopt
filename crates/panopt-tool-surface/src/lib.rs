@@ -115,57 +115,57 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         schema_fn: schema_for_no_args,
     },
     ToolDef {
-        name: "scratchpad_create",
-        description: "Create a new scratchpad with a title. Returns its numeric id.",
-        schema_fn: schema_for::<ScratchpadCreateArgs>,
+        name: "note_create",
+        description: "Create a new note with a title. Returns its numeric id.",
+        schema_fn: schema_for::<NoteCreateArgs>,
     },
     ToolDef {
-        name: "scratchpad_list",
-        description: "List all scratchpads as a JSON array of {id, title}.",
+        name: "note_list",
+        description: "List all notes as a JSON array of {id, title}.",
         schema_fn: schema_for_no_args,
     },
     ToolDef {
-        name: "scratchpad_search",
-        description: "Find scratchpads. Optional `query` substring-matches title and body \
+        name: "note_search",
+        description: "Find notes. Optional `query` substring-matches title and body \
                       (case-insensitive). Optional `tags` requires every listed tag to be \
                       present (AND semantics). Returns the same {id, title} shape as \
-                      scratchpad_list; an empty-arg call is equivalent to scratchpad_list.",
-        schema_fn: schema_for::<ScratchpadSearchArgs>,
+                      note_list; an empty-arg call is equivalent to note_list.",
+        schema_fn: schema_for::<NoteSearchArgs>,
     },
     ToolDef {
-        name: "scratchpad_append",
-        description: "Append text to an existing scratchpad, addressed by numeric id.",
-        schema_fn: schema_for::<ScratchpadAppendArgs>,
+        name: "note_append",
+        description: "Append text to an existing note, addressed by numeric id.",
+        schema_fn: schema_for::<NoteAppendArgs>,
     },
     ToolDef {
-        name: "scratchpad_read",
-        description: "Read the full body of a scratchpad, addressed by numeric id.",
-        schema_fn: schema_for::<ScratchpadReadArgs>,
+        name: "note_read",
+        description: "Read the full body of a note, addressed by numeric id.",
+        schema_fn: schema_for::<NoteReadArgs>,
     },
     ToolDef {
-        name: "scratchpad_get",
-        description: "Fetch one scratchpad in full - id, title, body, and timestamps - \
+        name: "note_get",
+        description: "Fetch one note in full - id, title, body, and timestamps - \
                       addressed by numeric id.",
-        schema_fn: schema_for::<ScratchpadGetArgs>,
+        schema_fn: schema_for::<NoteGetArgs>,
     },
     ToolDef {
-        name: "scratchpad_update",
-        description: "Edit a scratchpad's title, body, and/or tags. Each omitted field is left \
+        name: "note_update",
+        description: "Edit a note's title, body, and/or tags. Each omitted field is left \
                       unchanged; body replaces the existing body in full (use \
-                      scratchpad_append to add instead of replace); tags replaces the whole \
+                      note_append to add instead of replace); tags replaces the whole \
                       tag list.",
-        schema_fn: schema_for::<ScratchpadUpdateArgs>,
+        schema_fn: schema_for::<NoteUpdateArgs>,
     },
     ToolDef {
-        name: "scratchpad_delete",
-        description: "Delete a scratchpad. Removes both the database row and the per-pad \
+        name: "note_delete",
+        description: "Delete a note. Removes both the database row and the per-note \
                       projection file.",
-        schema_fn: schema_for::<ScratchpadDeleteArgs>,
+        schema_fn: schema_for::<NoteDeleteArgs>,
     },
     ToolDef {
-        name: "scratchpad_tags_list",
+        name: "note_tags_list",
         description: "List the project's tag vocabulary: the sorted, deduped union of every \
-                      tag attached to any todo OR scratchpad. Identical output to \
+                      tag attached to any todo OR note. Identical output to \
                       todo_tags_list - the two surfaces share one project-wide tag pool.",
         schema_fn: schema_for_no_args,
     },
@@ -270,9 +270,9 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
     ToolDef {
         name: "todo_tags_list",
         description: "List the project's tag vocabulary: the sorted, deduped union of \
-                      every tag attached to any todo OR scratchpad. The two surfaces \
+                      every tag attached to any todo OR note. The two surfaces \
                       share one project-wide tag pool, so this returns identical output \
-                      to scratchpad_tags_list.",
+                      to note_tags_list.",
         schema_fn: schema_for_no_args,
     },
     ToolDef {
@@ -351,7 +351,7 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
     ToolDef {
         name: "id_kind",
         description: "Given a numeric id, return what kind of resource it is \
-                      and a short label. Resolves across todos, scratchpads, \
+                      and a short label. Resolves across todos, notes, \
                       agent tools, and processes (ids are unified per project \
                       so a `#N` reference points to exactly one row). Errors \
                       `invalid_params` if the id matches no live (non-soft- \

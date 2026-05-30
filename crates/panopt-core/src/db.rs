@@ -1,15 +1,19 @@
 //! SQLite schema and forward migrations for the persistent store.
 //!
-//! One database file holds every project. `todos` and `scratchpads` are keyed
+//! One database file holds every project. `todos` and `notes` are keyed
 //! by `(project_id, id)`, so ids restart at 1 per project and the projected
 //! files read naturally. The schema version is tracked in SQLite's
 //! `user_version` pragma so later changes can migrate forward in place.
+//!
+//! Note: the `notes` table was called `scratchpads` through V8; the V1-V8
+//! migration steps below keep that historical name and V9 renames it. Only
+//! runtime code (and the schema as of V9) speaks of `notes`.
 
 use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -288,6 +292,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 8 {
         apply_v8(conn)?;
     }
+    if version < 9 {
+        apply_v9(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -319,6 +326,40 @@ fn apply_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// scratchpad migration (V4) guarded against.
 fn apply_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column_if_missing(conn, "scratchpads", "tags", "TEXT NOT NULL DEFAULT '[]'")
+}
+
+/// Version 9: rename the `scratchpads` table to `notes` (todo #79).
+///
+/// "Scratchpad" implied an ephemerality the concept never had - these are
+/// durable, append-oriented, shared documents that agents and humans both read
+/// and write. The rename is the whole change: the columns, the unified
+/// `projects.next_id` counter, and the tag vocabulary shared with todos are all
+/// untouched, and every pre-existing scratchpad survives as a note with its id
+/// and body intact. Whether notes should additionally carry a `type`
+/// (note/plan/memory/inter-agent) is deferred to a follow-up.
+///
+/// Guarded like the column migrations against dev-database drift: an
+/// in-development V9 binary may have renamed the table before its
+/// `user_version` bump landed, so a database reporting V8 might already have a
+/// `notes` table. Skip the rename in that case instead of failing on
+/// "no such table: scratchpads".
+fn apply_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if table_exists(conn, "notes")? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE scratchpads RENAME TO notes;")
+}
+
+/// True if a table named `table` exists. Used by migrations that must stay
+/// idempotent against a transitional dev-database that already applied a
+/// rename or create before its `user_version` bump landed.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 #[cfg(test)]
@@ -407,22 +448,23 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_v4_scratchpad_timestamps() {
+    fn fresh_database_has_v4_note_timestamps() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         // The v4 columns exist and accept inserts that set both timestamps.
+        // A fresh database is fully migrated, so the table is `notes` (V9).
         conn.execute_batch(
             "INSERT INTO projects (id, root) VALUES (1, '/x');
-             INSERT INTO scratchpads (project_id, id, title, body, created_at, updated_at)
+             INSERT INTO notes (project_id, id, title, body, created_at, updated_at)
                  VALUES (1, 1, 't', '', datetime('now'), datetime('now'));",
         )
         .unwrap();
         let updated: String = conn
-            .query_row("SELECT updated_at FROM scratchpads WHERE id = 1", [], |r| {
+            .query_row("SELECT updated_at FROM notes WHERE id = 1", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert!(!updated.is_empty(), "fresh scratchpad has updated_at set");
+        assert!(!updated.is_empty(), "fresh note has updated_at set");
     }
 
     #[test]
@@ -447,10 +489,11 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
-        // The pre-existing scratchpad is backfilled with real timestamps.
+        // The pre-existing scratchpad is backfilled with real timestamps and,
+        // post-migration, lives in the renamed `notes` table (V9).
         let (created, updated): (String, String) = conn
             .query_row(
-                "SELECT created_at, updated_at FROM scratchpads WHERE id = 1",
+                "SELECT created_at, updated_at FROM notes WHERE id = 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -490,8 +533,9 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // The backfill still runs, so the empty timestamps land at real ones.
+        // The table is `notes` post-migration (V9).
         let updated: String = conn
-            .query_row("SELECT updated_at FROM scratchpads WHERE id = 1", [], |r| {
+            .query_row("SELECT updated_at FROM notes WHERE id = 1", [], |r| {
                 r.get(0)
             })
             .unwrap();
@@ -735,8 +779,9 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
-        // Every pre-V7 row is live (deleted_at IS NULL) post-migration.
-        for table in ["todos", "scratchpads", "agent_tools", "processes"] {
+        // Every pre-V7 row is live (deleted_at IS NULL) post-migration. The
+        // scratchpads table is `notes` after V9.
+        for table in ["todos", "notes", "agent_tools", "processes"] {
             let alive: i64 = conn
                 .query_row(
                     &format!("SELECT COUNT(*) FROM {table} WHERE deleted_at IS NULL"),
@@ -749,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_database_upgrades_to_v8_with_empty_scratchpad_tags() {
+    fn v7_database_upgrades_to_v8_with_empty_note_tags() {
         // Stand up a V7 database with one pre-existing scratchpad. V8 adds the
         // tags column with default '[]', so the row keeps its body untouched
         // and reads back an empty JSON array - no backfill needed.
@@ -776,10 +821,9 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
+        // Post-V9 the table is `notes`.
         let tags: String = conn
-            .query_row("SELECT tags FROM scratchpads WHERE id = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT tags FROM notes WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(tags, "[]", "pre-V8 scratchpad gets the empty-tags default");
     }
@@ -808,6 +852,80 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v8_database_renames_scratchpads_to_notes_preserving_rows() {
+        // Stand up a V8 database with one scratchpad, then migrate. V9 renames
+        // the table to `notes`; the row keeps its id, title, body, and tags,
+        // and the old `scratchpads` name no longer resolves.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        apply_v8(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, next_id) VALUES (1, '/x', 2);
+             INSERT INTO scratchpads (project_id, id, title, body, tags, created_at, updated_at)
+                 VALUES (1, 1, 'kept', 'body text', '[\"a\"]', '2026-01-01', '2026-01-01');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The row survives verbatim under the new table name.
+        let (title, body, tags): (String, String, String) = conn
+            .query_row(
+                "SELECT title, body, tags FROM notes WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "kept");
+        assert_eq!(body, "body text");
+        assert_eq!(tags, "[\"a\"]");
+
+        // The old name is gone.
+        assert!(!table_exists(&conn, "scratchpads").unwrap());
+        assert!(table_exists(&conn, "notes").unwrap());
+    }
+
+    #[test]
+    fn v9_rename_tolerates_a_transitional_database_already_renamed() {
+        // The drift case the V9 guard exists for: an in-development V9 binary
+        // renamed the table to `notes` but did not bump `user_version`, so the
+        // database reports V8 yet already has `notes` and no `scratchpads`.
+        // `migrate` should finish cleanly instead of failing on the rename.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        apply_v8(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE scratchpads RENAME TO notes;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "notes").unwrap());
     }
 
     #[test]

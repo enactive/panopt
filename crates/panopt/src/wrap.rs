@@ -2,7 +2,7 @@
 //!
 //! `tui_textarea` 0.7 does not support visual line wrap - it tracks one row
 //! per logical line and scrolls horizontally when a line outgrows the field.
-//! For prose-shaped fields (todo / scratchpad bodies) that reads as "my text
+//! For prose-shaped fields (todo / note bodies) that reads as "my text
 //! disappeared off the right edge." This module re-renders the textarea's
 //! buffer wrapped at the field width, and maps the textarea's logical cursor
 //! position to a visual position so the host can place the terminal cursor on

@@ -17,8 +17,8 @@ mod mcp_proxy;
 mod mcpclient;
 mod paths;
 mod process;
-mod scratchpad;
-mod scratchpad_form;
+mod note;
+mod note_form;
 mod search;
 mod todo;
 mod todo_form;
@@ -124,16 +124,16 @@ enum Cmd {
         #[command(subcommand)]
         action: process::ProcessCmd,
     },
-    /// Operate on the project's scratchpads from the CLI. Currently exposes
+    /// Operate on the project's notes from the CLI. Currently exposes
     /// only `rm`; the rest of the surface lives in the cockpit's editor form.
-    Scratchpad {
-        /// Project root the scratchpads belong to (default: the current directory).
+    Note {
+        /// Project root the notes belong to (default: the current directory).
         #[arg(long, global = true)]
         ws: Option<PathBuf>,
         #[command(subcommand)]
-        action: scratchpad::ScratchpadCmd,
+        action: note::NoteCmd,
     },
-    /// Popup search across the project's todos and scratchpads. Intended for
+    /// Popup search across the project's todos and notes. Intended for
     /// the cockpit (the sidebar plugin spawns this in a floating pane via the
     /// search keybind), but also runs standalone — Enter prints `kind:id` to
     /// stdout when not under Zellij.
@@ -142,7 +142,7 @@ enum Cmd {
         #[arg(long)]
         ws: Option<PathBuf>,
     },
-    /// Resolve a numeric id to its resource kind (todo / scratchpad /
+    /// Resolve a numeric id to its resource kind (todo / note /
     /// agent-tool / process) via the daemon's `id_kind` MCP tool.
     #[command(name = "id-kind")]
     IdKind {
@@ -209,10 +209,10 @@ enum Cmd {
         /// Routing-file token the sidebar plugin assigned this pane.
         #[arg(long)]
         slot: String,
-        /// Initial item kind: todo, scratchpad, todo-list, scratchpad-list.
+        /// Initial item kind: todo, note, todo-list, note-list.
         #[arg(long)]
         kind: Option<String>,
-        /// Initial item id, for the todo and scratchpad kinds.
+        /// Initial item id, for the todo and note kinds.
         #[arg(long)]
         id: Option<u64>,
     },
@@ -234,7 +234,7 @@ enum Cmd {
     /// spawns when the user presses `x` on a row.
     #[command(name = "_delete-gate", hide = true)]
     DeleteGateExec {
-        /// Item kind: todo, scratchpad, agent-tool, or process.
+        /// Item kind: todo, note, agent-tool, or process.
         #[arg(long)]
         kind: String,
         /// Numeric id of the item the user wants to delete.
@@ -268,7 +268,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Todo { ws, action } => todo::run(ws, action, cli.port),
         Cmd::AgentTool { ws, action } => agent_tool::run(ws, action, cli.port),
         Cmd::Process { ws, action } => process::run(ws, action, cli.port),
-        Cmd::Scratchpad { ws, action } => scratchpad::run(ws, action, cli.port),
+        Cmd::Note { ws, action } => note::run(ws, action, cli.port),
         Cmd::Search { ws } => search::run(ws, cli.port),
         Cmd::IdKind { ws, id } => id_kind::run(ws, id, cli.port),
         Cmd::AgentExec { ws, id } => agent::exec_in_pane(ws, id, cli.port),

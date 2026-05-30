@@ -16,10 +16,10 @@ pub struct ProjectId(pub(crate) i64);
 /// A shared, append-oriented note identified by a stable numeric id.
 ///
 /// The `id` (not the `title`) is the durable handle and the projected filename,
-/// so renaming a scratchpad never moves its file. The id is unique within its
+/// so renaming a note never moves its file. The id is unique within its
 /// project and restarts at 1 in each project.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Scratchpad {
+pub struct Note {
     pub id: u64,
     pub title: String,
     pub body: String,
@@ -31,12 +31,12 @@ pub struct Scratchpad {
     pub updated_at: String,
 }
 
-/// A set of optional edits to a [`Scratchpad`], applied by
-/// [`crate::Store::scratchpad_update`].
+/// A set of optional edits to a [`Note`], applied by
+/// [`crate::Store::note_update`].
 ///
 /// Each `None` field leaves that attribute untouched; each `Some` replaces it.
 #[derive(Debug, Default, Clone)]
-pub struct ScratchpadPatch {
+pub struct NotePatch {
     pub title: Option<String>,
     pub body: Option<String>,
     pub tags: Option<Vec<String>>,

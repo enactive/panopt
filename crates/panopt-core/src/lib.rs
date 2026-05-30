@@ -1,6 +1,6 @@
 //! `panopt-core` - the runtime- and transport-agnostic core of PANopt.
 //!
-//! Holds the shared todo and scratchpad state for every project in one SQLite
+//! Holds the shared todo and note state for every project in one SQLite
 //! database, tracks connected agents and their advisory locks in memory, and
 //! projects each project's state to markdown files on disk. It is deliberately
 //! free of any MCP, async, or HTTP dependency so a different front-end (a TUI,
@@ -19,6 +19,6 @@ mod state;
 pub use error::CoreError;
 pub use model::{
     Agent, AgentTool, AgentToolPatch, KeySource, Lock, Priority, Process, ProcessKind,
-    ProcessPatch, ProjectId, Scratchpad, ScratchpadPatch, Todo, TodoComment, TodoPatch, TodoStatus,
+    ProcessPatch, ProjectId, Note, NotePatch, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 pub use state::Store;

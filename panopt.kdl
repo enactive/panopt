@@ -1,7 +1,7 @@
 // PANopt cockpit layout for Zellij.
 //
 // Left: five plugin panes stacked vertically (25% column), one per resource
-// kind - todos, agents, terminals, commands, scratchpads. Each is its own
+// kind - todos, agents, terminals, commands, notes. Each is its own
 // Zellij plugin instance running the same wasm with a distinct `mode` value;
 // they are pinned full-height by the `ui` tab template.
 // Right: a single content pane the five plugin panes swap into.
@@ -39,7 +39,7 @@ layout {
                 }
                 pane size="25%" {
                     plugin location="file:/Users/user/p/panopt/crates/panopt-zellij/target/wasm32-wasip1/release/panopt-zellij.wasm" {
-                        mode "scratchpads"
+                        mode "notes"
                     }
                 }
             }

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use crate::model::{Agent, AgentTool, Lock, Process, Scratchpad, Todo, TodoStatus};
+use crate::model::{Agent, AgentTool, Lock, Process, Note, Todo, TodoStatus};
 
 /// Per-process counter giving each temp file a unique name, so two concurrent
 /// writes to the same target never collide on the temp path.
@@ -39,19 +39,19 @@ fn todo_path(ws: &Path, id: u64) -> PathBuf {
     todos_dir(ws).join(format!("{id}.md"))
 }
 
-fn scratchpad_dir(ws: &Path) -> PathBuf {
-    panopt_dir(ws).join("scratchpad")
+fn note_dir(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("note")
 }
 
-fn scratchpad_path(ws: &Path, id: u64) -> PathBuf {
-    scratchpad_dir(ws).join(format!("{id}.md"))
+fn note_path(ws: &Path, id: u64) -> PathBuf {
+    note_dir(ws).join(format!("{id}.md"))
 }
 
-/// The scratchpad index file: one line linking every per-scratchpad file. The
-/// cockpit plugin reads it to list scratchpads (the per-pad files carry no
+/// The note index file: one line linking every per-note file. The
+/// cockpit plugin reads it to list notes (the per-pad files carry no
 /// index of their own).
-fn scratchpads_index_path(ws: &Path) -> PathBuf {
-    panopt_dir(ws).join("scratchpads.md")
+fn notes_index_path(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("notes.md")
 }
 
 /// The agent-tools projection: durable agent configurations (config layer).
@@ -181,12 +181,12 @@ pub(crate) fn render_todo_md(todo: &Todo) -> String {
     out
 }
 
-/// Render a scratchpad as a `---` frontmatter block of tags + timestamps, the
+/// Render a note as a `---` frontmatter block of tags + timestamps, the
 /// title as an H1, then its body verbatim. The frontmatter mirrors
 /// `render_todo_md` so every per-item file in the projection carries the same
 /// structured-then-prose shape. Empty `tags` renders as `tags: ` (no special
 /// case), exactly like todos do.
-pub(crate) fn render_scratchpad_md(pad: &Scratchpad) -> String {
+pub(crate) fn render_note_md(pad: &Note) -> String {
     let mut out = String::from("---\n");
     out.push_str(&format!("tags: {}\n", pad.tags.join(", ")));
     out.push_str(&format!("created: {}\n", pad.created_at));
@@ -200,20 +200,20 @@ pub(crate) fn render_scratchpad_md(pad: &Scratchpad) -> String {
     out
 }
 
-/// Render the scratchpad index: one line per scratchpad, each linking to that
-/// scratchpad's own file. `pads` is `(id, title, updated_at)`, id-ascending;
+/// Render the note index: one line per note, each linking to that
+/// note's own file. `pads` is `(id, title, updated_at)`, id-ascending;
 /// the `updated_at` is embedded in the trailing label so every append changes
 /// the rendered bytes, which is how the cockpit sidebar (a 1s file poller)
 /// notices the change.
-pub(crate) fn render_scratchpads_index_md(pads: &[(u64, String, String)]) -> String {
-    let mut out = String::from("# Scratchpads\n\n");
+pub(crate) fn render_notes_index_md(pads: &[(u64, String, String)]) -> String {
+    let mut out = String::from("# Notes\n\n");
     if pads.is_empty() {
-        out.push_str("_(no scratchpads)_\n");
+        out.push_str("_(no notes)_\n");
         return out;
     }
     for (id, title, updated) in pads {
         out.push_str(&format!(
-            "- [#{id}](scratchpad/{id}.md) {title} - updated {updated}\n",
+            "- [#{id}](note/{id}.md) {title} - updated {updated}\n",
         ));
     }
     out
@@ -355,13 +355,13 @@ pub(crate) fn render_locks_md(locks: &[Lock]) -> String {
 /// before any tool call.
 pub(crate) fn bootstrap(ws: &Path) -> io::Result<()> {
     fs::create_dir_all(panopt_dir(ws))?;
-    fs::create_dir_all(scratchpad_dir(ws))?;
+    fs::create_dir_all(note_dir(ws))?;
     fs::create_dir_all(todos_dir(ws))?;
     atomic_write(&panopt_dir(ws).join(".gitignore"), "*\n")?;
     atomic_write(&todos_index_path(ws), &render_todos_index_md(&[]))?;
     atomic_write(
-        &scratchpads_index_path(ws),
-        &render_scratchpads_index_md(&[]),
+        &notes_index_path(ws),
+        &render_notes_index_md(&[]),
     )?;
     atomic_write(&agent_tools_path(ws), &render_agent_tools_md(&[]))?;
     atomic_write(&processes_path(ws), &render_processes_md(&[]))?;
@@ -406,26 +406,26 @@ pub(crate) fn project_todos(ws: &Path, todos: &[Todo]) -> io::Result<()> {
     Ok(())
 }
 
-/// Rewrite the one `.panopt/scratchpad/<id>.md` for the given scratchpad.
-pub(crate) fn project_scratchpad(ws: &Path, pad: &Scratchpad) -> io::Result<()> {
-    atomic_write(&scratchpad_path(ws, pad.id), &render_scratchpad_md(pad))
+/// Rewrite the one `.panopt/note/<id>.md` for the given note.
+pub(crate) fn project_note(ws: &Path, pad: &Note) -> io::Result<()> {
+    atomic_write(&note_path(ws, pad.id), &render_note_md(pad))
 }
 
-/// Rewrite `.panopt/scratchpads.md` from the project's
-/// `(id, title, updated_at)` list, and sweep per-scratchpad files whose
-/// scratchpad has been deleted. Mirrors the sweep in [`project_todos`] so the
+/// Rewrite `.panopt/notes.md` from the project's
+/// `(id, title, updated_at)` list, and sweep per-note files whose
+/// note has been deleted. Mirrors the sweep in [`project_todos`] so the
 /// index is the source of truth for which files should exist.
-pub(crate) fn project_scratchpads_index(
+pub(crate) fn project_notes_index(
     ws: &Path,
     pads: &[(u64, String, String)],
 ) -> io::Result<()> {
     atomic_write(
-        &scratchpads_index_path(ws),
-        &render_scratchpads_index_md(pads),
+        &notes_index_path(ws),
+        &render_notes_index_md(pads),
     )?;
 
     let live: HashSet<u64> = pads.iter().map(|(id, _, _)| *id).collect();
-    if let Ok(entries) = fs::read_dir(scratchpad_dir(ws)) {
+    if let Ok(entries) = fs::read_dir(note_dir(ws)) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let stem = match name.to_string_lossy().strip_suffix(".md") {
@@ -581,8 +581,8 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_renders_frontmatter_title_then_body() {
-        let pad = Scratchpad {
+    fn note_renders_frontmatter_title_then_body() {
+        let pad = Note {
             id: 3,
             title: "notes".into(),
             body: "line one".into(),
@@ -591,7 +591,7 @@ mod tests {
             updated_at: "2026-05-23 18:05:21".into(),
         };
         assert_eq!(
-            render_scratchpad_md(&pad),
+            render_note_md(&pad),
             "---\n\
              tags: \n\
              created: 2026-05-23 18:05:00\n\
@@ -605,8 +605,8 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_frontmatter_carries_a_comma_joined_tags_line() {
-        let pad = Scratchpad {
+    fn note_frontmatter_carries_a_comma_joined_tags_line() {
+        let pad = Note {
             id: 5,
             title: "n".into(),
             body: String::new(),
@@ -614,7 +614,7 @@ mod tests {
             created_at: "2026-05-27 00:00:00".into(),
             updated_at: "2026-05-27 00:00:00".into(),
         };
-        let rendered = render_scratchpad_md(&pad);
+        let rendered = render_note_md(&pad);
         assert!(
             rendered.contains("\ntags: foo, bar\n"),
             "expected `tags: foo, bar` in frontmatter, got:\n{rendered}"
@@ -715,14 +715,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         bootstrap(dir.path()).unwrap();
 
-        assert!(dir.path().join(".panopt/scratchpad").is_dir());
+        assert!(dir.path().join(".panopt/note").is_dir());
         assert!(dir.path().join(".panopt/todos").is_dir());
         assert_eq!(
             fs::read_to_string(dir.path().join(".panopt/.gitignore")).unwrap(),
             "*\n"
         );
         assert!(dir.path().join(".panopt/todos.md").is_file());
-        assert!(dir.path().join(".panopt/scratchpads.md").is_file());
+        assert!(dir.path().join(".panopt/notes.md").is_file());
         assert!(dir.path().join(".panopt/agent_tools.md").is_file());
         assert!(dir.path().join(".panopt/processes.md").is_file());
         assert!(dir.path().join(".panopt/agents.md").is_file());
@@ -745,15 +745,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_scratchpads_index_renders_placeholder() {
+    fn empty_notes_index_renders_placeholder() {
         assert_eq!(
-            render_scratchpads_index_md(&[]),
-            "# Scratchpads\n\n_(no scratchpads)_\n"
+            render_notes_index_md(&[]),
+            "# Notes\n\n_(no notes)_\n"
         );
     }
 
     #[test]
-    fn scratchpads_index_links_each_pad() {
+    fn notes_index_links_each_pad() {
         let pads = vec![
             (
                 1,
@@ -763,10 +763,10 @@ mod tests {
             (2, "scratch".to_string(), "2026-05-23 18:06:00".to_string()),
         ];
         assert_eq!(
-            render_scratchpads_index_md(&pads),
-            "# Scratchpads\n\n\
-             - [#1](scratchpad/1.md) design notes - updated 2026-05-23 18:05:21\n\
-             - [#2](scratchpad/2.md) scratch - updated 2026-05-23 18:06:00\n"
+            render_notes_index_md(&pads),
+            "# Notes\n\n\
+             - [#1](note/1.md) design notes - updated 2026-05-23 18:05:21\n\
+             - [#2](note/2.md) scratch - updated 2026-05-23 18:06:00\n"
         );
     }
 

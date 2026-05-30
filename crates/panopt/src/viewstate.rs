@@ -1,7 +1,7 @@
 //! Local, per-cockpit view state for the viewer panes.
 //!
 //! A viewer remembers where you were in each item it has shown - the scroll
-//! offset of a long scratchpad, the cursor row of a list - so leaving an item
+//! offset of a long note, the cursor row of a list - so leaving an item
 //! and returning lands in the same place. This is a personal preference, not
 //! coordination state, so it lives on the cockpit side under the user's config
 //! directory, never in the daemon or the shared `.panopt/` projection.

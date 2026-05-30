@@ -12,7 +12,7 @@ code editor itself.
 
 In one line: **PANopt is a coordination daemon.** Agents run as terminal
 sessions in Zellij; PANopt is the shared brain they talk to - a single MCP
-server holding todos, scratchpads, locks, and an agent registry, surfaced live
+server holding todos, notes, locks, and an agent registry, surfaced live
 as a Zellij sidebar plugin and as ordinary projected files.
 
 The name fits the design. A panopticon is a structure with a single vantage
@@ -29,7 +29,7 @@ core plus a web frontend in a system webview). It does three things:
 1. Wraps agent CLIs in a GUI - launch and manage multiple terminal-based
    agents from one window.
 2. Runs an MCP server for inter-agent coordination.
-3. Provides shared todos and scratchpads across those agents.
+3. Provides shared todos and notes across those agents.
 
 The user runs Linux and wants this workflow there. PANopt itself is not
 platform-bound, though: it is portable Rust, verified end-to-end on macOS, with
@@ -46,9 +46,9 @@ document.
 
 ### Goals
 
-- Inter-agent coordination: multiple agent CLIs sharing todos, scratchpads,
+- Inter-agent coordination: multiple agent CLIs sharing todos, notes,
   advisory locks, and a live agent registry.
-- Todos and scratchpads that feel first-class in the cockpit.
+- Todos and notes that feel first-class in the cockpit.
 - Minimal maintenance burden. One maintainer, personal tool, indefinite
   lifespan.
 - Work with the tools that already exist (Zellij, MCP-capable agent CLIs)
@@ -73,7 +73,7 @@ rejected. It is deliberately the longest section.
 ### 4.1 Understanding the original Solo
 
 To replicate Solo's behavior, PANopt needs Solo's MCP surface, its on-disk
-formats for todos and scratchpads, and its process model.
+formats for todos and notes, and its process model.
 
 The correct approach is dynamic, black-box observation, which is cheap because
 Tauri apps expose almost everything:
@@ -130,7 +130,7 @@ Solo breaks cleanly into three parts (Section 2):
 1. **Wrap agent CLIs in a GUI.** A commodity - a terminal multiplexer manages
    multiple agent CLI sessions as panes and tabs natively.
 2. **MCP server for inter-agent coordination.** No existing tool provides this.
-3. **Shared todos and scratchpads.** No existing tool provides this.
+3. **Shared todos and notes.** No existing tool provides this.
 
 Parts 2 and 3 are the real, differentiated value. Part 1 is not worth building.
 
@@ -149,7 +149,7 @@ Section 4.6 records why the host is a multiplexer, not an editor.
 ### 4.6 The host: a terminal multiplexer, not an editor
 
 The first version of this design used Zed as the host - agents as Zed terminal
-sessions, todos and scratchpads as files in Zed. Building it surfaced three
+sessions, todos and notes as files in Zed. Building it surfaced three
 problems, none fixable without forking Zed:
 
 1. **The agent surface is not first-class.** Zed runs external agents in its
@@ -195,12 +195,12 @@ files and browse code - a tool reached for, not the frame.
 - **PANopt Zellij plugin** - a Rust-to-WASM Zellij plugin. The cockpit runs
   five instances of the same wasm stacked in the left column, keyed off a
   `mode` configuration value (`todos`, `agents`, `terminals`, `commands`,
-  `scratchpads`), so each pane renders exactly one kind. Selecting an item
+  `notes`), so each pane renders exactly one kind. Selecting an item
   swaps its pane into the single content slot on the right (Section 5.5). The
   Todos pane doubles as the cockpit gatekeeper, owning the close-gate and
   blank-pane spawn pipes (Section 5.5).
 - **Viewer panes** - long-lived `panopt _viewer` panes that display a todo,
-  scratchpad, or section list, re-pointed by the sidebar through a routing file.
+  note, or section list, re-pointed by the sidebar through a routing file.
 - **Agents** - external CLIs (Claude Code and similar), run as Zellij panes or
   tabs, each configured with the daemon as an MCP server.
 - **`panopt`** - the launcher CLI. Starts `panoptd` on demand and opens agent
@@ -218,7 +218,7 @@ files and browse code - a tool reached for, not the frame.
   |  five PANopt plugin panes   one content pane          |
   |  (todos / agents /          (viewer / agent / ...)    |
   |   terminals / commands /                              |
-  |   scratchpads, stacked)                               |
+  |   notes, stacked)                               |
   +------|--------------------|------|-------------------+
          | reads .panopt/*.md |  MCP |  MCP
          | + focuses panes    | (HTTP)|(HTTP)
@@ -226,7 +226,7 @@ files and browse code - a tool reached for, not the frame.
   +------------------------------------------------------+
   |                   panoptd  (daemon)                  |
   |                                                      |
-  |   MCP server  ->  state: todos, scratchpads, locks,  |
+  |   MCP server  ->  state: todos, notes, locks,  |
   |                   agent registry, agent_tools,       |
   |                   processes                          |
   |                        |                             |
@@ -297,7 +297,7 @@ An agent is registered with the daemon automatically: the first tool call on a
 connection adds it to the agent registry (Section 6.3), keyed by its connection
 key. The `identify` tool then enriches that entry with a human name and
 status, and `whoami` / `agent_list` read it back. An agent gains the
-coordination tools - `todo_*`, `scratchpad_*`, the registry tools, and `lock_*`
+coordination tools - `todo_*`, `note_*`, the registry tools, and `lock_*`
 - simply by connecting. Because this plane is pure MCP, it works
 identically with any MCP-capable agent and any host - Zellij today, a bare
 shell, or anything else later. The coordination core is never welded to the
@@ -310,7 +310,7 @@ Zellij-native:
 
 1. **Filesystem projection (the backbone).** On every state mutation the daemon
    atomically rewrites markdown files under `.panopt/` (`todos.md`,
-   `scratchpad/<id>.md`) - write to a temp file, then rename, so a reader never
+   `note/<id>.md`) - write to a temp file, then rename, so a reader never
    sees a half-written file. Any editor with live file-reload renders them as
    ordinary buffers: file-tree entries, syntax highlighting, search, splits,
    pinned tabs. This needs zero host integration and is the reliable backbone
@@ -319,7 +319,7 @@ Zellij-native:
 2. **The Zellij plugin (the cockpit sidebar).** The same Rust-to-WASM plugin
    is instantiated five times in the layout, stacked vertically in the left
    column. Each instance is keyed by a `mode` configuration value
-   (`todos`, `agents`, `terminals`, `commands`, `scratchpads`) and renders
+   (`todos`, `agents`, `terminals`, `commands`, `notes`) and renders
    exactly one kind, read from the projected `.panopt/` files and Zellij's
    own live pane state. Zellij treats distinct configurations as distinct
    plugins, so the five panes share code but not state. Each pane carries its
@@ -329,7 +329,7 @@ Zellij-native:
    starts with the five sidebar panes and a single empty `panopt _viewer`;
    selecting an item swaps its pane into that one slot and suppresses whatever
    was there - a suppressed pane keeps running, hidden, with no stack and no
-   title bar. Todos, scratchpads, and section lists all share the one
+   title bar. Todos, notes, and section lists all share the one
    re-pointable viewer pane, which the plugin re-points by writing a small
    routing file the viewer polls; an agent, command, or terminal is its own
    pane, swapped in whole. Moving the cursor previews the selected item in the
@@ -391,15 +391,20 @@ a frontmatter field becomes a change the daemon parses back into an update.
 Richer mutations go through the sidebar plugin or MCP tools. The files are a
 view first and an input second.
 
-### 6.2 Scratchpads
+### 6.2 Notes
 
 Append-oriented shared notes, organized into sections and tags.
 
-Projection: one file per scratchpad at `.panopt/scratchpad/<id>.md`, plus a
-`.panopt/scratchpads.md` index that links them all (the cockpit reads the index
-to list them). Because scratchpads are append-mostly, bidirectional sync is
+Projection: one file per note at `.panopt/note/<id>.md`, plus a
+`.panopt/notes.md` index that links them all (the cockpit reads the index
+to list them). Because notes are append-mostly, bidirectional sync is
 clean: a user editing in any editor and an agent appending via MCP both land,
 and the daemon reconciles by section. Appends are conflict-free by construction.
+
+These were called *scratchpads* through schema V8; V9 renamed the table and the
+`note_*` tool surface (todo #79) because the concept is durable, not ephemeral.
+Whether a note should additionally carry a `type` (note / plan / memory /
+inter-agent text) is a deferred follow-up - notes are currently untyped.
 
 ### 6.3 Agent registry and locks
 
@@ -459,7 +464,7 @@ A single SQLite database holds every project. One database file is simpler to
 operate than a file per project, and SQLite gives durability and queryability
 with no server.
 
-Five tables: `projects`, `todos`, `scratchpads`, `agent_tools`, and `processes`
+Five tables: `projects`, `todos`, `notes`, `agent_tools`, and `processes`
 (Section 6.6). The latter four are keyed by `(project_id, id)`, so ids restart
 at 1 in each project and read naturally in the projected files. A single
 per-project `next_id` counter on the `projects` row is shared across all four
@@ -476,7 +481,7 @@ and no project ever sees it.
 
 The daemon is the single source of truth. Projected files are derived state.
 
-- Scratchpads: section-based merge; appends never conflict.
+- Notes: section-based merge; appends never conflict.
 - Todos: the projected file is read-mostly. Checkbox toggles are parsed back;
   structural edits go through commands. Where a direct file edit and a daemon
   update collide, the daemon's value wins (last-writer-wins under daemon
@@ -505,7 +510,7 @@ process that referenced it; the live instance keeps running.
 
 Both tables draw ids from the unified per-project `next_id` counter
 (Section 6.4), so a `#N` reference still resolves to exactly one row across
-todos, scratchpads, agent_tools, and processes.
+todos, notes, agent_tools, and processes.
 
 Whether a process is currently running is *not* stored today: the cockpit
 derives it from live Zellij pane state, same as the pre-V6 roster did. The
@@ -535,10 +540,10 @@ their shared state appears live as files.
 Built: `panopt-core` (state and filesystem projection, no protocol
 dependencies) and `panoptd` (an MCP server over Streamable HTTP, built on
 `rmcp`, `tokio`, and `axum`). In-memory state behind a `Mutex`, one-way
-projection - no SQLite yet. Seven tools: `scratchpad_create`, `scratchpad_list`,
-`scratchpad_append`, `scratchpad_read`, `todo_create`, `todo_list`,
-`todo_complete` (`scratchpad_create` and `scratchpad_list` were added to the
-original five: scratchpads are id-keyed, so a create tool mints ids and a list
+projection - no SQLite yet. Seven tools: `note_create`, `note_list`,
+`note_append`, `note_read`, `todo_create`, `todo_list`,
+`todo_complete` (`note_create` and `note_list` were added to the
+original five: notes are id-keyed, so a create tool mints ids and a list
 tool discovers them).
 
 Verified: two agents coordinating through a single daemon over MCP; every
@@ -570,7 +575,7 @@ surface. None carried architectural risk - they are more of the same once the
 proven loops exist. Persistence, multi-project support, the agent registry,
 advisory locks, and the full todo data model with its editing tools and
 per-file projection have since been built (Sections 5.3, 6.4, 6.3, and 6.1);
-bidirectional editing and the remaining scratchpad and process tools remain.
+bidirectional editing and the remaining note and process tools remain.
 
 ## 8. Technology Choices
 

@@ -106,7 +106,7 @@ pub fn run(ws: Option<PathBuf>, cmd: TodoCmd, port: u16) -> Result<()> {
 /// The daemon MCP endpoint for project `ws`, scoped to a non-registering
 /// `observer` connection and carrying the bearer token as a query parameter.
 /// Shared by every `panopt` subcommand that talks to the daemon (todo,
-/// scratchpad, agent-tool, process, id-kind, viewer panes, the form).
+/// note, agent-tool, process, id-kind, viewer panes, the form).
 ///
 /// The token sits on the URL rather than in a header because the minimal
 /// `mcpclient` we ship only knows how to set the session-id header; pinning

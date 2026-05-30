@@ -1,7 +1,7 @@
 //! PANopt coordination sidebar - a Zellij plugin.
 //!
 //! Each plugin pane renders one kind of resource - todos, agents, terminals,
-//! commands, or scratchpads - selected by the `mode` value in its layout
+//! commands, or notes - selected by the `mode` value in its layout
 //! config. The five panes stack vertically in the cockpit's left column, each
 //! pinned to its own fixed proportion so adding or removing panes on the
 //! right cannot reshape any of them. A keyboard cursor walks the pane's items
@@ -11,7 +11,7 @@
 //! The cockpit is these five panes plus one content pane on the right.
 //! Selecting an item swaps its pane into that one slot and suppresses
 //! whatever was there - a suppressed pane keeps running, just hidden, no
-//! stack and no title bar. Documents (todos, scratchpads, lists) all share
+//! stack and no title bar. Documents (todos, notes, lists) all share
 //! one re-pointable `panopt _viewer` pane; agents, commands, and terminals
 //! are each their own pane. Moving the cursor previews the selected item in
 //! the slot - or clears the slot when the row has nothing to show - always
@@ -38,7 +38,7 @@ use zellij_tile::prelude::*;
 /// Routing slot prefix for viewer panes the plugin spawns ad hoc. The layout
 /// boots one viewer with `--slot main`; further viewers spawned by
 /// [`PanoptPane::ensure_viewer_in_slot`] get unique names `v<mode-letter><n>`
-/// (`vt1`, `vs1`, `va1`, ...) so each pane has its own
+/// (`vt1`, `vn1`, `va1`, ...) so each pane has its own
 /// `.panopt/.cockpit/viewer-<slot>.json` routing file and the five plugin
 /// instances cannot collide on the same suffix. Per-pane routing keeps
 /// sidebar navigation single-pane: only the slot's viewer re-points on a
@@ -73,7 +73,7 @@ enum Mode {
     Agents,
     Terminals,
     Commands,
-    Scratchpads,
+    Notes,
 }
 
 impl Mode {
@@ -83,7 +83,7 @@ impl Mode {
             "agents" => Some(Mode::Agents),
             "terminals" => Some(Mode::Terminals),
             "commands" => Some(Mode::Commands),
-            "scratchpads" => Some(Mode::Scratchpads),
+            "notes" => Some(Mode::Notes),
             _ => None,
         }
     }
@@ -94,7 +94,7 @@ impl Mode {
             Mode::Agents => "Agents",
             Mode::Terminals => "Terminals",
             Mode::Commands => "Commands",
-            Mode::Scratchpads => "Scratchpads",
+            Mode::Notes => "Notes",
         }
     }
 
@@ -106,7 +106,7 @@ impl Mode {
             Mode::Agents => 'a',
             Mode::Terminals => 'r',
             Mode::Commands => 'c',
-            Mode::Scratchpads => 's',
+            Mode::Notes => 'n',
         }
     }
 
@@ -119,7 +119,7 @@ impl Mode {
             Mode::Agents => "agents",
             Mode::Terminals => "terminals",
             Mode::Commands => "commands",
-            Mode::Scratchpads => "scratchpads",
+            Mode::Notes => "notes",
         }
     }
 
@@ -132,7 +132,7 @@ impl Mode {
             Mode::Agents => "alt+2",
             Mode::Terminals => "alt+3",
             Mode::Commands => "alt+4",
-            Mode::Scratchpads => "alt+5",
+            Mode::Notes => "alt+5",
         }
     }
 
@@ -144,7 +144,7 @@ impl Mode {
             '2' => Some(Mode::Agents),
             '3' => Some(Mode::Terminals),
             '4' => Some(Mode::Commands),
-            '5' => Some(Mode::Scratchpads),
+            '5' => Some(Mode::Notes),
             _ => None,
         }
     }
@@ -410,8 +410,8 @@ struct PanoptPane {
     /// Todos parsed from `.panopt/todos.md`: `(id, label)`. Populated only
     /// when this pane's mode actually displays todos.
     todos: Vec<(u64, String)>,
-    /// Scratchpads parsed from `.panopt/scratchpads.md`: `(id, label)`.
-    scratchpads: Vec<(u64, String)>,
+    /// Notes parsed from `.panopt/notes.md`: `(id, label)`.
+    notes: Vec<(u64, String)>,
     /// Process instances parsed from `.panopt/processes.md`.
     /// TODO(#27): render agent_tools.md alongside processes once a spawn UI
     /// exists; until then the sidebar shows only live instances, same as the
@@ -612,7 +612,7 @@ struct Item {
 #[derive(Clone)]
 enum ItemTarget {
     Todo(u64),
-    Scratchpad(u64),
+    Note(u64),
     /// A process agent or command, by process id.
     Process(u64),
     /// An existing pane: an ad-hoc agent or a plain terminal.
@@ -1007,9 +1007,9 @@ impl PanoptPane {
                     self.todo_sort_2.label()
                 ));
             }
-            Mode::Scratchpads => {
-                lines.push("  n             new scratchpad".to_string());
-                lines.push("  x             delete scratchpad".to_string());
+            Mode::Notes => {
+                lines.push("  n             new note".to_string());
+                lines.push("  x             delete note".to_string());
             }
             Mode::Agents => {
                 lines.push("  n             new agent".to_string());
@@ -1096,7 +1096,7 @@ impl PanoptPane {
         let path = format!("/host/.panopt/.cockpit/viewer-{slot}.json");
         let body = fs::read_to_string(&path).unwrap_or_default();
         let (kind, id) = parse_viewer_routing(&body);
-        viewer_title_for(kind.as_deref(), id, &self.todos, &self.scratchpads)
+        viewer_title_for(kind.as_deref(), id, &self.todos, &self.notes)
     }
 
     /// Title for an ad-hoc agent pane (one spawned by `n` in the Agents pane
@@ -1126,7 +1126,7 @@ impl PanoptPane {
     // --- data ---
 
     /// Re-read whichever projected index files this mode needs. The Todos
-    /// pane reads only todos; Scratchpads only scratchpads; the Agents and
+    /// pane reads only todos; Notes only notes; the Agents and
     /// Commands modes share processes.md plus the agent label projection.
     fn reload_data(&mut self) {
         match self.mode {
@@ -1135,12 +1135,12 @@ impl PanoptPane {
                 // The Todos pane is the cockpit gatekeeper and titles every
                 // right-pane terminal in `sync_pane_titles`; it needs every
                 // projection a title can reference, not just its own list.
-                self.scratchpads = read_index("/host/.panopt/scratchpads.md");
+                self.notes = read_index("/host/.panopt/notes.md");
                 self.processes = read_processes("/host/.panopt/processes.md");
                 self.read_agent_labels();
             }
-            Mode::Scratchpads => {
-                self.scratchpads = read_index("/host/.panopt/scratchpads.md");
+            Mode::Notes => {
+                self.notes = read_index("/host/.panopt/notes.md");
             }
             Mode::Agents | Mode::Commands => {
                 self.processes = read_processes("/host/.panopt/processes.md");
@@ -1292,7 +1292,7 @@ impl PanoptPane {
     /// Allocate the next unique routing slot name for a viewer the plugin is
     /// about to spawn. The mode letter scopes the counter per-plugin-instance,
     /// so two panes spawning a viewer on the same tick still produce distinct
-    /// names (e.g. `vt1` from Todos, `vs1` from Scratchpads).
+    /// names (e.g. `vt1` from Todos, `vn1` from Notes).
     fn allocate_viewer_slot(&mut self) -> String {
         self.next_viewer_slot += 1;
         format!(
@@ -1440,12 +1440,12 @@ impl PanoptPane {
                     })
                     .collect()
             }
-            Mode::Scratchpads => self
-                .scratchpads
+            Mode::Notes => self
+                .notes
                 .iter()
                 .map(|(id, label)| Item {
                     label: format!("#{id} {label}"),
-                    target: ItemTarget::Scratchpad(*id),
+                    target: ItemTarget::Note(*id),
                     live: false,
                 })
                 .collect(),
@@ -1548,7 +1548,7 @@ impl PanoptPane {
     fn preview_cursor(&mut self) {
         match self.focused_target() {
             Some(ItemTarget::Todo(id)) => self.open_document("todo", Some(id), false),
-            Some(ItemTarget::Scratchpad(id)) => self.open_document("scratchpad", Some(id), false),
+            Some(ItemTarget::Note(id)) => self.open_document("note", Some(id), false),
             Some(ItemTarget::Process(id)) => match self.process_pane(id) {
                 Some(pane) => self.route_pane_to_slot(pane, false),
                 None => self.clear_slot(),
@@ -1610,8 +1610,8 @@ impl PanoptPane {
             BareKey::Char('n') if self.mode == Mode::Todos => {
                 self.open_document("new-todo", None, true)
             }
-            BareKey::Char('n') if self.mode == Mode::Scratchpads => {
-                self.open_document("new-scratchpad", None, true)
+            BareKey::Char('n') if self.mode == Mode::Notes => {
+                self.open_document("new-note", None, true)
             }
             BareKey::Char('n') if self.mode == Mode::Agents => self.spawn_agent_pane(None),
             BareKey::Char('L') => self.open_mode_list(true),
@@ -1738,19 +1738,19 @@ impl PanoptPane {
         };
         match target {
             ItemTarget::Todo(id) => self.open_document("todo", Some(id), focus),
-            ItemTarget::Scratchpad(id) => self.open_document("scratchpad", Some(id), focus),
+            ItemTarget::Note(id) => self.open_document("note", Some(id), focus),
             ItemTarget::Process(id) => self.activate_process(id, focus),
             ItemTarget::Pane(pane) => self.route_pane_to_slot(pane, focus),
         }
     }
 
     /// Open the full-list view in the slot for modes that have one. Todos
-    /// and Scratchpads display their respective lists; the agent/command/
+    /// and Notes display their respective lists; the agent/command/
     /// terminal modes are no-ops because their lists are already shown whole.
     fn open_mode_list(&mut self, focus: bool) {
         match self.mode {
             Mode::Todos => self.open_document("todo-list", None, focus),
-            Mode::Scratchpads => self.open_document("scratchpad-list", None, focus),
+            Mode::Notes => self.open_document("note-list", None, focus),
             _ => {}
         }
     }
@@ -1764,7 +1764,7 @@ impl PanoptPane {
         }
     }
 
-    /// Delete the focused item. Todos, scratchpads, and process rows go
+    /// Delete the focused item. Todos, notes, and process rows go
     /// through the `panopt` CLI (the daemon owns the durable state); ad-hoc
     /// agent panes and plain shell terminals are just closed via the host.
     fn delete_focused(&mut self) {
@@ -1778,9 +1778,7 @@ impl PanoptPane {
         };
         match target {
             ItemTarget::Todo(id) => self.spawn_delete_gate_dialog("todo", id, &label, cwd),
-            ItemTarget::Scratchpad(id) => {
-                self.spawn_delete_gate_dialog("scratchpad", id, &label, cwd)
-            }
+            ItemTarget::Note(id) => self.spawn_delete_gate_dialog("note", id, &label, cwd),
             ItemTarget::Process(id) => self.spawn_delete_gate_dialog("process", id, &label, cwd),
             // A "pane" target is a transient view (a terminal pane, an ad-hoc
             // agent pane) - closing it does not delete any persistent record,
@@ -1923,7 +1921,7 @@ impl PanoptPane {
         self.close_search_pane();
         match kind {
             "todo" => self.open_document("todo", Some(id), true),
-            "scratchpad" => self.open_document("scratchpad", Some(id), true),
+            "note" => self.open_document("note", Some(id), true),
             _ => {}
         }
     }
@@ -1960,11 +1958,8 @@ impl PanoptPane {
             "todo" => {
                 self.run_panopt(&["todo", "rm", &id.to_string(), "--port", &self.port], cwd);
             }
-            "scratchpad" => {
-                self.run_panopt(
-                    &["scratchpad", "rm", &id.to_string(), "--port", &self.port],
-                    cwd,
-                );
+            "note" => {
+                self.run_panopt(&["note", "rm", &id.to_string(), "--port", &self.port], cwd);
             }
             "process" => {
                 // Process delete also tears down its live pane (if any), the
@@ -1997,7 +1992,7 @@ impl PanoptPane {
 
     /// Stop the focused runnable: close its content pane. The underlying
     /// process row (when any) is left intact so `u` can spawn it again. For
-    /// docs (todos / scratchpads) this is a no-op since they have nothing
+    /// docs (todos / notes) this is a no-op since they have nothing
     /// to stop.
     fn stop_focused(&mut self) {
         match self.focused_target() {
@@ -2717,7 +2712,7 @@ fn viewer_title_for(
     kind: Option<&str>,
     id: Option<u64>,
     todos: &[(u64, String)],
-    scratchpads: &[(u64, String)],
+    notes: &[(u64, String)],
 ) -> String {
     match (kind, id) {
         (None, _) | (Some("empty"), _) => "Viewer".to_string(),
@@ -2725,20 +2720,20 @@ fn viewer_title_for(
             Some(t) => format!("Todo #{id} - {t}"),
             None => format!("Todo #{id}"),
         },
-        (Some("scratchpad"), Some(id)) => match lookup_title(scratchpads, id) {
-            Some(t) => format!("Scratchpad #{id} - {t}"),
-            None => format!("Scratchpad #{id}"),
+        (Some("note"), Some(id)) => match lookup_title(notes, id) {
+            Some(t) => format!("Note #{id} - {t}"),
+            None => format!("Note #{id}"),
         },
         (Some("todo-list"), _) => "Todos".to_string(),
-        (Some("scratchpad-list"), _) => "Scratchpads".to_string(),
+        (Some("note-list"), _) => "Notes".to_string(),
         (Some("new-todo"), _) => "New todo".to_string(),
-        (Some("new-scratchpad"), _) => "New scratchpad".to_string(),
+        (Some("new-note"), _) => "New note".to_string(),
         _ => "Viewer".to_string(),
     }
 }
 
 /// Look up an index entry's label by id, stripping the trailing
-/// `" - status, priority"` (todos) or `" - updated ..."` (scratchpads)
+/// `" - status, priority"` (todos) or `" - updated ..."` (notes)
 /// suffix that the projection format appends. The result is the bare title
 /// the user typed.
 fn lookup_title(index: &[(u64, String)], id: u64) -> Option<String> {
@@ -2800,7 +2795,7 @@ fn parse_index_line(line: &str) -> Option<(u64, String)> {
     let close = line[hash..].find(']')? + hash;
     let id: u64 = line[hash..close].parse().ok()?;
     let label_at = line[close..].find(") ")? + close + 2;
-    // The scratchpad/todo projections render as `- [#N](path) {title} - <sfx>`,
+    // The note/todo projections render as `- [#N](path) {title} - <sfx>`,
     // so an empty title leaves the raw chunk starting with a space (one of the
     // two literal spaces around `{title}`). `.trim()` collapses both the
     // empty-title case and the non-empty case onto the same shape - a label
@@ -2944,16 +2939,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_scratchpad_index_line() {
-        let (id, label) = parse_index_line("- [#7](scratchpad/7.md) design notes").unwrap();
+    fn parses_a_note_index_line() {
+        let (id, label) = parse_index_line("- [#7](note/7.md) design notes").unwrap();
         assert_eq!(id, 7);
         assert_eq!(label, "design notes");
     }
 
     #[test]
-    fn parses_a_scratchpad_index_line_with_updated_timestamp() {
+    fn parses_a_note_index_line_with_updated_timestamp() {
         let (id, label) =
-            parse_index_line("- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21")
+            parse_index_line("- [#1](note/1.md) Sample Notes - updated 2026-05-23 18:05:21")
                 .unwrap();
         assert_eq!(id, 1);
         assert_eq!(label, "Sample Notes - updated 2026-05-23 18:05:21");
@@ -2967,17 +2962,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_title_scratchpad_line_keeps_the_suffix_in_the_label() {
+    fn empty_title_note_line_keeps_the_suffix_in_the_label() {
         // After a user clears the title field, the projection renders
-        // `- [#N](scratchpad/N.md)  - updated <ts>` (double space). The
+        // `- [#N](note/N.md)  - updated <ts>` (double space). The
         // parser strips one of the spaces, leaving the label as
         // "- updated <ts>" - suffix-only, no title.
         let (id, label) =
-            parse_index_line("- [#73](scratchpad/73.md)  - updated 2026-05-27 07:00:00").unwrap();
+            parse_index_line("- [#73](note/73.md)  - updated 2026-05-27 07:00:00").unwrap();
         assert_eq!(id, 73);
         assert_eq!(label, "- updated 2026-05-27 07:00:00");
         // lookup_title recognises the leading "- " as the empty-title shape
-        // and returns None so the pane title falls back to "Scratchpad #N".
+        // and returns None so the pane title falls back to "Note #N".
         let pads = vec![(73u64, label)];
         assert!(lookup_title(&pads, 73).is_none());
     }
@@ -3064,8 +3059,8 @@ mod tests {
         );
         // Order is not constrained by the writer, but be tolerant anyway.
         assert_eq!(
-            parse_viewer_routing(r#"{"id":7,"kind":"scratchpad"}"#),
-            (Some("scratchpad".to_string()), Some(7))
+            parse_viewer_routing(r#"{"id":7,"kind":"note"}"#),
+            (Some("note".to_string()), Some(7))
         );
     }
 
@@ -3096,24 +3091,24 @@ mod tests {
             "Todo #99"
         );
         assert_eq!(
-            viewer_title_for(Some("scratchpad"), Some(5), &todos, &pads),
-            "Scratchpad #5 - design notes"
+            viewer_title_for(Some("note"), Some(5), &todos, &pads),
+            "Note #5 - design notes"
         );
         assert_eq!(
             viewer_title_for(Some("todo-list"), None, &todos, &pads),
             "Todos"
         );
         assert_eq!(
-            viewer_title_for(Some("scratchpad-list"), None, &todos, &pads),
-            "Scratchpads"
+            viewer_title_for(Some("note-list"), None, &todos, &pads),
+            "Notes"
         );
         assert_eq!(
             viewer_title_for(Some("new-todo"), None, &todos, &pads),
             "New todo"
         );
         assert_eq!(
-            viewer_title_for(Some("new-scratchpad"), None, &todos, &pads),
-            "New scratchpad"
+            viewer_title_for(Some("new-note"), None, &todos, &pads),
+            "New note"
         );
         // Unknown kind: do not invent a name, just label generically.
         assert_eq!(
@@ -3153,7 +3148,7 @@ mod tests {
             ('2', Mode::Agents),
             ('3', Mode::Terminals),
             ('4', Mode::Commands),
-            ('5', Mode::Scratchpads),
+            ('5', Mode::Notes),
         ] {
             assert_eq!(Mode::from_hotkey(digit), Some(mode));
             assert_eq!(mode.hotkey_hint(), format!("alt+{digit}"));
@@ -3373,7 +3368,7 @@ mod tests {
             ("agents", Mode::Agents),
             ("terminals", Mode::Terminals),
             ("commands", Mode::Commands),
-            ("scratchpads", Mode::Scratchpads),
+            ("notes", Mode::Notes),
         ] {
             assert_eq!(Mode::parse(s), Some(m));
         }
@@ -3389,7 +3384,7 @@ mod tests {
             Mode::Agents,
             Mode::Terminals,
             Mode::Commands,
-            Mode::Scratchpads,
+            Mode::Notes,
         ]
         .into_iter()
         .map(|m| m.letter())
@@ -3400,9 +3395,9 @@ mod tests {
     #[test]
     fn viewer_slot_carries_mode_letter() {
         let mut todos = pane_with(Mode::Todos);
-        let mut scratchpads = pane_with(Mode::Scratchpads);
+        let mut notes = pane_with(Mode::Notes);
         let a = todos.allocate_viewer_slot();
-        let b = scratchpads.allocate_viewer_slot();
+        let b = notes.allocate_viewer_slot();
         // Two panes both allocating their first slot - the mode letter is
         // what stops them from colliding on the same `v1`.
         assert_ne!(a, b);

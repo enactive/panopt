@@ -959,7 +959,7 @@ impl TodoForm {
         // delete state ("a" while removing "abc") would be the value the
         // daemon and the sidebar see, and the next refresh would replay that
         // orphan character back into the title field. Mirrors the
-        // ScratchpadForm fix for todo #75.
+        // NoteForm fix for todo #75.
         if self.id.is_none() && title.is_empty() {
             return Ok(());
         }
@@ -1788,7 +1788,7 @@ fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
 }
 
 /// Border color for a bordered form field, keyed on whether it has focus.
-/// Shared by both the todo and scratchpad forms (Title, Body, Comments, Tags).
+/// Shared by both the todo and note forms (Title, Body, Comments, Tags).
 /// The focused field takes the accent; every unfocused border drops to a dim
 /// `#444444` so the focused field stands alone and the rest recede. An absolute
 /// RGB, rather than `Color::DarkGray`, keeps the de-emphasis from being undone
@@ -1938,7 +1938,7 @@ pub(crate) fn highlight_line(seg: &str, from: usize, to: usize) -> Line<'static>
 /// `Ctrl-D` to page the cursor by half the visible Body height (vim/less
 /// convention), then lets every other key fall through to the textarea.
 ///
-/// Why: Phase 2 of scratchpad #91 globally bound `PageUp` / `PageDown` to
+/// Why: Phase 2 of note #91 globally bound `PageUp` / `PageDown` to
 /// Zellij's `PageScrollUp` / `PageScrollDown`, which means a form pane's
 /// PageUp does nothing (the form is on the terminal's alt-screen, so Zellij
 /// scrollback is empty). The form needs its own paging gesture; `Ctrl-U` /

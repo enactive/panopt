@@ -1,7 +1,7 @@
 //! The `panopt id-kind` subcommand: a thin MCP client of the daemon's
 //! `id_kind` tool.
 //!
-//! Resolves a numeric id to its resource kind (todo / scratchpad /
+//! Resolves a numeric id to its resource kind (todo / note /
 //! agent-tool / process) and a short label, using the unified per-project
 //! id counter (see `panopt-core` V5 migration). Errors out with the daemon's
 //! "id N not found" when the id is unallocated or soft-deleted.

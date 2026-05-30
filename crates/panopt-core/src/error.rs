@@ -5,9 +5,9 @@ use std::path::PathBuf;
 /// Errors returned by [`crate::Store`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
-    /// No scratchpad exists with the given id in the project.
-    #[error("scratchpad {0} not found")]
-    ScratchpadNotFound(u64),
+    /// No note exists with the given id in the project.
+    #[error("note {0} not found")]
+    NoteNotFound(u64),
 
     /// No todo exists with the given id in the project.
     #[error("todo {0} not found")]

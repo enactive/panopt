@@ -1,16 +1,16 @@
 //! `panopt _viewer` - a long-lived cockpit content pane.
 //!
 //! Renders one item from the project's `.panopt/` projection - a list of
-//! items - or, for the todo and scratchpad kinds, hosts the matching shared
-//! editable form ([`crate::todo_form`] / [`crate::scratchpad_form`]). The
+//! items - or, for the todo and note kinds, hosts the matching shared
+//! editable form ([`crate::todo_form`] / [`crate::note_form`]). The
 //! sidebar plugin re-points the pane at a different item by writing a routing
 //! file the viewer polls; switching item saves the outgoing item's scroll
 //! position and restores the incoming one's (see [`crate::viewstate`]).
 //!
 //! Index views come from the projected `.panopt/*.md` files, which the daemon
-//! keeps current. Todos and scratchpads are special: the viewer opens an MCP
+//! keeps current. Todos and notes are special: the viewer opens an MCP
 //! session and renders the matching form against live `todo_get` /
-//! `scratchpad_get` data, autosaving on a debounce. The pane is long-lived:
+//! `note_get` data, autosaving on a debounce. The pane is long-lived:
 //! it closes only when the user presses Ctrl-C, never on its own.
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
 use crate::mcpclient::Client;
-use crate::scratchpad_form::ScratchpadForm;
+use crate::note_form::NoteForm;
 use crate::todo::observer_url;
 use crate::todo_form::TodoForm;
 use crate::viewstate::{self, ViewState};
@@ -60,28 +60,28 @@ enum Target {
     /// the first autosave with a non-empty title; from then on it behaves
     /// like a `Todo(id)`.
     NewTodo,
-    Scratchpad(u64),
-    /// A brand-new scratchpad, not yet persisted. The form sends
-    /// `scratchpad_create` on the first autosave with a non-empty title; from
-    /// then on it behaves like a `Scratchpad(id)`.
-    NewScratchpad,
+    Note(u64),
+    /// A brand-new note, not yet persisted. The form sends
+    /// `note_create` on the first autosave with a non-empty title; from
+    /// then on it behaves like a `Note(id)`.
+    NewNote,
     TodoList,
-    ScratchpadList,
+    NoteList,
     Empty,
 }
 
 impl Target {
     /// Parse a routing payload's `kind`/`id` pair into a target. The `empty`
     /// kind lets the sidebar clear the viewer when nothing is selected; the
-    /// `new-todo` / `new-scratchpad` kinds open blank forms.
+    /// `new-todo` / `new-note` kinds open blank forms.
     fn parse(kind: &str, id: Option<u64>) -> Option<Target> {
         match (kind, id) {
             ("todo", Some(id)) => Some(Target::Todo(id)),
             ("new-todo", _) => Some(Target::NewTodo),
-            ("scratchpad", Some(id)) => Some(Target::Scratchpad(id)),
-            ("new-scratchpad", _) => Some(Target::NewScratchpad),
+            ("note", Some(id)) => Some(Target::Note(id)),
+            ("new-note", _) => Some(Target::NewNote),
             ("todo-list", _) => Some(Target::TodoList),
-            ("scratchpad-list", _) => Some(Target::ScratchpadList),
+            ("note-list", _) => Some(Target::NoteList),
             ("empty", _) => Some(Target::Empty),
             _ => None,
         }
@@ -94,22 +94,22 @@ impl Target {
         match self {
             Target::Todo(id) => format!("todo:{id}"),
             Target::NewTodo => "todo:new".to_string(),
-            Target::Scratchpad(id) => format!("scratchpad:{id}"),
-            Target::NewScratchpad => "scratchpad:new".to_string(),
+            Target::Note(id) => format!("note:{id}"),
+            Target::NewNote => "note:new".to_string(),
             Target::TodoList => "list:todos".to_string(),
-            Target::ScratchpadList => "list:scratchpads".to_string(),
+            Target::NoteList => "list:notes".to_string(),
             Target::Empty => "empty".to_string(),
         }
     }
 
     fn is_list(&self) -> bool {
-        matches!(self, Target::TodoList | Target::ScratchpadList)
+        matches!(self, Target::TodoList | Target::NoteList)
     }
 
     fn is_form(&self) -> bool {
         matches!(
             self,
-            Target::Todo(_) | Target::NewTodo | Target::Scratchpad(_) | Target::NewScratchpad,
+            Target::Todo(_) | Target::NewTodo | Target::Note(_) | Target::NewNote,
         )
     }
 
@@ -119,11 +119,11 @@ impl Target {
     fn content_path(&self, ws: &Path) -> Option<PathBuf> {
         let panopt = ws.join(".panopt");
         match self {
-            Target::Todo(_) | Target::NewTodo | Target::Scratchpad(_) | Target::NewScratchpad => {
+            Target::Todo(_) | Target::NewTodo | Target::Note(_) | Target::NewNote => {
                 None
             }
             Target::TodoList => Some(panopt.join("todos.md")),
-            Target::ScratchpadList => Some(panopt.join("scratchpads.md")),
+            Target::NoteList => Some(panopt.join("notes.md")),
             Target::Empty => None,
         }
     }
@@ -132,7 +132,7 @@ impl Target {
 /// The loaded, render-ready content for the current target.
 enum Content {
     /// A scrollable document: the lines of a projected `.md` file. No target
-    /// currently renders as a `Doc` - both todos and scratchpads now go
+    /// currently renders as a `Doc` - both todos and notes now go
     /// through their form views - but the variant remains so the legacy
     /// scroll/render path is one step away if a plain-doc target is added.
     #[allow(dead_code)]
@@ -145,16 +145,16 @@ enum Content {
     /// rendering and key handling to it. Boxed because `TodoForm` is large
     /// (~3.7 KB) and otherwise dominates the enum's size.
     TodoForm(Box<TodoForm>),
-    /// The editable scratchpad form. Sibling of [`Content::TodoForm`]; see
-    /// [`crate::scratchpad_form`]. Boxed for the same reason.
-    ScratchpadForm(Box<ScratchpadForm>),
+    /// The editable note form. Sibling of [`Content::TodoForm`]; see
+    /// [`crate::note_form`]. Boxed for the same reason.
+    NoteForm(Box<NoteForm>),
 }
 
 /// One row of a list view: where selecting it routes, its display label, and
 /// the metadata the filter and sort need.
 ///
 /// `status`, `is_blocked`, `priority`, `created_at`, and `updated_at` are only
-/// populated for todo entries loaded via MCP; scratchpad entries and the
+/// populated for todo entries loaded via MCP; note entries and the
 /// fallback projection-reader leave them at `None`/default, and the
 /// [`TodoFilter`] / [`TodoSort`] simply never hide or reorder them.
 struct ListEntry {
@@ -421,7 +421,7 @@ pub fn run(
     // pasted text scrubs itself across the field as each line break fires the
     // shortcut. Failing to enable is non-fatal: typed input still works.
     // Mouse capture lets the viewer receive clicks on list rows so the user
-    // can open todos and scratchpads by clicking, matching the sidebar's
+    // can open todos and notes by clicking, matching the sidebar's
     // click-to-activate behaviour. Failing to enable is non-fatal: keyboard
     // navigation still works.
     let _ = execute!(stdout(), EnableBracketedPaste, EnableMouseCapture);
@@ -593,18 +593,18 @@ impl Viewer {
                     }
                 }
             }
-            Content::ScratchpadForm(form) => {
+            Content::NoteForm(form) => {
                 if ctrl && matches!(key.code, KeyCode::Char('c')) {
                     let _ = form.flush();
                     true
                 } else {
                     match form.handle_key(key) {
-                        crate::scratchpad_form::ScratchpadFormAction::Close => {
+                        crate::note_form::NoteFormAction::Close => {
                             let _ = form.flush();
                             true
                         }
-                        crate::scratchpad_form::ScratchpadFormAction::Dirty
-                        | crate::scratchpad_form::ScratchpadFormAction::Idle => {
+                        crate::note_form::NoteFormAction::Dirty
+                        | crate::note_form::NoteFormAction::Idle => {
                             self.needs_draw = true;
                             false
                         }
@@ -675,7 +675,7 @@ impl Viewer {
                 let _ = form.handle_paste(s);
                 self.needs_draw = true;
             }
-            Content::ScratchpadForm(form) => {
+            Content::NoteForm(form) => {
                 let _ = form.handle_paste(s);
                 self.needs_draw = true;
             }
@@ -695,7 +695,7 @@ impl Viewer {
                 let _ = form.handle_mouse(m);
                 self.needs_draw = true;
             }
-            Content::ScratchpadForm(form) => {
+            Content::NoteForm(form) => {
                 let _ = form.handle_mouse(m);
                 self.needs_draw = true;
             }
@@ -755,7 +755,7 @@ impl Viewer {
                 let max = (lines.len() as i64 - self.viewport as i64).max(0);
                 self.scroll = (self.scroll as i64 + delta).clamp(0, max) as u16;
             }
-            Content::Message(_) | Content::TodoForm(_) | Content::ScratchpadForm(_) => {}
+            Content::Message(_) | Content::TodoForm(_) | Content::NoteForm(_) => {}
         }
     }
 
@@ -857,7 +857,7 @@ impl Viewer {
             Content::TodoForm(form) => {
                 let _ = form.flush();
             }
-            Content::ScratchpadForm(form) => {
+            Content::NoteForm(form) => {
                 let _ = form.flush();
             }
             _ => {}
@@ -967,7 +967,7 @@ impl Viewer {
                     self.needs_draw = true;
                 }
             },
-            Content::ScratchpadForm(form) => match form.refresh_from_daemon() {
+            Content::NoteForm(form) => match form.refresh_from_daemon() {
                 Ok(true) => self.needs_draw = true,
                 Ok(false) => {}
                 Err(e) => {
@@ -992,7 +992,7 @@ impl Viewer {
                 self.needs_draw = true;
                 promotion_target(&self.target, form.id)
             }
-            Content::ScratchpadForm(form)
+            Content::NoteForm(form)
                 if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
             {
                 if let Err(e) = form.flush() {
@@ -1008,7 +1008,7 @@ impl Viewer {
         }
     }
 
-    /// Once a new-todo / new-scratchpad form's first save assigns an id,
+    /// Once a new-todo / new-note form's first save assigns an id,
     /// rewrite the routing file so the sidebar plugin re-titles the pane from
     /// "New todo" to "Todo #N - ...". The form content is already in sync with
     /// the daemon's view, so this only updates the pane title surface - no
@@ -1016,7 +1016,7 @@ impl Viewer {
     fn promote_form_target(&mut self, target: Target) {
         let (kind, id) = match &target {
             Target::Todo(id) => ("todo", *id),
-            Target::Scratchpad(id) => ("scratchpad", *id),
+            Target::Note(id) => ("note", *id),
             _ => return,
         };
         write_routing_to(&self.routing_path, kind, Some(id));
@@ -1027,7 +1027,7 @@ impl Viewer {
     }
 
     /// Load the current target's content. For form targets this calls the
-    /// daemon (`todo_get`, `scratchpad_get`) or constructs a blank form; for
+    /// daemon (`todo_get`, `note_get`) or constructs a blank form; for
     /// everything else it reads the `.panopt/` projection.
     fn reload_content(&mut self) {
         let path = self.target.content_path(&self.ws);
@@ -1046,10 +1046,10 @@ impl Viewer {
                 }
                 Err(e) => Content::Message(format!("could not load todo #{id}: {e:#}")),
             },
-            Target::NewScratchpad => {
-                Content::ScratchpadForm(Box::new(ScratchpadForm::blank(&self.url)))
+            Target::NewNote => {
+                Content::NoteForm(Box::new(NoteForm::blank(&self.url)))
             }
-            Target::Scratchpad(id) => match load_scratchpad(&self.url, *id) {
+            Target::Note(id) => match load_note(&self.url, *id) {
                 Ok(pad) => {
                     let tags: Vec<String> = pad["tags"]
                         .as_array()
@@ -1059,7 +1059,7 @@ impl Viewer {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    Content::ScratchpadForm(Box::new(ScratchpadForm::from_parts(
+                    Content::NoteForm(Box::new(NoteForm::from_parts(
                         &self.url,
                         *id,
                         pad["title"].as_str().unwrap_or(""),
@@ -1069,7 +1069,7 @@ impl Viewer {
                         pad["updated_at"].as_str().unwrap_or(""),
                     )))
                 }
-                Err(e) => Content::Message(format!("could not load scratchpad #{id}: {e:#}")),
+                Err(e) => Content::Message(format!("could not load note #{id}: {e:#}")),
             },
             Target::TodoList => match load_todo_list(&self.url) {
                 Ok(entries) => Content::List(entries),
@@ -1079,8 +1079,8 @@ impl Viewer {
                 // approximated as `open` in this mode.
                 Err(_) => Content::List(read_todo_index(path.as_deref())),
             },
-            Target::ScratchpadList => {
-                Content::List(read_index(path.as_deref(), Target::Scratchpad))
+            Target::NoteList => {
+                Content::List(read_index(path.as_deref(), Target::Note))
             }
         };
         self.clamp();
@@ -1103,7 +1103,7 @@ impl Viewer {
                     self.scroll = max;
                 }
             }
-            Content::Message(_) | Content::TodoForm(_) | Content::ScratchpadForm(_) => {}
+            Content::Message(_) | Content::TodoForm(_) | Content::NoteForm(_) => {}
         }
     }
 
@@ -1115,7 +1115,7 @@ impl Viewer {
             form.draw(frame, frame.area());
             return;
         }
-        if let Content::ScratchpadForm(form) = &mut self.content {
+        if let Content::NoteForm(form) = &mut self.content {
             form.draw(frame, frame.area());
             return;
         }
@@ -1189,7 +1189,7 @@ impl Viewer {
                     area,
                 );
             }
-            Content::TodoForm(_) | Content::ScratchpadForm(_) => {
+            Content::TodoForm(_) | Content::NoteForm(_) => {
                 unreachable!("form modes short-circuit draw")
             }
         }
@@ -1199,8 +1199,8 @@ impl Viewer {
         match &self.target {
             Target::Todo(id) => format!(" Todo #{id}"),
             Target::NewTodo => " New todo".to_string(),
-            Target::Scratchpad(id) => format!(" Scratchpad #{id}"),
-            Target::NewScratchpad => " New scratchpad".to_string(),
+            Target::Note(id) => format!(" Note #{id}"),
+            Target::NewNote => " New note".to_string(),
             Target::TodoList => {
                 let (visible, total) = self.list_counts();
                 format!(
@@ -1210,7 +1210,7 @@ impl Viewer {
                     self.todo_sort_2.label(),
                 )
             }
-            Target::ScratchpadList => " Scratchpads".to_string(),
+            Target::NoteList => " Notes".to_string(),
             Target::Empty => " PANopt viewer".to_string(),
         }
     }
@@ -1247,11 +1247,11 @@ fn load_todo(url: &str, id: u64) -> Result<Value> {
     outcome
 }
 
-/// One-shot `scratchpad_get` against the daemon. Returns the JSON object
+/// One-shot `note_get` against the daemon. Returns the JSON object
 /// `{id, title, body, created_at, updated_at}`.
-fn load_scratchpad(url: &str, id: u64) -> Result<Value> {
+fn load_note(url: &str, id: u64) -> Result<Value> {
     let client = Client::connect(url)?;
-    let outcome = client.call("scratchpad_get", json!({ "scratchpad_id": id }));
+    let outcome = client.call("note_get", json!({ "note_id": id }));
     client.close();
     outcome
 }
@@ -1271,7 +1271,7 @@ fn resolve_blocker_title(url: &str, id: u64) -> Option<String> {
 
 /// Read a `.panopt/` index file into list entries, mapping each id through
 /// `into_target` to the target selecting it should open. Used for the
-/// scratchpad list, which has no status/blocker filter to honour.
+/// note list, which has no status/blocker filter to honour.
 fn read_index(path: Option<&Path>, into_target: impl Fn(u64) -> Target) -> Vec<ListEntry> {
     let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {
         return Vec::new();
@@ -1370,7 +1370,7 @@ fn load_todo_list(url: &str) -> Result<Vec<ListEntry>> {
 }
 
 /// Parse one `.panopt/` index line - `- [ ] [#3](todos/3.md) the title ...` or
-/// `- [#1](scratchpad/1.md) the title` - into its id and trailing label.
+/// `- [#1](note/1.md) the title` - into its id and trailing label.
 fn parse_index_line(line: &str) -> Option<(u64, String)> {
     let line = line.trim();
     if !line.starts_with("- [") {
@@ -1407,22 +1407,22 @@ fn read_content_count(ws: &Path) -> Option<usize> {
 
 /// Decide whether the just-flushed form has earned a kind transition. Pure
 /// function: takes the viewer's current [`Target`] and the form's id after
-/// flush, returns `Some(Target::Todo(id) | Target::Scratchpad(id))` only when
+/// flush, returns `Some(Target::Todo(id) | Target::Note(id))` only when
 /// a `new-*` target now has an id. Everything else (the form was already
 /// promoted, the flush didn't assign an id, or we're not on a form target)
 /// returns `None`. Kept separate from [`Viewer::maybe_autosave`] so the
-/// scratchpad/todo symmetry can be exercised in unit tests.
+/// note/todo symmetry can be exercised in unit tests.
 fn promotion_target(target: &Target, form_id: Option<u64>) -> Option<Target> {
     match (target, form_id) {
         (Target::NewTodo, Some(id)) => Some(Target::Todo(id)),
-        (Target::NewScratchpad, Some(id)) => Some(Target::Scratchpad(id)),
+        (Target::NewNote, Some(id)) => Some(Target::Note(id)),
         _ => None,
     }
 }
 
 /// Atomically write a viewer routing file. Mirrors the sidebar plugin's
 /// `write_routing` so both writers produce a byte-identical payload; the
-/// viewer reaches this only on the new-todo / new-scratchpad promotion path
+/// viewer reaches this only on the new-todo / new-note promotion path
 /// to update its own pane title without going through the plugin.
 fn write_routing_to(path: &Path, kind: &str, id: Option<u64>) {
     if let Some(parent) = path.parent() {
@@ -1460,18 +1460,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_scratchpad_index_line() {
-        let (id, label) = parse_index_line("- [#7](scratchpad/7.md) design notes").unwrap();
+    fn parses_a_note_index_line() {
+        let (id, label) = parse_index_line("- [#7](note/7.md) design notes").unwrap();
         assert_eq!(id, 7);
         assert_eq!(label, "design notes");
     }
 
     #[test]
-    fn parses_a_scratchpad_index_line_with_updated_timestamp() {
+    fn parses_a_note_index_line_with_updated_timestamp() {
         // The post-V4 index line ends in `- updated <ts>`; the parser keeps
         // that suffix as the label, which the viewer's list mode displays.
         let (id, label) =
-            parse_index_line("- [#1](scratchpad/1.md) Sample Notes - updated 2026-05-23 18:05:21")
+            parse_index_line("- [#1](note/1.md) Sample Notes - updated 2026-05-23 18:05:21")
                 .unwrap();
         assert_eq!(id, 1);
         assert_eq!(label, "Sample Notes - updated 2026-05-23 18:05:21");
@@ -1488,8 +1488,8 @@ mod tests {
         assert_eq!(Target::parse("todo", Some(4)), Some(Target::Todo(4)));
         assert_eq!(Target::parse("new-todo", None), Some(Target::NewTodo));
         assert_eq!(
-            Target::parse("scratchpad-list", None),
-            Some(Target::ScratchpadList)
+            Target::parse("note-list", None),
+            Some(Target::NoteList)
         );
         assert_eq!(Target::parse("empty", None), Some(Target::Empty));
         assert_eq!(Target::parse("todo", None), None);
@@ -1506,13 +1506,13 @@ mod tests {
     }
 
     #[test]
-    fn target_form_check_covers_todos_and_scratchpads() {
+    fn target_form_check_covers_todos_and_notes() {
         assert!(Target::Todo(1).is_form());
         assert!(Target::NewTodo.is_form());
-        assert!(Target::Scratchpad(1).is_form());
-        assert!(Target::NewScratchpad.is_form());
+        assert!(Target::Note(1).is_form());
+        assert!(Target::NewNote.is_form());
         assert!(!Target::TodoList.is_form());
-        assert!(!Target::ScratchpadList.is_form());
+        assert!(!Target::NoteList.is_form());
     }
 
     #[test]
@@ -1520,21 +1520,21 @@ mod tests {
         let ws = Path::new("/tmp/x");
         assert!(Target::Todo(1).content_path(ws).is_none());
         assert!(Target::NewTodo.content_path(ws).is_none());
-        assert!(Target::Scratchpad(1).content_path(ws).is_none());
-        assert!(Target::NewScratchpad.content_path(ws).is_none());
+        assert!(Target::Note(1).content_path(ws).is_none());
+        assert!(Target::NewNote.content_path(ws).is_none());
         assert!(Target::TodoList.content_path(ws).is_some());
-        assert!(Target::ScratchpadList.content_path(ws).is_some());
+        assert!(Target::NoteList.content_path(ws).is_some());
     }
 
     #[test]
-    fn parse_recognizes_new_scratchpad() {
+    fn parse_recognizes_new_note() {
         assert_eq!(
-            Target::parse("new-scratchpad", None),
-            Some(Target::NewScratchpad)
+            Target::parse("new-note", None),
+            Some(Target::NewNote)
         );
         assert_eq!(
-            Target::parse("scratchpad", Some(7)),
-            Some(Target::Scratchpad(7))
+            Target::parse("note", Some(7)),
+            Some(Target::Note(7))
         );
     }
 
@@ -1752,7 +1752,7 @@ mod tests {
     #[test]
     fn cycle_filter_is_a_noop_when_not_on_todo_list() {
         let mut viewer = viewer_with_statuses(&[("open", false)], TodoFilter::All);
-        viewer.target = Target::ScratchpadList;
+        viewer.target = Target::NoteList;
         viewer.cycle_filter(true);
         assert_eq!(viewer.todo_filter, TodoFilter::All);
     }
@@ -1761,23 +1761,23 @@ mod tests {
     fn promotion_target_flips_new_kinds_once_an_id_lands() {
         // Both new-* kinds promote symmetrically once the daemon assigns an
         // id; this is the contract sync_pane_titles relies on to re-title the
-        // pane from "New scratchpad" / "New todo" to the id-bearing form.
+        // pane from "New note" / "New todo" to the id-bearing form.
         assert_eq!(
             promotion_target(&Target::NewTodo, Some(7)),
             Some(Target::Todo(7))
         );
         assert_eq!(
-            promotion_target(&Target::NewScratchpad, Some(7)),
-            Some(Target::Scratchpad(7))
+            promotion_target(&Target::NewNote, Some(7)),
+            Some(Target::Note(7))
         );
         // Flush hasn't assigned an id yet (empty-title autosave is a no-op):
         // stay on the new-* kind so the plugin keeps the placeholder title.
         assert_eq!(promotion_target(&Target::NewTodo, None), None);
-        assert_eq!(promotion_target(&Target::NewScratchpad, None), None);
+        assert_eq!(promotion_target(&Target::NewNote, None), None);
         // Already promoted: a subsequent autosave must not re-flip the target
         // (which would clobber a user-driven re-point of the same pane).
         assert_eq!(promotion_target(&Target::Todo(7), Some(9)), None);
-        assert_eq!(promotion_target(&Target::Scratchpad(7), Some(9)), None);
+        assert_eq!(promotion_target(&Target::Note(7), Some(9)), None);
         // Non-form targets never promote regardless of an incoming id.
         assert_eq!(promotion_target(&Target::TodoList, Some(7)), None);
         assert_eq!(promotion_target(&Target::Empty, Some(7)), None);
@@ -1790,10 +1790,10 @@ mod tests {
         // routing` and the plugin's title path round-trip cleanly.
         let dir = tempdir();
         let path = dir.join("viewer-tx.json");
-        write_routing_to(&path, "scratchpad", Some(42));
+        write_routing_to(&path, "note", Some(42));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            r#"{"kind":"scratchpad","id":42}"#
+            r#"{"kind":"note","id":42}"#
         );
         write_routing_to(&path, "todo", Some(9));
         assert_eq!(
@@ -1804,19 +1804,19 @@ mod tests {
 
     #[test]
     fn promote_form_target_rewrites_routing_and_flips_target() {
-        // End-to-end of the #66 / #57 fix: a NewScratchpad pane whose form
+        // End-to-end of the #66 / #57 fix: a NewNote pane whose form
         // just earned id 42 must (a) overwrite its routing file with the id-
         // bearing kind so the sidebar plugin re-titles it on the next tick,
         // and (b) flip self.target so the cockpit's own status bar follows.
         let dir = tempdir();
         let routing_path = dir.join("viewer-promo.json");
-        std::fs::write(&routing_path, r#"{"kind":"new-scratchpad"}"#).unwrap();
+        std::fs::write(&routing_path, r#"{"kind":"new-note"}"#).unwrap();
         let mut viewer = Viewer {
             ws: dir.clone(),
             url: String::new(),
             routing_path: routing_path.clone(),
             routing_mtime: mtime(&routing_path),
-            target: Target::NewScratchpad,
+            target: Target::NewNote,
             content: Content::Message(String::new()),
             content_mtime: None,
             scroll: 0,
@@ -1829,11 +1829,11 @@ mod tests {
             needs_draw: false,
             sole_content_pane: false,
         };
-        viewer.promote_form_target(Target::Scratchpad(42));
-        assert_eq!(viewer.target, Target::Scratchpad(42));
+        viewer.promote_form_target(Target::Note(42));
+        assert_eq!(viewer.target, Target::Note(42));
         assert_eq!(
             std::fs::read_to_string(&routing_path).unwrap(),
-            r#"{"kind":"scratchpad","id":42}"#
+            r#"{"kind":"note","id":42}"#
         );
         // routing_mtime tracks the write we just did, so the next poll_routing
         // sees no change and doesn't reload (which would tear the open form).

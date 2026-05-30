@@ -20,14 +20,14 @@ use std::sync::{Arc, Mutex};
 use http::request::Parts;
 use panopt_core::{
     Agent, AgentTool, AgentToolPatch, CoreError, KeySource, Lock, Priority, Process, ProcessKind,
-    ProcessPatch, ProjectId, Scratchpad, ScratchpadPatch, Store, Todo, TodoPatch, TodoStatus,
+    ProcessPatch, ProjectId, Note, NotePatch, Store, Todo, TodoPatch, TodoStatus,
 };
 use panopt_tool_surface::params::{
     AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
     IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs,
-    ProcessGetArgs, ProcessUpdateArgs, ScratchpadAppendArgs, ScratchpadCreateArgs,
-    ScratchpadDeleteArgs, ScratchpadGetArgs, ScratchpadReadArgs, ScratchpadSearchArgs,
-    ScratchpadUpdateArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs,
+    ProcessGetArgs, ProcessUpdateArgs, NoteAppendArgs, NoteCreateArgs,
+    NoteDeleteArgs, NoteGetArgs, NoteReadArgs, NoteSearchArgs,
+    NoteUpdateArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs,
     TodoCommentUpdateArgs, TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs,
     TodoLockArgs, TodoSearchArgs, TodoSetBlockersArgs, TodoStartArgs, TodoUnlockArgs,
     TodoUpdateArgs,
@@ -57,16 +57,16 @@ pub struct Handler {
     tool_router: ToolRouter<Self>,
 }
 
-/// Wire shape for a scratchpad in `scratchpad_list` output.
+/// Wire shape for a note in `note_list` output.
 #[derive(Serialize)]
-struct ScratchpadDto {
+struct NoteDto {
     id: u64,
     title: String,
 }
 
-/// Wire shape for `scratchpad_get`: title, body, tags, and timestamps.
+/// Wire shape for `note_get`: title, body, tags, and timestamps.
 #[derive(Serialize)]
-struct ScratchpadDetailDto {
+struct NoteDetailDto {
     id: u64,
     title: String,
     body: String,
@@ -75,9 +75,9 @@ struct ScratchpadDetailDto {
     updated_at: String,
 }
 
-impl ScratchpadDetailDto {
-    fn from_scratchpad(pad: &Scratchpad) -> Self {
-        ScratchpadDetailDto {
+impl NoteDetailDto {
+    fn from_note(pad: &Note) -> Self {
+        NoteDetailDto {
             id: pad.id,
             title: pad.title.clone(),
             body: pad.body.clone(),
@@ -89,7 +89,7 @@ impl ScratchpadDetailDto {
 }
 
 /// Wire shape for `id_kind`: the resource kind and a short human label
-/// (title for todos/scratchpads, `display_name` falling back to `name` for
+/// (title for todos/notes, `display_name` falling back to `name` for
 /// agent tools and processes - the same fallback the cockpit's projection
 /// uses).
 #[derive(Serialize)]
@@ -352,14 +352,14 @@ fn resolve_id_kind(store: &Store, project: ProjectId, id: u64) -> Result<IdKindD
         Err(CoreError::TodoNotFound(_)) => {}
         Err(e) => return Err(map_core_err(e)),
     }
-    match store.scratchpad_get(project, id) {
+    match store.note_get(project, id) {
         Ok(s) => {
             return Ok(IdKindDto {
-                kind: "scratchpad",
+                kind: "note",
                 label: s.title,
             })
         }
-        Err(CoreError::ScratchpadNotFound(_)) => {}
+        Err(CoreError::NoteNotFound(_)) => {}
         Err(e) => return Err(map_core_err(e)),
     }
     match store.agent_tool_get(project, id) {
@@ -400,7 +400,7 @@ fn map_core_err(e: CoreError) -> McpError {
     match e {
         // Caller-fixable: a bad id, a rejected argument, or a workspace path
         // the daemon cannot reach.
-        CoreError::ScratchpadNotFound(_)
+        CoreError::NoteNotFound(_)
         | CoreError::TodoNotFound(_)
         | CoreError::TodoCommentNotFound { .. }
         | CoreError::AgentToolNotFound(_)
@@ -686,129 +686,129 @@ impl Handler {
         json_result(&dtos)
     }
 
-    async fn scratchpad_create(
+    async fn note_create(
         &self,
         parts: Parts,
-        args: ScratchpadCreateArgs,
+        args: NoteCreateArgs,
     ) -> Result<CallToolResult, McpError> {
         let id = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.scratchpad_create(project, args.title)
+            st.note_create(project, args.title)
                 .map_err(map_core_err)?
         };
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }
 
-    async fn scratchpad_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
-        let dtos: Vec<ScratchpadDto> = {
+    async fn note_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
+        let dtos: Vec<NoteDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.scratchpad_list(project)
+            st.note_list(project)
                 .map_err(map_core_err)?
                 .into_iter()
-                .map(|(id, title)| ScratchpadDto { id, title })
+                .map(|(id, title)| NoteDto { id, title })
                 .collect()
         };
         json_result(&dtos)
     }
 
-    async fn scratchpad_search(
+    async fn note_search(
         &self,
         parts: Parts,
-        args: ScratchpadSearchArgs,
+        args: NoteSearchArgs,
     ) -> Result<CallToolResult, McpError> {
-        let dtos: Vec<ScratchpadDto> = {
+        let dtos: Vec<NoteDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
             let tags = args.tags.unwrap_or_default();
-            st.scratchpad_search(project, args.query.as_deref(), &tags)
+            st.note_search(project, args.query.as_deref(), &tags)
                 .map_err(map_core_err)?
                 .into_iter()
-                .map(|(id, title)| ScratchpadDto { id, title })
+                .map(|(id, title)| NoteDto { id, title })
                 .collect()
         };
         json_result(&dtos)
     }
 
-    async fn scratchpad_append(
+    async fn note_append(
         &self,
         parts: Parts,
-        args: ScratchpadAppendArgs,
+        args: NoteAppendArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.scratchpad_append(project, args.scratchpad_id, &args.content)
+            st.note_append(project, args.note_id, &args.content)
                 .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    async fn scratchpad_read(
+    async fn note_read(
         &self,
         parts: Parts,
-        args: ScratchpadReadArgs,
+        args: NoteReadArgs,
     ) -> Result<CallToolResult, McpError> {
         let body = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.scratchpad_read(project, args.scratchpad_id)
+            st.note_read(project, args.note_id)
                 .map_err(map_core_err)?
         };
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
-    async fn scratchpad_get(
+    async fn note_get(
         &self,
         parts: Parts,
-        args: ScratchpadGetArgs,
+        args: NoteGetArgs,
     ) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
             let pad = st
-                .scratchpad_get(project, args.scratchpad_id)
+                .note_get(project, args.note_id)
                 .map_err(map_core_err)?;
-            ScratchpadDetailDto::from_scratchpad(&pad)
+            NoteDetailDto::from_note(&pad)
         };
         json_result(&dto)
     }
 
-    async fn scratchpad_update(
+    async fn note_update(
         &self,
         parts: Parts,
-        args: ScratchpadUpdateArgs,
+        args: NoteUpdateArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            let patch = ScratchpadPatch {
+            let patch = NotePatch {
                 title: args.title,
                 body: args.body,
                 tags: args.tags,
             };
-            st.scratchpad_update(project, args.scratchpad_id, patch)
+            st.note_update(project, args.note_id, patch)
                 .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    async fn scratchpad_delete(
+    async fn note_delete(
         &self,
         parts: Parts,
-        args: ScratchpadDeleteArgs,
+        args: NoteDeleteArgs,
     ) -> Result<CallToolResult, McpError> {
         {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.scratchpad_delete(project, args.scratchpad_id)
+            st.note_delete(project, args.note_id)
                 .map_err(map_core_err)?;
         }
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    async fn scratchpad_tags_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
+    async fn note_tags_list(&self, parts: Parts) -> Result<CallToolResult, McpError> {
         let tags = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -1323,15 +1323,15 @@ enum Tool {
     LockAcquire,
     LockRelease,
     LockStatus,
-    ScratchpadCreate,
-    ScratchpadList,
-    ScratchpadSearch,
-    ScratchpadAppend,
-    ScratchpadRead,
-    ScratchpadGet,
-    ScratchpadUpdate,
-    ScratchpadDelete,
-    ScratchpadTagsList,
+    NoteCreate,
+    NoteList,
+    NoteSearch,
+    NoteAppend,
+    NoteRead,
+    NoteGet,
+    NoteUpdate,
+    NoteDelete,
+    NoteTagsList,
     TodoCreate,
     TodoList,
     TodoSearch,
@@ -1372,15 +1372,15 @@ impl Tool {
             "lock_acquire" => Tool::LockAcquire,
             "lock_release" => Tool::LockRelease,
             "lock_status" => Tool::LockStatus,
-            "scratchpad_create" => Tool::ScratchpadCreate,
-            "scratchpad_list" => Tool::ScratchpadList,
-            "scratchpad_search" => Tool::ScratchpadSearch,
-            "scratchpad_append" => Tool::ScratchpadAppend,
-            "scratchpad_read" => Tool::ScratchpadRead,
-            "scratchpad_get" => Tool::ScratchpadGet,
-            "scratchpad_update" => Tool::ScratchpadUpdate,
-            "scratchpad_delete" => Tool::ScratchpadDelete,
-            "scratchpad_tags_list" => Tool::ScratchpadTagsList,
+            "note_create" => Tool::NoteCreate,
+            "note_list" => Tool::NoteList,
+            "note_search" => Tool::NoteSearch,
+            "note_append" => Tool::NoteAppend,
+            "note_read" => Tool::NoteRead,
+            "note_get" => Tool::NoteGet,
+            "note_update" => Tool::NoteUpdate,
+            "note_delete" => Tool::NoteDelete,
+            "note_tags_list" => Tool::NoteTagsList,
             "todo_create" => Tool::TodoCreate,
             "todo_list" => Tool::TodoList,
             "todo_search" => Tool::TodoSearch,
@@ -1480,36 +1480,36 @@ async fn dispatch_local<'a>(
             handler.lock_release(parts, args).await
         }
         Tool::LockStatus => handler.lock_status(parts).await,
-        Tool::ScratchpadCreate => {
-            let args: ScratchpadCreateArgs = parse_json_object(raw_args)?;
-            handler.scratchpad_create(parts, args).await
+        Tool::NoteCreate => {
+            let args: NoteCreateArgs = parse_json_object(raw_args)?;
+            handler.note_create(parts, args).await
         }
-        Tool::ScratchpadList => handler.scratchpad_list(parts).await,
-        Tool::ScratchpadSearch => {
-            let args: ScratchpadSearchArgs = parse_json_object(raw_args)?;
-            handler.scratchpad_search(parts, args).await
+        Tool::NoteList => handler.note_list(parts).await,
+        Tool::NoteSearch => {
+            let args: NoteSearchArgs = parse_json_object(raw_args)?;
+            handler.note_search(parts, args).await
         }
-        Tool::ScratchpadAppend => {
-            let args: ScratchpadAppendArgs = parse_json_object(raw_args)?;
-            handler.scratchpad_append(parts, args).await
+        Tool::NoteAppend => {
+            let args: NoteAppendArgs = parse_json_object(raw_args)?;
+            handler.note_append(parts, args).await
         }
-        Tool::ScratchpadRead => {
-            let args: ScratchpadReadArgs = parse_json_object(raw_args)?;
-            handler.scratchpad_read(parts, args).await
+        Tool::NoteRead => {
+            let args: NoteReadArgs = parse_json_object(raw_args)?;
+            handler.note_read(parts, args).await
         }
-        Tool::ScratchpadGet => {
-            let args: ScratchpadGetArgs = parse_json_object(raw_args)?;
-            handler.scratchpad_get(parts, args).await
+        Tool::NoteGet => {
+            let args: NoteGetArgs = parse_json_object(raw_args)?;
+            handler.note_get(parts, args).await
         }
-        Tool::ScratchpadUpdate => {
-            let args: ScratchpadUpdateArgs = parse_json_object(raw_args)?;
-            handler.scratchpad_update(parts, args).await
+        Tool::NoteUpdate => {
+            let args: NoteUpdateArgs = parse_json_object(raw_args)?;
+            handler.note_update(parts, args).await
         }
-        Tool::ScratchpadDelete => {
-            let args: ScratchpadDeleteArgs = parse_json_object(raw_args)?;
-            handler.scratchpad_delete(parts, args).await
+        Tool::NoteDelete => {
+            let args: NoteDeleteArgs = parse_json_object(raw_args)?;
+            handler.note_delete(parts, args).await
         }
-        Tool::ScratchpadTagsList => handler.scratchpad_tags_list(parts).await,
+        Tool::NoteTagsList => handler.note_tags_list(parts).await,
         Tool::TodoCreate => {
             let args: TodoCreateArgs = parse_json_object(raw_args)?;
             handler.todo_create(parts, args).await
@@ -1624,7 +1624,7 @@ impl ServerHandler for Handler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(server_info)
             .with_instructions(
-                "PANopt coordination daemon: shared todos and scratchpads across agents.\n\
+                "PANopt coordination daemon: shared todos and notes across agents.\n\
                  Each connection is scoped to one project by the ?ws=<project path> \
                  query parameter on the server URL.\n\
                  - Registry: call identify (name, optional status) on startup so others \
@@ -1642,15 +1642,15 @@ impl ServerHandler for Handler {
                  todo_complete, todo_delete, todo_add_blocker / todo_remove_blocker / \
                  todo_set_blockers, todo_comment_add / todo_comment_update / \
                  todo_comment_delete, todo_tags_list (project tag vocabulary, union with \
-                 scratchpads), and todo_lock / todo_unlock (advisory `todo:<id>` lock, \
+                 notes), and todo_lock / todo_unlock (advisory `todo:<id>` lock, \
                  surfaced as locked_by on todo_get). Each todo also projects to \
                  .panopt/todos/<id>.md.\n\
-                 - Scratchpads: scratchpad_create (returns an id), scratchpad_list, \
-                 scratchpad_get (one scratchpad in full), scratchpad_append (add to body), \
-                 scratchpad_read (body only), scratchpad_update (replace title, body, and/or \
-                 tags), scratchpad_delete, scratchpad_tags_list (project tag vocabulary, \
-                 same union as todo_tags_list). Each scratchpad also projects to \
-                 .panopt/scratchpad/<id>.md.\n\
+                 - Notes: note_create (returns an id), note_list, \
+                 note_get (one note in full), note_append (add to body), \
+                 note_read (body only), note_update (replace title, body, and/or \
+                 tags), note_delete, note_tags_list (project tag vocabulary, \
+                 same union as todo_tags_list). Each note also projects to \
+                 .panopt/note/<id>.md.\n\
                  - Agent tools (config layer): agent_tool_create (returns an id), \
                  agent_tool_list, agent_tool_get, agent_tool_update, agent_tool_delete. \
                  Durable per-project agent configurations the cockpit can spawn from. \
@@ -1662,7 +1662,7 @@ impl ServerHandler for Handler {
                  agent tool nulls the agent_tool_id back-reference of any processes that \
                  referenced it. Projected to .panopt/processes.md.\n\
                  - Utilities: id_kind resolves a numeric id to its resource kind \
-                 (todo / scratchpad / agent-tool / process) plus a short label. \
+                 (todo / note / agent-tool / process) plus a short label. \
                  Useful since ids are unified per project and a `#N` reference \
                  points to exactly one row.\n\
                  State is persisted, shared live across every agent on the same project, \

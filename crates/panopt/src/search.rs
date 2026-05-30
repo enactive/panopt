@@ -2,7 +2,7 @@
 //!
 //! A floating-pane TUI launched by the sidebar plugin when the user presses
 //! the global search keybind. Lets the user type a query, fires the daemon's
-//! `todo_search` and `scratchpad_search` MCP tools (debounced ~150ms per
+//! `todo_search` and `note_search` MCP tools (debounced ~150ms per
 //! keystroke), and renders matching rows across both kinds. On Enter, it
 //! pipes the selection back to the plugin via
 //! `zellij action pipe --name panopt:show-result`; the plugin then routes
@@ -45,21 +45,21 @@ const POLL_TICK: Duration = Duration::from_millis(50);
 #[derive(Clone, Copy)]
 enum Kind {
     Todo,
-    Scratchpad,
+    Note,
 }
 
 impl Kind {
     fn prefix(self) -> &'static str {
         match self {
             Kind::Todo => "T",
-            Kind::Scratchpad => "S",
+            Kind::Note => "S",
         }
     }
 
     fn wire(self) -> &'static str {
         match self {
             Kind::Todo => "todo",
-            Kind::Scratchpad => "scratchpad",
+            Kind::Note => "note",
         }
     }
 }
@@ -69,9 +69,9 @@ struct Row {
     kind: Kind,
     id: u64,
     title: String,
-    /// Todo status string (e.g. "open", "in_progress"); `None` for scratchpads.
+    /// Todo status string (e.g. "open", "in_progress"); `None` for notes.
     status: Option<String>,
-    /// Todo priority string (e.g. "high"); `None` for scratchpads.
+    /// Todo priority string (e.g. "high"); `None` for notes.
     priority: Option<String>,
 }
 
@@ -241,12 +241,12 @@ fn run_search(client: &Client, query: &str) -> Result<Vec<Row>> {
     }
 
     let pads = client
-        .call("scratchpad_search", json!({ "query": query }))
-        .context("scratchpad_search")?;
+        .call("note_search", json!({ "query": query }))
+        .context("note_search")?;
     if let Some(arr) = pads.as_array() {
         for s in arr {
             rows.push(Row {
-                kind: Kind::Scratchpad,
+                kind: Kind::Note,
                 id: s.get("id").and_then(Value::as_u64).unwrap_or(0),
                 title: s
                     .get("title")
@@ -322,7 +322,7 @@ fn draw(frame: &mut Frame, state: &State) {
     }
     if lines.is_empty() {
         let msg = if state.query.is_empty() {
-            "(type to search todos and scratchpads)"
+            "(type to search todos and notes)"
         } else if state.pending_since.is_some() {
             "(searching...)"
         } else {
@@ -494,7 +494,7 @@ mod tests {
             priority: None,
         });
         state.rows.push(Row {
-            kind: Kind::Scratchpad,
+            kind: Kind::Note,
             id: 9,
             title: "y".into(),
             status: None,
@@ -507,7 +507,7 @@ mod tests {
         );
         match out {
             Some(Outcome::Select(row)) => {
-                assert!(matches!(row.kind, Kind::Scratchpad));
+                assert!(matches!(row.kind, Kind::Note));
                 assert_eq!(row.id, 9);
             }
             _ => panic!("expected Select"),

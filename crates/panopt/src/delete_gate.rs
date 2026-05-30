@@ -26,7 +26,7 @@ use ratatui::{DefaultTerminal, Frame};
 #[derive(Clone, Copy)]
 enum Kind {
     Todo,
-    Scratchpad,
+    Note,
     AgentTool,
     Process,
 }
@@ -35,11 +35,11 @@ impl Kind {
     fn parse(s: &str) -> Result<Kind> {
         match s {
             "todo" => Ok(Kind::Todo),
-            "scratchpad" => Ok(Kind::Scratchpad),
+            "note" => Ok(Kind::Note),
             "agent-tool" => Ok(Kind::AgentTool),
             "process" => Ok(Kind::Process),
             other => Err(anyhow!(
-                "unknown kind `{other}` - expected todo/scratchpad/agent-tool/process"
+                "unknown kind `{other}` - expected todo/note/agent-tool/process"
             )),
         }
     }
@@ -47,7 +47,7 @@ impl Kind {
     fn wire(self) -> &'static str {
         match self {
             Kind::Todo => "todo",
-            Kind::Scratchpad => "scratchpad",
+            Kind::Note => "note",
             Kind::AgentTool => "agent-tool",
             Kind::Process => "process",
         }
@@ -56,7 +56,7 @@ impl Kind {
     fn label(self) -> &'static str {
         match self {
             Kind::Todo => "todo",
-            Kind::Scratchpad => "scratchpad",
+            Kind::Note => "note",
             Kind::AgentTool => "agent tool",
             Kind::Process => "process",
         }
@@ -196,8 +196,8 @@ mod tests {
     fn parses_known_kinds() {
         assert!(matches!(Kind::parse("todo").unwrap(), Kind::Todo));
         assert!(matches!(
-            Kind::parse("scratchpad").unwrap(),
-            Kind::Scratchpad
+            Kind::parse("note").unwrap(),
+            Kind::Note
         ));
         assert!(matches!(
             Kind::parse("agent-tool").unwrap(),

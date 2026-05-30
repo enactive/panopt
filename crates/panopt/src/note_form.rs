@@ -1,18 +1,18 @@
-//! The editable scratchpad form, hosted in-pane by the cockpit's `_viewer`.
+//! The editable note form, hosted in-pane by the cockpit's `_viewer`.
 //!
-//! Sibling of [`crate::todo_form`] but trimmed to fit the scratchpad model:
+//! Sibling of [`crate::todo_form`] but trimmed to fit the note model:
 //! one single-line title field and one multi-line body field, no enums, no
 //! comments, no blockers. The `draw` takes a `Rect` so the viewer can place
-//! it directly; `handle_key` returns a [`ScratchpadFormAction`] so the host
+//! it directly; `handle_key` returns a [`NoteFormAction`] so the host
 //! decides whether to debounce a save or to close.
 //!
 //! Saves go through the MCP client: a creation round-trip with
-//! `scratchpad_create` on first save, then `scratchpad_update` for every
-//! subsequent flush. The form never reads or writes the `.panopt/scratchpad/`
+//! `note_create` on first save, then `note_update` for every
+//! subsequent flush. The form never reads or writes the `.panopt/note/`
 //! projection itself.
 //!
 //! The viewer polls [`Self::refresh_from_daemon`] on its `REFRESH` cadence so
-//! a concurrent edit (another agent's `scratchpad_update`, a CLI write)
+//! a concurrent edit (another agent's `note_update`, a CLI write)
 //! reconciles into the open form: untouched fields are replayed from the
 //! remote value; fields the user is mid-edit on hold their local text and the
 //! message line flags the conflict. The [`Baseline`] is always advanced to
@@ -38,12 +38,12 @@ use crate::todo_form::{
     select_to_column, selected_text, single_line_input, text_area,
 };
 
-/// What [`ScratchpadForm::handle_key`] is telling the host to do next.
+/// What [`NoteForm::handle_key`] is telling the host to do next.
 ///
 /// The viewer uses `Dirty` to start a debounce window and flush a short time
 /// later; `Close` is the user's request to leave the form (Ctrl-C).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ScratchpadFormAction {
+pub enum NoteFormAction {
     /// Nothing changed that the host needs to act on.
     Idle,
     /// A field changed: the host should consider this a pending save.
@@ -52,7 +52,7 @@ pub enum ScratchpadFormAction {
     Close,
 }
 
-/// Which scratchpad field currently has focus.
+/// Which note field currently has focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Field {
     Title,
@@ -74,11 +74,11 @@ struct Baseline {
     tags: Vec<String>,
 }
 
-/// The editable state of the scratchpad form.
-pub struct ScratchpadForm {
+/// The editable state of the note form.
+pub struct NoteForm {
     /// The daemon MCP URL with `?ws=...&observer=1`.
     pub(crate) url: String,
-    /// The scratchpad's id, or `None` until a new scratchpad is first saved.
+    /// The note's id, or `None` until a new note is first saved.
     pub(crate) id: Option<u64>,
 
     title: TextArea<'static>,
@@ -94,9 +94,9 @@ pub struct ScratchpadForm {
     created: String,
     updated: String,
 
-    /// Display name of whoever holds an advisory lock on this scratchpad.
-    /// Today `scratchpad_get` doesn't yet surface this; the field is kept in
-    /// sync from the response anyway so the eventual scratchpad-lock surface
+    /// Display name of whoever holds an advisory lock on this note.
+    /// Today `note_get` doesn't yet surface this; the field is kept in
+    /// sync from the response anyway so the eventual note-lock surface
     /// (todo #55) has live data the moment the daemon starts emitting it.
     pub(crate) locked_by: Option<String>,
 
@@ -117,7 +117,7 @@ pub struct ScratchpadForm {
     /// [`crate::todo_form::body_input`], same rationale as the todo form.
     body_view_height: usize,
     /// Screen rectangle the Body field occupies (inside its border). Captured
-    /// each draw so click-to-position-cursor in [`ScratchpadForm::handle_mouse`]
+    /// each draw so click-to-position-cursor in [`NoteForm::handle_mouse`]
     /// can map a click back to a logical cursor without re-deriving the
     /// layout. `None` until the first render lands.
     body_area: Option<Rect>,
@@ -139,10 +139,10 @@ pub struct ScratchpadForm {
     baseline: Baseline,
 }
 
-impl ScratchpadForm {
-    /// A blank form for a not-yet-created scratchpad.
-    pub fn blank(url: &str) -> ScratchpadForm {
-        ScratchpadForm {
+impl NoteForm {
+    /// A blank form for a not-yet-created note.
+    pub fn blank(url: &str) -> NoteForm {
+        NoteForm {
             url: url.to_string(),
             id: None,
             title: text_area(""),
@@ -160,12 +160,12 @@ impl ScratchpadForm {
             selection: None,
             field_areas: Vec::new(),
             text_field_areas: Vec::new(),
-            message: "new scratchpad - type to begin".to_string(),
+            message: "new note - type to begin".to_string(),
             baseline: Baseline::default(),
         }
     }
 
-    /// A form preloaded from an existing scratchpad's id, title, body, tags,
+    /// A form preloaded from an existing note's id, title, body, tags,
     /// and timestamps.
     pub fn from_parts(
         url: &str,
@@ -175,8 +175,8 @@ impl ScratchpadForm {
         tags: &[String],
         created_at: &str,
         updated_at: &str,
-    ) -> ScratchpadForm {
-        ScratchpadForm {
+    ) -> NoteForm {
+        NoteForm {
             url: url.to_string(),
             id: Some(id),
             title: text_area(title),
@@ -194,7 +194,7 @@ impl ScratchpadForm {
             selection: None,
             field_areas: Vec::new(),
             text_field_areas: Vec::new(),
-            message: format!("scratchpad #{id}"),
+            message: format!("note #{id}"),
             baseline: Baseline {
                 title: title.to_string(),
                 body: body.to_string(),
@@ -203,12 +203,12 @@ impl ScratchpadForm {
         }
     }
 
-    /// Handle one key press. The returned [`ScratchpadFormAction`] tells the
+    /// Handle one key press. The returned [`NoteFormAction`] tells the
     /// host whether the form is dirty (start the debounce), idle, or asking
     /// to close.
-    pub fn handle_key(&mut self, key: KeyEvent) -> ScratchpadFormAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> NoteFormAction {
         if key.kind != KeyEventKind::Press {
-            return ScratchpadFormAction::Idle;
+            return NoteFormAction::Idle;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -242,7 +242,7 @@ impl ScratchpadForm {
                     }
                 }
             }
-            return ScratchpadFormAction::Idle;
+            return NoteFormAction::Idle;
         }
 
         // Any other key: the visible selection is stale; clear before
@@ -251,7 +251,7 @@ impl ScratchpadForm {
 
         match key.code {
             // Ctrl-C closes the form; q/x must remain typeable in the body.
-            KeyCode::Char('c') if ctrl => ScratchpadFormAction::Close,
+            KeyCode::Char('c') if ctrl => NoteFormAction::Close,
             // Tab cycles focus: Title -> Tags -> Body -> Title. BackTab walks
             // the same cycle in reverse so Shift-Tab is the inverse of Tab.
             KeyCode::Tab => {
@@ -260,7 +260,7 @@ impl ScratchpadForm {
                     Field::Tags => Field::Body,
                     Field::Body => Field::Title,
                 };
-                ScratchpadFormAction::Idle
+                NoteFormAction::Idle
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
@@ -268,13 +268,13 @@ impl ScratchpadForm {
                     Field::Tags => Field::Title,
                     Field::Body => Field::Tags,
                 };
-                ScratchpadFormAction::Idle
+                NoteFormAction::Idle
             }
             _ => self.field_key(key),
         }
     }
 
-    fn field_key(&mut self, key: KeyEvent) -> ScratchpadFormAction {
+    fn field_key(&mut self, key: KeyEvent) -> NoteFormAction {
         let changed = match self.focus {
             Field::Title => single_line_input(&mut self.title, key),
             Field::Tags => single_line_input(&mut self.tags, key),
@@ -282,9 +282,9 @@ impl ScratchpadForm {
         };
         if changed {
             self.mark_dirty();
-            ScratchpadFormAction::Dirty
+            NoteFormAction::Dirty
         } else {
-            ScratchpadFormAction::Idle
+            NoteFormAction::Idle
         }
     }
 
@@ -292,7 +292,7 @@ impl ScratchpadForm {
     /// [`crate::todo_form::TodoForm::handle_mouse`]; see that for the full
     /// lifecycle (Down anchors a selection, Drag extends it, Up emits OSC 52,
     /// scroll wheel walks the cursor).
-    pub fn handle_mouse(&mut self, m: MouseEvent) -> ScratchpadFormAction {
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> NoteFormAction {
         let body_area = self.body_area;
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -302,7 +302,7 @@ impl ScratchpadForm {
                         self.body
                             .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
                         self.selection = Some((pos, pos));
-                        return ScratchpadFormAction::Idle;
+                        return NoteFormAction::Idle;
                     }
                 }
                 if let Some((field, inner)) = self.text_field_at(m.row, m.column) {
@@ -314,13 +314,13 @@ impl ScratchpadForm {
                         area.start_selection();
                     }
                     self.selection = None;
-                    return ScratchpadFormAction::Idle;
+                    return NoteFormAction::Idle;
                 }
                 if let Some(field) = self.field_at(m.row, m.column) {
                     self.focus = field;
                     self.selection = None;
                 }
-                return ScratchpadFormAction::Idle;
+                return NoteFormAction::Idle;
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(area) = body_area {
@@ -329,7 +329,7 @@ impl ScratchpadForm {
                             self.selection = Some((anchor, pos));
                             self.body
                                 .move_cursor(CursorMove::Jump(pos.0 as u16, pos.1 as u16));
-                            return ScratchpadFormAction::Idle;
+                            return NoteFormAction::Idle;
                         }
                     }
                 }
@@ -358,7 +358,7 @@ impl ScratchpadForm {
                             let _ = crate::clip::copy_to_clipboard(&text);
                         }
                     }
-                    return ScratchpadFormAction::Idle;
+                    return NoteFormAction::Idle;
                 }
                 let focused = self.focus;
                 if let Some(area) = self.single_line_textarea_mut(focused) {
@@ -380,7 +380,7 @@ impl ScratchpadForm {
             }
             _ => {}
         }
-        ScratchpadFormAction::Idle
+        NoteFormAction::Idle
     }
 
     /// Single-line textarea field whose recorded inner content rectangle
@@ -452,9 +452,9 @@ impl ScratchpadForm {
 
     /// Insert a bracketed-paste payload into the focused field. Multi-line
     /// pastes into Title are flattened to spaces.
-    pub fn handle_paste(&mut self, s: &str) -> ScratchpadFormAction {
+    pub fn handle_paste(&mut self, s: &str) -> NoteFormAction {
         if s.is_empty() {
-            return ScratchpadFormAction::Idle;
+            return NoteFormAction::Idle;
         }
         let changed = match self.focus {
             Field::Title => paste_into_single_line(&mut self.title, s),
@@ -463,9 +463,9 @@ impl ScratchpadForm {
         };
         if changed {
             self.mark_dirty();
-            ScratchpadFormAction::Dirty
+            NoteFormAction::Dirty
         } else {
-            ScratchpadFormAction::Idle
+            NoteFormAction::Idle
         }
     }
 
@@ -485,16 +485,16 @@ impl ScratchpadForm {
     /// Push the current title and body back to the daemon. Used by the
     /// viewer's debounced autosave.
     ///
-    /// Creates the scratchpad first when this is a new form (no id yet) and
+    /// Creates the note first when this is a new form (no id yet) and
     /// the title is non-empty; otherwise updates an existing one in place.
     /// Diffs against [`Self::baseline`] so an idle field is omitted from
-    /// `scratchpad_update` rather than echoed back stale.
+    /// `note_update` rather than echoed back stale.
     pub fn flush(&mut self) -> Result<()> {
         let title = self.current_title();
-        // Suppress only the new-form case: `scratchpad_create` needs a non-
+        // Suppress only the new-form case: `note_create` needs a non-
         // empty title, and an autosave on a blank-from-the-start form would
         // surface that as a spurious error in the message line. Once the
-        // scratchpad exists, the user is allowed to clear its title - the
+        // note exists, the user is allowed to clear its title - the
         // update path accepts an empty string. Without this distinction the
         // last non-empty intermediate state ("a" while the user is mid-delete
         // of "abc") would be the value the daemon and the sidebar see, and
@@ -511,21 +511,21 @@ impl ScratchpadForm {
             let id = match self.id {
                 Some(id) => id,
                 None => {
-                    let created = client.call("scratchpad_create", json!({ "title": title }))?;
+                    let created = client.call("note_create", json!({ "title": title }))?;
                     let id = created
                         .as_u64()
-                        .ok_or_else(|| anyhow!("daemon returned no scratchpad id"))?;
+                        .ok_or_else(|| anyhow!("daemon returned no note id"))?;
                     self.id = Some(id);
-                    // `scratchpad_create` accepts only `title`; the daemon
+                    // `note_create` accepts only `title`; the daemon
                     // initialises the body to "" and tags to []. Record both
                     // in the baseline so the diff below sends whichever body
-                    // or tags the user typed in the new-scratchpad form.
+                    // or tags the user typed in the new-note form.
                     self.baseline.title = title.clone();
                     id
                 }
             };
             let mut payload = serde_json::Map::new();
-            payload.insert("scratchpad_id".into(), json!(id));
+            payload.insert("note_id".into(), json!(id));
             if title != self.baseline.title {
                 payload.insert("title".into(), json!(title));
             }
@@ -538,7 +538,7 @@ impl ScratchpadForm {
             // Skip the round-trip when nothing changed - this is the common
             // shape of a debounced autosave fired by an unrelated event.
             if payload.len() > 1 {
-                client.call("scratchpad_update", Value::Object(payload))?;
+                client.call("note_update", Value::Object(payload))?;
             }
             Ok(())
         })();
@@ -549,7 +549,7 @@ impl ScratchpadForm {
         self.baseline = Baseline { title, body, tags };
         self.dirty = false;
         self.dirty_since = None;
-        self.message = format!("saved scratchpad #{}", self.id.unwrap_or(0));
+        self.message = format!("saved note #{}", self.id.unwrap_or(0));
         Ok(())
     }
 
@@ -568,7 +568,7 @@ impl ScratchpadForm {
             return Ok(false);
         };
         let client = Client::connect(&self.url)?;
-        let outcome = client.call("scratchpad_get", json!({ "scratchpad_id": id }));
+        let outcome = client.call("note_get", json!({ "note_id": id }));
         client.close();
         let pad = outcome?;
 
@@ -676,7 +676,7 @@ impl ScratchpadForm {
     /// Render the form into `area`.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         // Rows: title / tags / body / context / message. The pane title (set
-        // by the Zellij sidebar) already names the scratchpad, so no in-form
+        // by the Zellij sidebar) already names the note, so no in-form
         // header row is needed; locked-by, when set, surfaces in the message
         // line at the bottom. Mirrors the todo form's #53 cleanup.
         let rows = Layout::vertical([
@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn blank_form_starts_focused_on_title_with_no_id() {
-        let form = ScratchpadForm::blank("http://localhost/?ws=/x");
+        let form = NoteForm::blank("http://localhost/?ws=/x");
         assert_eq!(form.id, None);
         assert_eq!(form.focus, Field::Title);
         assert!(form.title_is_empty());
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn from_parts_preloads_id_title_body_and_tags() {
-        let form = ScratchpadForm::from_parts(
+        let form = NoteForm::from_parts(
             "http://localhost/?ws=/x",
             7,
             "notes",
@@ -855,28 +855,28 @@ mod tests {
 
     #[test]
     fn tab_cycles_focus_title_tags_body() {
-        let mut form = ScratchpadForm::blank("http://localhost/?ws=/x");
+        let mut form = NoteForm::blank("http://localhost/?ws=/x");
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
-        assert_eq!(form.handle_key(tab), ScratchpadFormAction::Idle);
+        assert_eq!(form.handle_key(tab), NoteFormAction::Idle);
         assert_eq!(form.focus, Field::Tags);
-        assert_eq!(form.handle_key(tab), ScratchpadFormAction::Idle);
+        assert_eq!(form.handle_key(tab), NoteFormAction::Idle);
         assert_eq!(form.focus, Field::Body);
-        assert_eq!(form.handle_key(tab), ScratchpadFormAction::Idle);
+        assert_eq!(form.handle_key(tab), NoteFormAction::Idle);
         assert_eq!(form.focus, Field::Title);
     }
 
     #[test]
     fn ctrl_c_returns_close() {
-        let mut form = ScratchpadForm::blank("http://localhost/?ws=/x");
+        let mut form = NoteForm::blank("http://localhost/?ws=/x");
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(form.handle_key(ctrl_c), ScratchpadFormAction::Close);
+        assert_eq!(form.handle_key(ctrl_c), NoteFormAction::Close);
     }
 
     #[test]
     fn typing_marks_dirty_and_starts_debounce_window() {
-        let mut form = ScratchpadForm::blank("http://localhost/?ws=/x");
+        let mut form = NoteForm::blank("http://localhost/?ws=/x");
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
-        assert_eq!(form.handle_key(key), ScratchpadFormAction::Dirty);
+        assert_eq!(form.handle_key(key), NoteFormAction::Dirty);
         assert!(form.dirty);
         assert!(form.dirty_since.is_some());
     }
@@ -886,21 +886,21 @@ mod tests {
     /// silently wiped the line under the cursor.
     #[test]
     fn handle_paste_into_body_preserves_lines() {
-        let mut form = ScratchpadForm::blank("http://localhost/?ws=/x");
+        let mut form = NoteForm::blank("http://localhost/?ws=/x");
         // Tab past Tags to Body (cycle is Title -> Tags -> Body).
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
         form.handle_key(tab);
         form.handle_key(tab);
         assert_eq!(form.focus, Field::Body);
         let action = form.handle_paste("alpha\nbeta\ngamma");
-        assert_eq!(action, ScratchpadFormAction::Dirty);
+        assert_eq!(action, NoteFormAction::Dirty);
         assert_eq!(form.body.lines(), vec!["alpha", "beta", "gamma"]);
     }
 
     /// An untouched field picks up the remote value on refresh.
     #[test]
     fn refresh_replays_remote_into_untouched_fields() {
-        let mut form = ScratchpadForm::from_parts(
+        let mut form = NoteForm::from_parts(
             "http://localhost/?ws=/x",
             1,
             "old title",
@@ -931,7 +931,7 @@ mod tests {
     /// the still-pending change.
     #[test]
     fn refresh_keeps_local_edit_and_flags_conflict() {
-        let mut form = ScratchpadForm::from_parts(
+        let mut form = NoteForm::from_parts(
             "http://localhost/?ws=/x",
             1,
             "old title",
@@ -970,7 +970,7 @@ mod tests {
     /// A no-op refresh (remote matches baseline) reports no visible change.
     #[test]
     fn refresh_with_no_remote_drift_is_a_noop() {
-        let mut form = ScratchpadForm::from_parts(
+        let mut form = NoteForm::from_parts(
             "http://localhost/?ws=/x",
             1,
             "t",
@@ -992,10 +992,10 @@ mod tests {
     }
 
     /// The lock-holder field follows the remote value so the future
-    /// scratchpad-lock surface (todo #55) has live data.
+    /// note-lock surface (todo #55) has live data.
     #[test]
     fn refresh_updates_locked_by_from_remote() {
-        let mut form = ScratchpadForm::from_parts(
+        let mut form = NoteForm::from_parts(
             "http://localhost/?ws=/x",
             1,
             "t",
@@ -1021,7 +1021,7 @@ mod tests {
     /// field instead picks up the remote value.
     #[test]
     fn refresh_handles_tags_drift_with_conflict_detection() {
-        let mut form = ScratchpadForm::from_parts(
+        let mut form = NoteForm::from_parts(
             "http://localhost/?ws=/x",
             1,
             "t",

@@ -14,35 +14,35 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScratchpadCreateArgs {
-    /// Human-readable title for the new scratchpad.
+pub struct NoteCreateArgs {
+    /// Human-readable title for the new note.
     pub title: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScratchpadAppendArgs {
-    /// Numeric id of the scratchpad to append to.
-    pub scratchpad_id: u64,
+pub struct NoteAppendArgs {
+    /// Numeric id of the note to append to.
+    pub note_id: u64,
     /// Text to append. It is placed on its own line after existing content.
     pub content: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScratchpadReadArgs {
-    /// Numeric id of the scratchpad to read.
-    pub scratchpad_id: u64,
+pub struct NoteReadArgs {
+    /// Numeric id of the note to read.
+    pub note_id: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScratchpadGetArgs {
-    /// Numeric id of the scratchpad to fetch in full.
-    pub scratchpad_id: u64,
+pub struct NoteGetArgs {
+    /// Numeric id of the note to fetch in full.
+    pub note_id: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScratchpadUpdateArgs {
-    /// Numeric id of the scratchpad to edit.
-    pub scratchpad_id: u64,
+pub struct NoteUpdateArgs {
+    /// Numeric id of the note to edit.
+    pub note_id: u64,
     /// New title. Omit to leave unchanged.
     #[serde(default)]
     pub title: Option<String>,
@@ -51,25 +51,25 @@ pub struct ScratchpadUpdateArgs {
     #[serde(default)]
     pub body: Option<String>,
     /// New complete tag list, replacing the old one. Tags share a project-wide
-    /// vocabulary with todos (see `scratchpad_tags_list`). Omit to leave
+    /// vocabulary with todos (see `note_tags_list`). Omit to leave
     /// unchanged.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScratchpadDeleteArgs {
-    /// Numeric id of the scratchpad to delete.
-    pub scratchpad_id: u64,
+pub struct NoteDeleteArgs {
+    /// Numeric id of the note to delete.
+    pub note_id: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScratchpadSearchArgs {
+pub struct NoteSearchArgs {
     /// Case-insensitive substring matched against title and body. Omit to
-    /// match every scratchpad (subject to other filters).
+    /// match every note (subject to other filters).
     #[serde(default)]
     pub query: Option<String>,
-    /// Require every listed tag to be present on the scratchpad (AND
+    /// Require every listed tag to be present on the note (AND
     /// semantics). Omit or pass an empty list to skip the tag filter.
     #[serde(default)]
     pub tags: Option<Vec<String>>,

@@ -9,7 +9,7 @@ Run several AI coding agents (Claude Code, Codex, anything that speaks MCP) on
 the same project at once, with a shared view of what's been done, what's
 in flight, and what's coming next - all from one terminal window.
 
-![The PANopt cockpit: five stacked sidebar panes on the left (todos, agents, terminals, commands, scratchpads), a content pane on the right](docs/cockpit.png)
+![The PANopt cockpit: five stacked sidebar panes on the left (todos, agents, terminals, commands, notes), a content pane on the right](docs/cockpit.png)
 
 ## What you get
 
@@ -18,7 +18,7 @@ priorities, add tags, leave comments, mark them blocked by other todos. You
 edit them from the sidebar with a quick form; your agents create and update
 them through MCP tools.
 
-**Shared scratchpads.** Free-form notes that agents and humans both read and
+**Shared notes.** Free-form notes that agents and humans both read and
 write. Useful for "here's what I tried", "open questions", or a running log
 of what an agent is doing - read live as the agent writes.
 
@@ -28,13 +28,13 @@ and by whom, so two agents won't quietly clobber each other.
 
 **One terminal cockpit.** The cockpit is a [Zellij](https://zellij.dev)
 session with five sidebar panes - todos, agents, terminals, commands,
-scratchpads - and one big content pane on the right. Arrow through any
+notes - and one big content pane on the right. Arrow through any
 list to preview an item; activate it to swap it into the content pane.
-Todos, scratchpads, and new agents are all created from the sidebar.
+Todos, notes, and new agents are all created from the sidebar.
 
 **Multiple agents, one project.** Spawn another agent from the agents
 pane and it joins the cockpit with its own pane. Every agent shares the
-same todos, scratchpads, and locks, so they can hand work between each
+same todos, notes, and locks, so they can hand work between each
 other instead of stepping on each other.
 
 **Remote agents.** Run the daemon on your workstation and connect an agent
@@ -42,7 +42,7 @@ from another machine on the LAN - a laptop, a Mac running Solo, a host with
 USB-attached debug hardware. The remote agent joins the same coordination
 plane as the local ones and can work on resources only it has access to.
 
-**Your stuff stays yours.** Todos and scratchpads mirror to plain markdown
+**Your stuff stays yours.** Todos and notes mirror to plain markdown
 files under `.panopt/` in your project and is gitignored by default; check 
 it in if you want the project's todos to travel with the repo.
 
@@ -122,7 +122,7 @@ claude --mcp-config "$(panopt agent-config --name my-name)"
 ```
 
 That session shows up in the agents list as `my-name` and shares the same
-todos, scratchpads, and locks as the cockpit-spawned agents.
+todos, notes, and locks as the cockpit-spawned agents.
 
 ### From another machine
 

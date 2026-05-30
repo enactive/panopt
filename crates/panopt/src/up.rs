@@ -13,7 +13,7 @@ use crate::{daemon, mcp, paths};
 ///
 /// Each plugin pane is one Zellij plugin instance running the same wasm
 /// binary, configured by a distinct `mode` value (`todos`, `agents`,
-/// `terminals`, `commands`, `scratchpads`). Zellij keys plugin identity on
+/// `terminals`, `commands`, `notes`). Zellij keys plugin identity on
 /// `(URL, configuration)`, so the five panes are five distinct instances.
 /// Layout-pinned in the `ui` tab template, so adding or removing panes on
 /// the right cannot reshape them.
@@ -71,7 +71,7 @@ layout {
                 }
                 pane size="25%" {
                     plugin location="file:{{WASM}}" {
-                        mode "scratchpads"
+                        mode "notes"
                         ws "{{PROJECT}}"
                         panopt_bin "{{PANOPT_BIN}}"
                         port "{{PORT}}"
@@ -118,7 +118,7 @@ layout {
 const NEW_PANE_BIND_FROM: &str = r#"bind "Alt n" { NewPane; }"#;
 const NEW_PANE_BIND_TO: &str = r#"bind "Alt n" { Run "zellij" "action" "pipe" "--name" "panopt:spawn-blank-pane" "--plugin-configuration" "mode=todos" { close_on_exit true; }; }"#;
 
-/// `Alt-/` opens the cockpit's popup search across todos and scratchpads. Bare
+/// `Alt-/` opens the cockpit's popup search across todos and notes. Bare
 /// `/` would intercept every search keystroke in vim, less, shells, etc. on
 /// locked content panes, so the binding wears the Alt modifier to stay clear
 /// of the inner program's namespace. There is no stock Zellij binding to
@@ -130,7 +130,7 @@ const NEW_PANE_BIND_TO: &str = r#"bind "Alt n" { Run "zellij" "action" "pipe" "-
 const SEARCH_BIND_TO: &str = r#"bind "Alt /" { Run "zellij" "action" "pipe" "--name" "panopt:open-search" "--plugin-configuration" "mode=todos" { close_on_exit true; }; }"#;
 
 /// `Alt-<1..5>` focuses a sidebar pane, lazygit-style (todo #110):
-/// `1`=Todos, `2`=Agents, `3`=Terminals, `4`=Commands, `5`=Scratchpads. These
+/// `1`=Todos, `2`=Agents, `3`=Terminals, `4`=Commands, `5`=Notes. These
 /// fire on auto-locked content panes; the same gesture on a sidebar plugin
 /// pane (Normal mode) is handled inside the plugin's `handle_key`. Both
 /// broadcast a `panopt:focus-pane` pipe carrying the target mode's slug as
@@ -151,7 +151,7 @@ fn focus_pane_binds() -> String {
         (2, "agents"),
         (3, "terminals"),
         (4, "commands"),
-        (5, "scratchpads"),
+        (5, "notes"),
     ]
     .iter()
     .map(|(digit, mode)| {
@@ -266,7 +266,7 @@ pub fn run(plugin: Option<PathBuf>, host: Option<String>, port: u16) -> Result<(
         SessionState::Dead => {
             // Quitting a cockpit leaves a dead, resurrectable Zellij session;
             // clear it so `panopt up` boots a fresh one. Daemon state (todos,
-            // scratchpads) lives in SQLite and is unaffected.
+            // notes) lives in SQLite and is unaffected.
             println!("clearing the dead cockpit `{session}`");
             let cleared = Command::new("zellij")
                 .arg("delete-session")
@@ -1404,7 +1404,7 @@ keybinds clear-defaults=true {
             (2, "agents"),
             (3, "terminals"),
             (4, "commands"),
-            (5, "scratchpads"),
+            (5, "notes"),
         ] {
             assert!(
                 out.contains(&format!(
@@ -1518,7 +1518,7 @@ keybinds {
             .replace("{{WASM}}", "/w.wasm")
             .replace("{{PANOPT_BIN}}", "/bin/panopt")
             .replace("{{PORT}}", "7600");
-        for m in ["todos", "agents", "terminals", "commands", "scratchpads"] {
+        for m in ["todos", "agents", "terminals", "commands", "notes"] {
             assert_eq!(
                 body.matches(&format!("mode \"{m}\"")).count(),
                 1,
