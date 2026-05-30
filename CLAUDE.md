@@ -56,11 +56,13 @@ claude --mcp-config "$(panopt agent-config --name greg-main)"
 
 Without this, the session falls back to the rotating `mcp-session-id` HTTP header as its agent key. The key churns on every reconnect, locks held under old keys get reaped by the 30s idle sweep, and other agents see the connection as a series of unreferenceable UUIDs. See `crates/panopt/src/agent_config.rs` for the resolver defaults (id = `$USER-$HOSTNAME`).
 
-## Working a panopt todo
+## Working a panopt resource by `#N`
 
-When the user asks you to work on a todo (`do #N`, `start #N`, `work on #N`, etc.), call `mcp__panopt__todo_start` as your first MCP action against that todo *instead of* `todo_get`. It returns the same full detail, flips status to `in_progress`, and claims the `todo:<N>` advisory lock so other agents and the sidebar see the project state correctly. When you finish, call `todo_complete`. If `todo_start` returns `{started: false, held_by: <name>}`, stop and tell the user — another agent already owns it.
+When the user refers to a resource as `#N` (a pound sign followed by a number), the id is shared across todos, notes, agent tools, and processes — don't assume it's a todo. Call `mcp__panopt__id_kind` first to discover the resource's type, then dispatch:
 
-Use `todo_get` only when the intent is to *read* a todo (browse, answer a question about it, render it) — not to begin work on it.
+- **Work on / "do" the item** (`do #N`, `start #N`, `work on #N`, etc.) — if it's a todo, call `mcp__panopt__todo_start` as your first action against it *instead of* `todo_get`. It returns the same full detail, flips status to `in_progress`, and claims the `todo:<N>` advisory lock so other agents and the sidebar see the project state correctly. When you finish, call `todo_complete`. If `todo_start` returns `{started: false, held_by: <name>}`, stop and tell the user — another agent already owns it.
+- **Plan the item** (`plan #N`) — use `todo_get`, not `todo_start`. Planning is a read; it should not claim the lock or flip status.
+- **Read / browse the item** (answer a question about it, render it) — use the kind-appropriate getter from `id_kind`: `todo_get`, `note_get`, `agent_tool_get`, or `process_get`.
 
 ## Reference
 
