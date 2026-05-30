@@ -701,7 +701,7 @@ impl ZellijPlugin for PanoptPane {
                     && self.permitted
                 {
                     self.initial_preview_delay += 1;
-                    if self.initial_preview_delay >= 2 {
+                    if self.initial_preview_delay >= 1 {
                         self.preview_cursor();
                         if let Some(plugin) = self.plugin_pane {
                             focus_pane_with_id(plugin, false, false);
