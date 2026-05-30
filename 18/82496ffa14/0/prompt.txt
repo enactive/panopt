@@ -1,0 +1,19 @@
+this does not work.  ctrl-c on the last right-side pane closes it...
+
+---
+
+it's not just command panes, though. the todo says 'ctrl-c to close' and it does.
+
+---
+
+no. that;s fucked up.  think for a change.  DON"T LET THE LAST RIGHT SIDE PANE BE CLOSED.   this way, the sidebar panes are NOT ON THE SIDE.
+
+---
+
+this is almost right.  looks like the first right pane is designated as 'main' and it is prevented from close.  that works.
+
+---
+
+this is almost right.  looks like the first right pane is designated as 'main' and it is prevented from close.  that works.
+
+better if we prevent *any* right pane from closing *if it is the only one remaining'
