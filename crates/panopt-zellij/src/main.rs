@@ -101,6 +101,45 @@ impl Mode {
             Mode::Scratchpads => 's',
         }
     }
+
+    /// Wire slug - the inverse of [`Mode::parse`]. Used to build the
+    /// `--plugin-configuration mode=<slug>` narrowing on the `panopt:focus-pane`
+    /// pipe so a focus request reaches exactly the target instance.
+    fn slug(self) -> &'static str {
+        match self {
+            Mode::Todos => "todos",
+            Mode::Agents => "agents",
+            Mode::Terminals => "terminals",
+            Mode::Commands => "commands",
+            Mode::Scratchpads => "scratchpads",
+        }
+    }
+
+    /// The `Alt-<n>` hotkey that focuses this pane, lazygit-style. Surfaced in
+    /// the frame title (see [`PanoptPane::frame_title`]) and the `?` help so the
+    /// gesture is discoverable from the pane itself.
+    fn hotkey_hint(self) -> &'static str {
+        match self {
+            Mode::Todos => "alt+1",
+            Mode::Agents => "alt+2",
+            Mode::Terminals => "alt+3",
+            Mode::Commands => "alt+4",
+            Mode::Scratchpads => "alt+5",
+        }
+    }
+
+    /// Map an `Alt-<digit>` keypress to the sidebar pane it focuses. The
+    /// inverse of [`Mode::hotkey_hint`]'s numbering.
+    fn from_hotkey(c: char) -> Option<Mode> {
+        match c {
+            '1' => Some(Mode::Todos),
+            '2' => Some(Mode::Agents),
+            '3' => Some(Mode::Terminals),
+            '4' => Some(Mode::Commands),
+            '5' => Some(Mode::Scratchpads),
+            _ => None,
+        }
+    }
 }
 
 /// Status filter applied to the Todos pane. Each variant matches a wire
@@ -453,6 +492,14 @@ struct PanoptPane {
     /// Used by [`PanoptPane::gate_close_focus`] to refuse closing any plugin
     /// pane absolutely.
     sidebar_focused: bool,
+    /// Whether the currently focused pane is floating. Tracked from the same
+    /// non-transient manifest as `sidebar_focused`. The cockpit's floating
+    /// panes are popups - the `panopt search` dialog and the delete/close
+    /// gate dialogs - all of which run in Locked mode, indistinguishable by
+    /// input mode from a focused tiled content pane. The `panopt:focus-pane`
+    /// pipe consults this so `Alt-<n>` does not yank focus out of a popup
+    /// (todo #110): a focus request is a no-op while a floating pane is up.
+    focused_is_floating: bool,
     /// The tab position with a focused pane, derived from the same manifest
     /// snapshot that drives `sidebar_focused`. Scopes the CloseTab gate.
     focused_tab: Option<usize>,
@@ -693,6 +740,23 @@ impl ZellijPlugin for PanoptPane {
                 self.handle_search_result(pipe_message.payload.as_deref());
                 return true;
             }
+            "panopt:focus-pane" => {
+                // `Alt-<n>` focus request (todo #110). Broadcast to every
+                // sidebar instance (config narrowing proved unreliable for the
+                // non-Todos modes - every digit routed to the gatekeeper); the
+                // payload names the target mode's slug, and only that instance
+                // focuses its own pane. Suppressed while a floating popup
+                // (search / gate dialog) holds focus, so the gesture can never
+                // yank the user out of a popup mid-input.
+                if pipe_message.payload.as_deref() == Some(self.mode.slug())
+                    && !self.focused_is_floating
+                {
+                    if let Some(plugin) = self.plugin_pane {
+                        focus_pane_with_id(plugin, false, false);
+                    }
+                }
+                return true;
+            }
             _ => {}
         }
         if self.mode != Mode::Todos {
@@ -830,7 +894,9 @@ impl PanoptPane {
     /// The frame title is the only place these statuses live now - the pane
     /// body is just the item list.
     fn frame_title(&self) -> String {
-        let base = self.mode.label();
+        // Lead with the `Alt-<n>` focus hotkey (todo #110) so the gesture is
+        // discoverable from the pane itself, lazygit-style: `[alt+1] Todos`.
+        let base = format!("[{}] {}", self.mode.hotkey_hint(), self.mode.label());
         if !self.permitted {
             return format!("{base} - grant permissions");
         }
@@ -904,6 +970,7 @@ impl PanoptPane {
         lines.push("  PgUp/PgDn     page".to_string());
         lines.push("  Home/End      first/last".to_string());
         lines.push("  Enter         open / focus".to_string());
+        lines.push("  alt+1..5      focus sidebar pane".to_string());
         lines.push(String::new());
         match self.mode {
             Mode::Todos => {
@@ -1079,6 +1146,7 @@ impl PanoptPane {
         let mut focused_non_plugin: Option<PaneId> = None;
         let mut sidebar_focused_this_update = false;
         let mut saw_focused_pane = false;
+        let mut focused_floating_this_update = false;
         let mut focused_tab_this_update: Option<usize> = None;
         for tab in tabs {
             for p in &manifest.panes[tab] {
@@ -1091,6 +1159,7 @@ impl PanoptPane {
                 if p.is_focused {
                     saw_focused_pane = true;
                     focused_tab_this_update = Some(*tab);
+                    focused_floating_this_update = p.is_floating;
                     if p.is_plugin {
                         // Any plugin pane focused = a cockpit plugin pane is
                         // focused. The cockpit is the only place plugins
@@ -1137,6 +1206,7 @@ impl PanoptPane {
         }
         if saw_focused_pane {
             self.sidebar_focused = sidebar_focused_this_update;
+            self.focused_is_floating = focused_floating_this_update;
             self.focused_tab = focused_tab_this_update;
             // Auto-lock the multiplexer when focus is on a content pane
             // (`panopt _viewer` form or an agent/terminal) so every Zellij
@@ -1526,6 +1596,19 @@ impl PanoptPane {
             }
             BareKey::Char('n') if self.mode == Mode::Agents => self.spawn_agent_pane(None),
             BareKey::Char('L') => self.open_mode_list(true),
+            // `Alt-<1..5>` jumps focus to a sibling sidebar pane, lazygit-style
+            // (todo #110). Guarded on the Alt modifier so it takes precedence
+            // over the bare `1`/`2` sort bindings below - a plain `1` still
+            // sorts. The keypress only reaches `handle_key` when a sidebar
+            // plugin pane already has focus (Normal mode); the equivalent
+            // gesture from a locked content pane rides Zellij keybinds (see
+            // `up::FOCUS_PANE_BINDS`). Both emit the same `panopt:focus-pane`
+            // pipe.
+            BareKey::Char(c @ '1'..='5') if key.key_modifiers.contains(&KeyModifier::Alt) => {
+                if let Some(target) = Mode::from_hotkey(c) {
+                    self.request_focus_pane(target);
+                }
+            }
             // Filter (Todos only). Forward = `f`, backward = `F`.
             BareKey::Char('f') if self.mode == Mode::Todos => self.cycle_todo_filter(true),
             BareKey::Char('F') if self.mode == Mode::Todos => self.cycle_todo_filter(false),
@@ -1749,6 +1832,33 @@ impl PanoptPane {
             BTreeMap::new(),
         );
         self.search_pane = pane;
+    }
+
+    /// Ask the `target` sidebar pane to focus itself (todo #110). Broadcast as
+    /// a `panopt:focus-pane` pipe carrying the target mode's slug as payload:
+    /// every sidebar instance receives it, only the one whose own slug matches
+    /// focuses its pane (and no-ops while a popup is up). We broadcast - rather
+    /// than narrow with `--plugin-configuration mode=<slug>` - because that
+    /// narrowing routed every digit to the gatekeeper instead of the named
+    /// instance; the same self-filtering broadcast backs `close-search` /
+    /// `show-result`. We go through `zellij action pipe` rather than the
+    /// in-process `pipe_message_to_plugin` for the same reason the cockpit
+    /// keybinds do: that API launches a fresh instance when no `(url, config)`
+    /// match is found. Unlike the keybind path, a plugin-issued `run_command`
+    /// spawns no transient focus-stealing pane.
+    fn request_focus_pane(&self, target: Mode) {
+        run_command(
+            &[
+                "zellij",
+                "action",
+                "pipe",
+                "--name",
+                "panopt:focus-pane",
+                "--",
+                target.slug(),
+            ],
+            BTreeMap::new(),
+        );
     }
 
     /// Close the floating search popup pane (if any) and clear the tracking
@@ -2983,6 +3093,27 @@ mod tests {
         // Case-insensitive match so user typing `agent foo` still gets
         // collapsed onto the canonical "Agent foo".
         assert_eq!(kind_prefixed_title("Agent", "agent foo"), "agent foo");
+    }
+
+    #[test]
+    fn mode_hotkey_mapping_is_consistent() {
+        // `from_hotkey` and `hotkey_hint` are inverses, and `slug` round-trips
+        // through `parse` - the focus pipe relies on both to reach exactly the
+        // target instance (todo #110).
+        for (digit, mode) in [
+            ('1', Mode::Todos),
+            ('2', Mode::Agents),
+            ('3', Mode::Terminals),
+            ('4', Mode::Commands),
+            ('5', Mode::Scratchpads),
+        ] {
+            assert_eq!(Mode::from_hotkey(digit), Some(mode));
+            assert_eq!(mode.hotkey_hint(), format!("alt+{digit}"));
+            assert_eq!(Mode::parse(mode.slug()), Some(mode));
+        }
+        assert_eq!(Mode::from_hotkey('0'), None);
+        assert_eq!(Mode::from_hotkey('6'), None);
+        assert_eq!(Mode::from_hotkey('a'), None);
     }
 
     #[test]

@@ -129,6 +129,40 @@ const NEW_PANE_BIND_TO: &str = r#"bind "Alt n" { Run "zellij" "action" "pipe" "-
 /// rather than by Zellij - so the gesture works everywhere in the cockpit.
 const SEARCH_BIND_TO: &str = r#"bind "Alt /" { Run "zellij" "action" "pipe" "--name" "panopt:open-search" "--plugin-configuration" "mode=todos" { close_on_exit true; }; }"#;
 
+/// `Alt-<1..5>` focuses a sidebar pane, lazygit-style (todo #110):
+/// `1`=Todos, `2`=Agents, `3`=Terminals, `4`=Commands, `5`=Scratchpads. These
+/// fire on auto-locked content panes; the same gesture on a sidebar plugin
+/// pane (Normal mode) is handled inside the plugin's `handle_key`. Both
+/// broadcast a `panopt:focus-pane` pipe carrying the target mode's slug as
+/// payload; every sidebar instance receives it but only the one whose own
+/// slug matches focuses its pane - and that one no-ops while a floating popup
+/// (search / gate dialog) holds focus, so the gesture never yanks the user out
+/// of a popup. We broadcast (the payload rides as the trailing `-- <slug>`
+/// positional that `zellij action pipe` reads) rather than narrow with
+/// `--plugin-configuration "mode=<slug>"` because the narrowing routed every
+/// digit to the gatekeeper instead of the named instance; the same
+/// self-filtering broadcast backs the search pipes. Built rather than
+/// `const`-ed because the slug varies per digit; see [`NEW_PANE_BIND_FROM`]
+/// for why the cockpit pipes through `zellij action pipe` rather than
+/// `MessagePlugin`.
+fn focus_pane_binds() -> String {
+    [
+        (1, "todos"),
+        (2, "agents"),
+        (3, "terminals"),
+        (4, "commands"),
+        (5, "scratchpads"),
+    ]
+    .iter()
+    .map(|(digit, mode)| {
+        format!(
+            r#"bind "Alt {digit}" {{ Run "zellij" "action" "pipe" "--name" "panopt:focus-pane" "--" "{mode}" {{ close_on_exit true; }}; }}"#
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("\n        ")
+}
+
 /// Zellij's stock close/quit keybinds, rewritten to pipe a request to the
 /// Todos plugin pane (cockpit gatekeeper) instead of acting immediately.
 /// The plugin refuses the action when an active item would be lost and
@@ -671,6 +705,7 @@ fn inject_locked_keybinds(base: &str) -> (String, bool) {
 /// which stay in Normal mode and whose own `handle_key` page-steps the
 /// list cursor.
 fn locked_extra_binds() -> String {
+    let focus_binds = focus_pane_binds();
     format!(
         "        bind \"Ctrl s\" {{ SwitchToMode \"scroll\"; }}\n        \
          bind \"PageUp\" {{ PageScrollUp; }}\n        \
@@ -681,7 +716,8 @@ fn locked_extra_binds() -> String {
          bind \"Alt Down\" {{ MoveFocus \"Down\"; }}\n        \
          {NEW_PANE_BIND_TO}\n        \
          {QUIT_BIND_TO}\n        \
-         {SEARCH_BIND_TO}\n    "
+         {SEARCH_BIND_TO}\n        \
+         {focus_binds}\n    "
     )
 }
 
@@ -1130,12 +1166,33 @@ keybinds clear-defaults=true {
         assert!(out.contains(r#""panopt:spawn-blank-pane""#));
         assert!(out.contains(r#""panopt:quit-request""#));
         assert!(out.contains(r#""panopt:open-search""#));
-        // Each pipe binding includes its gatekeeper narrowing once.
+        // The `Alt-<1..5>` focus binds (todo #110), one per sidebar pane. They
+        // broadcast (no `mode=` narrowing) and carry the target mode's slug as
+        // payload; the plugin self-filters on payload == its own slug.
+        for (digit, mode) in [
+            (1, "todos"),
+            (2, "agents"),
+            (3, "terminals"),
+            (4, "commands"),
+            (5, "scratchpads"),
+        ] {
+            assert!(
+                out.contains(&format!(
+                    r#"bind "Alt {digit}" {{ Run "zellij" "action" "pipe" "--name" "panopt:focus-pane" "--" "{mode}""#
+                )),
+                "missing Alt {digit} -> {mode} focus bind"
+            );
+        }
+        // `mode=todos` narrowing appears on three gatekeeper pipes:
+        // spawn-blank-pane, quit-request, open-search. The focus binds
+        // broadcast instead, so they add none.
         assert_eq!(
             out.matches(r#""--plugin-configuration" "mode=todos""#)
                 .count(),
             3
         );
+        // The Alt-5 focus bind also lands inside the locked block.
+        let focus_alt5 = out.find(r#"bind "Alt 5""#).unwrap();
         // The splice lands inside the `locked` block, not after it. The
         // locked block in the fixture is followed by `shared_except`, so
         // every spliced bind must appear before that header.
@@ -1152,6 +1209,10 @@ keybinds clear-defaults=true {
             "PageUp bind must land inside the locked block - if it leaks \
              into a `shared` block it will intercept on sidebar plugin \
              panes too and the plugin's page-step handler will never fire"
+        );
+        assert!(
+            focus_alt5 < shared_except,
+            "Alt 5 focus bind must land inside the locked block"
         );
     }
 
