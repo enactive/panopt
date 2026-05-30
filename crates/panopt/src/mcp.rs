@@ -66,7 +66,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(super::AGENT_MCP_JSON).unwrap();
         let server = &v["mcpServers"]["panopt"];
         assert_eq!(server["type"], "stdio");
-        assert_eq!(server["command"], "panopt");
+        assert_eq!(server["command"], "${PANOPT_BIN:-panopt}");
         let args = server["args"].as_array().expect("args is an array");
         // The proxy subcommand has to be present, and every templated env
         // var the proxy needs has to make it into the args list.
