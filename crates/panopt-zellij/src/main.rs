@@ -52,6 +52,14 @@ const SPAWNED_VIEWER_SLOT_PREFIX: &str = "v";
 /// stay consistent across the five panes.
 const AGENT_LABELS_PATH: &str = "/host/.panopt/.cockpit/agent-labels.json";
 
+/// The Todos gatekeeper publishes the live right-side content-pane count here.
+/// A `_viewer` reads it at close time to learn whether it is the only pane
+/// left - the one it must refuse to close, since losing it makes Zellij
+/// re-tile and the sidebar stop being a sidebar. The plugin's own `x`/`Ctrl-q`
+/// close gate already covers the keybind paths; this file covers the viewer's
+/// in-pane Ctrl-c/`q`, which never routes through the plugin.
+const CONTENT_COUNT_PATH: &str = "/host/.panopt/.cockpit/content-count";
+
 /// Which kind of resource one plugin pane renders. Five plugin instances run
 /// in parallel, one per `Mode`, each configured by the `mode "<kind>"` value
 /// in the layout's plugin block. Zellij keys plugin identity on
@@ -537,6 +545,11 @@ struct PanoptPane {
     /// and not on every manifest tick. Only the Todos pane writes this -
     /// see the gate in `ingest_panes`.
     last_emitted_locked: Option<bool>,
+    /// Last content-pane count this instance published to [`CONTENT_COUNT_PATH`]
+    /// so the gatekeeper rewrites the file only when the count changes, not on
+    /// every manifest tick. Only the Todos pane writes it; `None` until the
+    /// first publish.
+    last_content_count: Option<usize>,
 }
 
 /// A parsed `.panopt/processes.md` line. The line format is preserved from
@@ -560,6 +573,10 @@ struct PaneRow {
     /// is already on screen.
     suppressed: bool,
     exited: bool,
+    /// A floating overlay (search popup, close/delete-gate dialog) rather than
+    /// a tiled content pane. Excluded from the content-pane floor: a dialog on
+    /// screen is not the content slot the cockpit must keep alive.
+    floating: bool,
     role: PaneRole,
     /// For [`PaneRole::Viewer`] panes only: the `--slot X` token from the
     /// launch command, used as the routing file name
@@ -1192,6 +1209,7 @@ impl PanoptPane {
                     focused: p.is_focused,
                     suppressed: p.is_suppressed,
                     exited: p.exited,
+                    floating: p.is_floating,
                     role,
                     viewer_slot,
                     tab: *tab,
@@ -1249,6 +1267,7 @@ impl PanoptPane {
                 .or_else(|| self.panes.iter().find(|p| !p.suppressed))
                 .map(|p| p.id);
         }
+        self.publish_content_count();
         self.sync_pane_titles();
     }
 
@@ -2210,12 +2229,13 @@ impl PanoptPane {
         let Some(target) = self.slot_pane else {
             return;
         };
-        // Closing the last visible right-side pane would leave the user with
-        // no content slot and no obvious way to summon one back - the sidebar
-        // swap-in-place model assumes a slot exists. Refuse absolutely, same
-        // shape as the sidebar refusal above; no override dialog (the dialog's
-        // confirm path would otherwise bypass this check).
-        if self.visible_content_panes_in_focused_tab() <= 1 {
+        // Closing the last content pane leaves no slot and no obvious way back
+        // (focus falls to the sidebar, where pane creation is refused). Refuse
+        // the explicit keybind close cleanly here, same shape as the sidebar
+        // refusal above and ahead of the active-work dialog whose confirm path
+        // would otherwise bypass this. `ensure_content_floor` is the safety net
+        // for the close paths a keybind gate cannot see (Ctrl-c, exit, crash).
+        if self.content_pane_count() <= 1 {
             self.refuse_gate("cannot close the last content pane");
             return;
         }
@@ -2401,21 +2421,36 @@ impl PanoptPane {
             .collect()
     }
 
-    /// Count right-side content panes currently on screen in the focused tab.
-    /// Plugin panes are `PaneId::Plugin` and excluded by construction, so a
-    /// non-suppressed, non-exited `PaneId::Terminal` is by definition a
-    /// right-side pane. Used by [`PanoptPane::gate_close_focus`] to refuse the
-    /// last-pane close that would leave the sidebar with no swap target.
-    fn visible_content_panes_in_focused_tab(&self) -> usize {
-        let Some(tab) = self.focused_tab else {
-            return 0;
-        };
+    /// Count live content panes across the whole session. `self.panes` already
+    /// excludes the five plugin panes (skipped at ingest), so this counts only
+    /// right-side content. Suppressed-but-running panes are included (they are
+    /// swappable content, just hidden); exited/held panes and floating overlays
+    /// (search popup, gate dialogs) are excluded. Drives
+    /// [`PanoptPane::gate_close_focus`] (refuse the last `x`/`Ctrl-q` close) and
+    /// [`PanoptPane::publish_content_count`] (so a viewer can refuse the last
+    /// Ctrl-c/`q` close, which never routes through the plugin).
+    fn content_pane_count(&self) -> usize {
         self.panes
             .iter()
-            .filter(|p| p.tab == tab)
-            .filter(|p| matches!(p.id, PaneId::Terminal(_)))
-            .filter(|p| !p.suppressed && !p.exited)
+            .filter(|p| !p.floating && !p.exited)
             .count()
+    }
+
+    /// Publish [`Self::content_pane_count`] to [`CONTENT_COUNT_PATH`] so each
+    /// `_viewer` can tell, at close time, whether it is the only right-side
+    /// pane left. Only the Todos gatekeeper writes (every instance sees the
+    /// same manifest, so the count is identical), and only when it changes, to
+    /// avoid rewriting the file on every manifest tick.
+    fn publish_content_count(&mut self) {
+        if self.mode != Mode::Todos {
+            return;
+        }
+        let count = self.content_pane_count();
+        if self.last_content_count == Some(count) {
+            return;
+        }
+        self.last_content_count = Some(count);
+        write_content_count(count);
     }
 
     fn refuse_gate(&mut self, reason: &str) {
@@ -2520,6 +2555,19 @@ fn write_routing(kind: &str, id: Option<u64>, slot: &str) {
     let tmp = format!("{dir}/.viewer-{slot}.tmp");
     if fs::write(&tmp, payload).is_ok() {
         let _ = fs::rename(&tmp, &target);
+    }
+}
+
+/// Atomically publish the live right-side content-pane count to
+/// [`CONTENT_COUNT_PATH`] (temp + rename), for viewers to read at close time.
+fn write_content_count(count: usize) {
+    let dir = "/host/.panopt/.cockpit";
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = format!("{dir}/.content-count.tmp");
+    if fs::write(&tmp, count.to_string()).is_ok() {
+        let _ = fs::rename(&tmp, CONTENT_COUNT_PATH);
     }
 }
 

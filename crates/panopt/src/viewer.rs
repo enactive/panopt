@@ -37,6 +37,14 @@ use crate::todo::observer_url;
 use crate::todo_form::TodoForm;
 use crate::viewstate::{self, ViewState};
 
+/// File the cockpit's Todos gatekeeper publishes the live right-side pane
+/// count to (under the project's `.panopt/.cockpit/`). A `_viewer` reads it to
+/// learn whether it is the only content pane left - the one it must not close,
+/// since closing it makes Zellij re-tile and the five plugin panes stop being
+/// a sidebar. Outside the cockpit the file is absent and viewers stay closable.
+/// See [`Viewer::close_gesture`].
+const CONTENT_COUNT_FILE: &str = "content-count";
+
 /// How often the viewer wakes to poll the routing file and refresh content.
 const TICK: Duration = Duration::from_millis(250);
 /// The shortest gap between re-reads of the displayed content file.
@@ -467,6 +475,11 @@ struct Viewer {
     todo_sort_2: TodoSort,
     last_refresh: Instant,
     needs_draw: bool,
+    /// True when this viewer is the only right-side content pane left, per the
+    /// count the cockpit gatekeeper publishes. Refreshed each tick; gates
+    /// [`Viewer::close_gesture`] so the last pane cannot be closed out from
+    /// under the sidebar. Always false outside the cockpit.
+    sole_content_pane: bool,
 }
 
 impl Viewer {
@@ -511,6 +524,7 @@ impl Viewer {
             todo_sort_2,
             last_refresh: Instant::now(),
             needs_draw: true,
+            sole_content_pane: false,
         };
         viewer.reload_content();
         viewer
@@ -538,7 +552,17 @@ impl Viewer {
             self.poll_routing();
             self.maybe_refresh();
             self.maybe_autosave();
+            self.refresh_sole_content();
         }
+    }
+
+    /// Re-read the gatekeeper's published right-side pane count and cache
+    /// whether this viewer is now the only one left. Only meaningful inside
+    /// the cockpit: a stand-alone `panopt _viewer` runs outside Zellij with no
+    /// gatekeeper publishing the count, so it must always stay closable.
+    fn refresh_sole_content(&mut self) {
+        self.sole_content_pane = std::env::var_os("ZELLIJ").is_some()
+            && read_content_count(&self.ws).is_some_and(|n| n <= 1);
     }
 
     /// Handle one key press; return `true` to quit. In form mode the form
@@ -546,46 +570,53 @@ impl Viewer {
     /// not collide with typed input.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match &mut self.content {
+        // Each arm yields `true` to mean "the user asked to close". The actual
+        // close is deferred to `close_gesture` after the match so it runs once
+        // the `&mut self.content` borrow the form arms hold has been released.
+        let close = match &mut self.content {
             Content::TodoForm(form) => {
                 if ctrl && matches!(key.code, KeyCode::Char('c')) {
                     // Flush any unsaved edits before the pane goes away.
                     let _ = form.flush();
-                    return true;
-                }
-                match form.handle_key(key) {
-                    crate::todo_form::TodoFormAction::Close => {
-                        let _ = form.flush();
-                        return true;
+                    true
+                } else {
+                    match form.handle_key(key) {
+                        crate::todo_form::TodoFormAction::Close => {
+                            let _ = form.flush();
+                            true
+                        }
+                        crate::todo_form::TodoFormAction::Dirty
+                        | crate::todo_form::TodoFormAction::Idle => {
+                            self.needs_draw = true;
+                            false
+                        }
                     }
-                    crate::todo_form::TodoFormAction::Dirty
-                    | crate::todo_form::TodoFormAction::Idle => {}
                 }
-                self.needs_draw = true;
-                false
             }
             Content::ScratchpadForm(form) => {
                 if ctrl && matches!(key.code, KeyCode::Char('c')) {
                     let _ = form.flush();
-                    return true;
-                }
-                match form.handle_key(key) {
-                    crate::scratchpad_form::ScratchpadFormAction::Close => {
-                        let _ = form.flush();
-                        return true;
+                    true
+                } else {
+                    match form.handle_key(key) {
+                        crate::scratchpad_form::ScratchpadFormAction::Close => {
+                            let _ = form.flush();
+                            true
+                        }
+                        crate::scratchpad_form::ScratchpadFormAction::Dirty
+                        | crate::scratchpad_form::ScratchpadFormAction::Idle => {
+                            self.needs_draw = true;
+                            false
+                        }
                     }
-                    crate::scratchpad_form::ScratchpadFormAction::Dirty
-                    | crate::scratchpad_form::ScratchpadFormAction::Idle => {}
                 }
-                self.needs_draw = true;
-                false
             }
             _ => {
                 match key.code {
-                    KeyCode::Char('c') if ctrl => return true,
+                    KeyCode::Char('c') if ctrl => return self.close_gesture(),
                     // `q` closes only outside the form; in form mode the user
                     // can type a `q` into the title.
-                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('q') => return self.close_gesture(),
                     KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
                     KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
                     KeyCode::PageUp => self.move_by(-(self.viewport.max(1) as i64)),
@@ -609,6 +640,30 @@ impl Viewer {
                 self.needs_draw = true;
                 false
             }
+        };
+        if close {
+            self.close_gesture()
+        } else {
+            false
+        }
+    }
+
+    /// The user's close gesture - Ctrl-C, or `q`/the form's own close outside
+    /// it. Returns `true` to quit the event loop (the process exits and the
+    /// pane closes). When this is the only right-side content pane left,
+    /// closing it would make Zellij re-tile and the sidebar plugin panes stop
+    /// being a sidebar - so it never quits: it clears the pane back to `Empty`
+    /// (any form edits already flushed by the caller) and keeps the process,
+    /// and the layout, alive. With another content pane present it quits,
+    /// closing its pane as before.
+    fn close_gesture(&mut self) -> bool {
+        if self.sole_content_pane {
+            self.target = Target::Empty;
+            self.reload_content();
+            self.needs_draw = true;
+            false
+        } else {
+            true
         }
     }
 
@@ -1342,6 +1397,14 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Read the right-side pane count the cockpit gatekeeper publishes under
+/// `.panopt/.cockpit/`. `None` when the file is absent (no cockpit) or
+/// unparseable, which callers treat as "not the sole pane" - i.e. closable.
+fn read_content_count(ws: &Path) -> Option<usize> {
+    let path = ws.join(".panopt").join(".cockpit").join(CONTENT_COUNT_FILE);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// Decide whether the just-flushed form has earned a kind transition. Pure
 /// function: takes the viewer's current [`Target`] and the form's id after
 /// flush, returns `Some(Target::Todo(id) | Target::Scratchpad(id))` only when
@@ -1508,6 +1571,48 @@ mod tests {
             todo_sort_2: TodoSort::CreatedAsc,
             last_refresh: Instant::now(),
             needs_draw: false,
+            sole_content_pane: false,
+        }
+    }
+
+    #[test]
+    fn sole_content_pane_refuses_to_close() {
+        // When this is the only right-side pane left, closing it would make
+        // Zellij re-tile and the sidebar plugin panes stop being a sidebar.
+        // Ctrl-C and `q` must therefore not quit it - they clear it back to
+        // Empty and keep the process (and the layout) alive.
+        for key in [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+        ] {
+            let mut viewer = viewer_with_list(3, 5, 0);
+            viewer.sole_content_pane = true;
+            assert!(
+                !viewer.handle_key(key),
+                "sole pane must not quit on {key:?}"
+            );
+            assert_eq!(
+                viewer.target,
+                Target::Empty,
+                "sole pane should clear to Empty on {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn viewer_closes_when_another_pane_remains() {
+        // With another content pane present this viewer is not the last one,
+        // so the close gesture quits as before: handle_key returns true and
+        // the event loop exits, closing the pane.
+        for key in [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+        ] {
+            let mut viewer = viewer_with_list(3, 5, 0);
+            assert!(
+                viewer.handle_key(key),
+                "non-sole pane should quit on {key:?}"
+            );
         }
     }
 
@@ -1582,6 +1687,7 @@ mod tests {
             todo_sort_2: TodoSort::CreatedAsc,
             last_refresh: Instant::now(),
             needs_draw: false,
+            sole_content_pane: false,
         }
     }
 
@@ -1721,6 +1827,7 @@ mod tests {
             todo_sort_2: TodoSort::CreatedAsc,
             last_refresh: Instant::now(),
             needs_draw: false,
+            sole_content_pane: false,
         };
         viewer.promote_form_target(Target::Scratchpad(42));
         assert_eq!(viewer.target, Target::Scratchpad(42));
