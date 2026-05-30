@@ -1,0 +1,13 @@
+plan #115
+
+---
+
+there is one case when panes are being created.  if I create one agent pane, then replace that pane's contents with something else (todo, note, etc), then go to the agent sidebar pane and press enter on 'Agent 1'...  the agent sidebar pane is split and the 'Agent 1' pane is rendered in it.
+
+---
+
+go
+
+---
+
+yes
