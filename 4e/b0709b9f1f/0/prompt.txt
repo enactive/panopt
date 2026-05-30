@@ -1,0 +1,7 @@
+fix #114
+
+---
+
+need to fix CLAUDE.md guidance on using panopt tools: 
+
+When the user refers to "#%d" (the pound sign followed by a number) use the id_kind tool to discover the item's type, then the appropriate _get tools to get the item or todo_start if the request is to work on ("do") the item.  A user request to plan an item should use todo_get.

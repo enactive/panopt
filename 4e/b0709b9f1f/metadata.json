@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "4eb0709b9f1f",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "crates/panopt/src/mcp.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/4e/b0709b9f1f/0/metadata.json",
+      "transcript": "/4e/b0709b9f1f/0/full.jsonl",
+      "content_hash": "/4e/b0709b9f1f/0/content_hash.txt",
+      "prompt": "/4e/b0709b9f1f/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 3001,
+    "cache_creation_tokens": 38567,
+    "cache_read_tokens": 425835,
+    "output_tokens": 3337,
+    "api_call_count": 17
+  }
+}
