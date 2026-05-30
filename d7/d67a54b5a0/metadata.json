@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "d7d67a54b5a0",
+  "strategy": "manual-commit",
+  "branch": "todo-110-sidebar-focus-hotkeys",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/up.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/d7/d67a54b5a0/0/metadata.json",
+      "transcript": "/d7/d67a54b5a0/0/full.jsonl",
+      "content_hash": "/d7/d67a54b5a0/0/content_hash.txt",
+      "prompt": "/d7/d67a54b5a0/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 4615,
+    "cache_creation_tokens": 159943,
+    "cache_read_tokens": 9513123,
+    "output_tokens": 89218,
+    "api_call_count": 97
+  }
+}

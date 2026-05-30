@@ -1,0 +1,17 @@
+plan #110
+
+---
+
+def. need it to work from all panes (except popups like the search one.
+
+---
+
+yes
+
+---
+
+all of these shortcuts focus the todos pane
+
+---
+
+now they don't do anything at all
