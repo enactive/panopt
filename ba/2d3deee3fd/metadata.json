@@ -3,7 +3,7 @@
   "checkpoint_id": "ba2d3deee3fd",
   "strategy": "manual-commit",
   "branch": "todo-110-sidebar-focus-hotkeys",
-  "checkpoints_count": 0,
+  "checkpoints_count": 2,
   "files_touched": [
     "crates/panopt/src/scratchpad_form.rs",
     "crates/panopt/src/todo_form.rs",
@@ -15,13 +15,19 @@
       "transcript": "/ba/2d3deee3fd/0/full.jsonl",
       "content_hash": "/ba/2d3deee3fd/0/content_hash.txt",
       "prompt": "/ba/2d3deee3fd/0/prompt.txt"
+    },
+    {
+      "metadata": "/ba/2d3deee3fd/1/metadata.json",
+      "transcript": "/ba/2d3deee3fd/1/full.jsonl",
+      "content_hash": "/ba/2d3deee3fd/1/content_hash.txt",
+      "prompt": "/ba/2d3deee3fd/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 13334,
-    "cache_creation_tokens": 84421,
-    "cache_read_tokens": 307452,
-    "output_tokens": 14460,
-    "api_call_count": 11
+    "input_tokens": 18039,
+    "cache_creation_tokens": 142341,
+    "cache_read_tokens": 886334,
+    "output_tokens": 18775,
+    "api_call_count": 31
   }
 }
