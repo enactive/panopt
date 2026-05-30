@@ -1250,7 +1250,17 @@ impl PanoptPane {
             }
         }
         if let Some(slot) = self.slot_pane {
-            if !self.panes.iter().any(|p| p.id == slot) {
+            // Drop the slot when its pane is gone *or merely suppressed*. Each
+            // sidebar mode is its own plugin instance with its own `slot_pane`;
+            // when one instance swaps a viewer into the content slot, the pane
+            // it displaced is suppressed (still in the manifest, just hidden).
+            // The other instances must not keep pointing at that hidden pane -
+            // otherwise `show_in_slot` mistakes it for the live slot, calls
+            // `focus_pane_with_id` on a suppressed pane, and Zellij resurfaces
+            // it by splitting whatever sidebar pane is focused. Treating a
+            // suppressed slot as no-longer-the-slot lets the re-adopt below
+            // re-point at the visible content pane.
+            if !self.panes.iter().any(|p| p.id == slot && !p.suppressed) {
                 self.slot_pane = None;
             }
         }
@@ -2101,7 +2111,13 @@ impl PanoptPane {
     }
 
     fn show_in_slot(&mut self, pane: PaneId, focus: bool) {
-        let is_slot = self.slot_pane == Some(pane);
+        // A stale `slot_pane` pointing at a suppressed pane must not count as
+        // the live slot: the reconcile in `ingest_panes` clears it, but a
+        // keypress can arrive before the next PaneUpdate. Require the slot to
+        // be visible so we always take the replace/show branch (which swaps
+        // `pane` into the real content slot) rather than focusing a hidden
+        // pane in place - the latter splits the focused sidebar pane.
+        let is_slot = self.slot_pane == Some(pane) && self.pane_is_visible(pane);
         if !is_slot {
             match self.slot_pane {
                 Some(slot) => replace_pane_with_existing_pane(slot, pane, true),
@@ -3333,6 +3349,43 @@ mod tests {
         assert!(sidebar.pane_is_visible(PaneId::Terminal(4)));
         assert!(!sidebar.pane_is_visible(PaneId::Terminal(9)));
         assert!(!sidebar.pane_is_visible(PaneId::Terminal(99)));
+    }
+
+    #[test]
+    fn ingest_panes_drops_a_suppressed_slot_and_readopts_the_viewer() {
+        use std::collections::HashMap;
+        // The Agents instance holds an agent pane as its slot. Another
+        // instance then swaps a viewer into the content area, suppressing the
+        // agent. On the next manifest the agent (id 4) is suppressed and a
+        // visible viewer (id 7) holds the slot. The stale agent slot must be
+        // dropped and the visible viewer re-adopted - otherwise Enter on the
+        // agent would `focus_pane_with_id` a suppressed pane and split the
+        // focused sidebar pane.
+        let mut sidebar = pane_with(Mode::Agents);
+        sidebar.slot_pane = Some(PaneId::Terminal(4));
+        let mut panes = HashMap::new();
+        panes.insert(
+            0usize,
+            vec![
+                PaneInfo {
+                    id: 4,
+                    is_selectable: true,
+                    is_suppressed: true,
+                    terminal_command: Some("/bin/panopt _agent --id a".to_string()),
+                    ..Default::default()
+                },
+                PaneInfo {
+                    id: 7,
+                    is_selectable: true,
+                    terminal_command: Some(
+                        "/bin/panopt _viewer --slot vt1 --port 7600".to_string(),
+                    ),
+                    ..Default::default()
+                },
+            ],
+        );
+        sidebar.ingest_panes(PaneManifest { panes });
+        assert_eq!(sidebar.slot_pane, Some(PaneId::Terminal(7)));
     }
 
     #[test]
