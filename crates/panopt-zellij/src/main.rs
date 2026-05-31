@@ -35,6 +35,8 @@ use std::path::PathBuf;
 
 use zellij_tile::prelude::*;
 
+use panopt_zellij_logic::*;
+
 /// Routing slot prefix for viewer panes the plugin spawns ad hoc. The layout
 /// boots one viewer with `--slot main`; further viewers spawned by
 /// [`PanoptPane::ensure_viewer_in_slot`] get unique names `v<mode-letter><n>`
@@ -59,333 +61,6 @@ const AGENT_LABELS_PATH: &str = "/host/.panopt/.cockpit/agent-labels.json";
 /// close gate already covers the keybind paths; this file covers the viewer's
 /// in-pane Ctrl-c/`q`, which never routes through the plugin.
 const CONTENT_COUNT_PATH: &str = "/host/.panopt/.cockpit/content-count";
-
-/// Which kind of resource one plugin pane renders. Five plugin instances run
-/// in parallel, one per `Mode`, each configured by the `mode "<kind>"` value
-/// in the layout's plugin block. Zellij keys plugin identity on
-/// `(URL, configuration)`, so the five panes are five distinct instances and
-/// can be addressed individually by `zellij action pipe --plugin-configuration
-/// "mode=<kind>"`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-enum Mode {
-    #[default]
-    Todos,
-    Agents,
-    Terminals,
-    Commands,
-    Notes,
-}
-
-impl Mode {
-    fn parse(s: &str) -> Option<Mode> {
-        match s {
-            "todos" => Some(Mode::Todos),
-            "agents" => Some(Mode::Agents),
-            "terminals" => Some(Mode::Terminals),
-            "commands" => Some(Mode::Commands),
-            "notes" => Some(Mode::Notes),
-            _ => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Mode::Todos => "Todos",
-            Mode::Agents => "Agents",
-            Mode::Terminals => "Terminals",
-            Mode::Commands => "Commands",
-            Mode::Notes => "Notes",
-        }
-    }
-
-    /// One-letter slug that prefixes spawned viewer slot names so the five
-    /// plugin instances cannot collide on the same `v<N>` suffix.
-    fn letter(self) -> char {
-        match self {
-            Mode::Todos => 't',
-            Mode::Agents => 'a',
-            Mode::Terminals => 'r',
-            Mode::Commands => 'c',
-            Mode::Notes => 'n',
-        }
-    }
-
-    /// Wire slug - the inverse of [`Mode::parse`]. Used to build the
-    /// `--plugin-configuration mode=<slug>` narrowing on the `panopt:focus-pane`
-    /// pipe so a focus request reaches exactly the target instance.
-    fn slug(self) -> &'static str {
-        match self {
-            Mode::Todos => "todos",
-            Mode::Agents => "agents",
-            Mode::Terminals => "terminals",
-            Mode::Commands => "commands",
-            Mode::Notes => "notes",
-        }
-    }
-
-    /// The `Alt-<n>` hotkey that focuses this pane, lazygit-style. Surfaced in
-    /// the frame title (see [`PanoptPane::frame_title`]) and the `?` help so the
-    /// gesture is discoverable from the pane itself.
-    fn hotkey_hint(self) -> &'static str {
-        match self {
-            Mode::Todos => "alt+1",
-            Mode::Agents => "alt+2",
-            Mode::Terminals => "alt+3",
-            Mode::Commands => "alt+4",
-            Mode::Notes => "alt+5",
-        }
-    }
-
-    /// Map an `Alt-<digit>` keypress to the sidebar pane it focuses. The
-    /// inverse of [`Mode::hotkey_hint`]'s numbering.
-    fn from_hotkey(c: char) -> Option<Mode> {
-        match c {
-            '1' => Some(Mode::Todos),
-            '2' => Some(Mode::Agents),
-            '3' => Some(Mode::Terminals),
-            '4' => Some(Mode::Commands),
-            '5' => Some(Mode::Notes),
-            _ => None,
-        }
-    }
-}
-
-/// Status filter applied to the Todos pane. Each variant matches a wire
-/// token from the projection's `- <status>, <priority>` suffix.
-///
-/// `OpenUnblocked` is the default working-set filter, but the sidebar reads
-/// only the projection (no MCP), and the index doesn't carry blocker info;
-/// in this pane `OpenUnblocked` degrades to "open" until the projection
-/// learns to record blockers per row. The viewer pane on the right uses MCP
-/// and applies the full blocker-aware filter, so the precise unblocked
-/// view is available there.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-enum TodoFilter {
-    All,
-    Open,
-    #[default]
-    OpenUnblocked,
-    InProgress,
-    Backlog,
-    Draft,
-    Completed,
-    NotDone,
-}
-
-const ALL_TODO_FILTERS: [TodoFilter; 8] = [
-    TodoFilter::All,
-    TodoFilter::Open,
-    TodoFilter::OpenUnblocked,
-    TodoFilter::InProgress,
-    TodoFilter::Backlog,
-    TodoFilter::Draft,
-    TodoFilter::Completed,
-    TodoFilter::NotDone,
-];
-
-impl TodoFilter {
-    fn label(self) -> &'static str {
-        match self {
-            TodoFilter::All => "all",
-            TodoFilter::Open => "open",
-            TodoFilter::OpenUnblocked => "open-unblocked",
-            TodoFilter::InProgress => "in_progress",
-            TodoFilter::Backlog => "backlog",
-            TodoFilter::Draft => "draft",
-            TodoFilter::Completed => "completed",
-            TodoFilter::NotDone => "not_done",
-        }
-    }
-
-    fn next(self) -> TodoFilter {
-        let i = ALL_TODO_FILTERS
-            .iter()
-            .position(|f| *f == self)
-            .unwrap_or(0);
-        ALL_TODO_FILTERS[(i + 1) % ALL_TODO_FILTERS.len()]
-    }
-
-    fn prev(self) -> TodoFilter {
-        let i = ALL_TODO_FILTERS
-            .iter()
-            .position(|f| *f == self)
-            .unwrap_or(0);
-        ALL_TODO_FILTERS[(i + ALL_TODO_FILTERS.len() - 1) % ALL_TODO_FILTERS.len()]
-    }
-
-    /// Whether the projection-index label passes this filter. The label is
-    /// the trailing text after the link, e.g. `"the title - open, high"`.
-    /// Without blocker info, `OpenUnblocked` is approximated as `Open`.
-    fn includes_label(self, label: &str) -> bool {
-        if matches!(self, TodoFilter::All) {
-            return true;
-        }
-        let Some(status) = parse_status_suffix(label) else {
-            // Missing / unparsable status: leave the entry visible so a
-            // stray projection format never silently hides a real todo.
-            return true;
-        };
-        match self {
-            TodoFilter::All => true,
-            TodoFilter::Open | TodoFilter::OpenUnblocked => status == "open",
-            TodoFilter::InProgress => status == "in_progress",
-            TodoFilter::Backlog => status == "backlog",
-            TodoFilter::Draft => status == "draft",
-            TodoFilter::Completed => status == "completed",
-            TodoFilter::NotDone => status == "not_done",
-        }
-    }
-}
-
-/// Find where the trailing " - <suffix>" segment of a projection label
-/// begins. Two shapes need to round-trip cleanly:
-/// - "wire up auth - open, high" - normal case, look for the last " - ".
-/// - "- open, high" - empty-title case (the projection's `{title}` slot was
-///   empty, the parser already stripped one of the surrounding spaces), strip
-///   the leading "- ".
-///
-/// Returns the byte index of the suffix payload's first character, or `None`
-/// when the label has no recognized suffix marker.
-fn suffix_start(label: &str) -> Option<usize> {
-    if let Some(pos) = label.rfind(" - ") {
-        Some(pos + 3)
-    } else if label.starts_with("- ") {
-        Some(2)
-    } else {
-        None
-    }
-}
-
-/// Extract the wire status token from a projection-index label suffix like
-/// `wire up auth - open, high`. Returns `None` for labels without a known
-/// suffix; callers treat that as "do not hide."
-fn parse_status_suffix(label: &str) -> Option<&str> {
-    let start = suffix_start(label)?;
-    let rest = &label[start..];
-    let comma = rest.find(',').unwrap_or(rest.len());
-    let token = rest[..comma].trim();
-    matches!(
-        token,
-        "open" | "in_progress" | "backlog" | "draft" | "completed" | "not_done"
-    )
-    .then_some(token)
-}
-
-/// Extract the wire priority token from a projection-index label suffix
-/// like `wire up auth - open, high, updated 2026-05-23 18:05:21`. Returns
-/// `None` for labels without a known suffix. The suffix now carries a
-/// third comma-separated token (`updated <ts>`), so we explicitly slice
-/// the *second* token rather than "everything after the first comma".
-fn parse_priority_suffix(label: &str) -> Option<&str> {
-    let start = suffix_start(label)?;
-    let rest = &label[start..];
-    let first = rest.find(',')?;
-    let after_first = &rest[first + 1..];
-    let end = after_first.find(',').unwrap_or(after_first.len());
-    let token = after_first[..end].trim();
-    matches!(token, "high" | "medium" | "low").then_some(token)
-}
-
-/// Extract the `updated_at` timestamp from a projection-index label suffix
-/// like `wire up auth - open, high, updated 2026-05-23 18:05:21`. Returns
-/// `None` when the row has no recognizable `updated <ts>` token (older
-/// projections that predate the timestamp suffix), so callers can degrade
-/// gracefully on a stale on-disk file rather than panicking mid-sort.
-fn parse_updated_suffix(label: &str) -> Option<&str> {
-    let start = suffix_start(label)?;
-    label[start..]
-        .split(',')
-        .map(str::trim)
-        .find_map(|token| token.strip_prefix("updated "))
-        .map(str::trim)
-}
-
-/// One axis of the two-level todo sort. The sidebar carries two of these
-/// (level 1 / level 2) and applies them as a stable two-pass sort, so equal
-/// keys on level 1 are broken by level 2.
-///
-/// The sidebar reads only the projection index, which carries status,
-/// priority, and `updated_at` per row. The `Modified` axes compare on
-/// `updated_at` directly (the daemon writes `datetime('now')` text, which
-/// is lexicographically orderable). The `Created` axes still degrade to
-/// **id order**, which is correct given per-project ids are monotonic and
-/// never reused: `id asc ≡ creation order asc`. This mirrors the existing
-/// `OpenUnblocked → Open` degradation in [`TodoFilter::includes_label`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-enum TodoSort {
-    #[default]
-    PriorityDesc,
-    CreatedAsc,
-    CreatedDesc,
-    ModifiedAsc,
-    ModifiedDesc,
-}
-
-const ALL_TODO_SORTS: [TodoSort; 5] = [
-    TodoSort::PriorityDesc,
-    TodoSort::CreatedAsc,
-    TodoSort::CreatedDesc,
-    TodoSort::ModifiedAsc,
-    TodoSort::ModifiedDesc,
-];
-
-impl TodoSort {
-    /// Display label. `/` indicates ascending (low → high), `\` indicates
-    /// descending (high → low); priority is single-direction (high → low)
-    /// so it carries no suffix.
-    fn label(self) -> &'static str {
-        match self {
-            TodoSort::PriorityDesc => "priority",
-            TodoSort::CreatedAsc => "created-/",
-            TodoSort::CreatedDesc => "created-\\",
-            TodoSort::ModifiedAsc => "modified-/",
-            TodoSort::ModifiedDesc => "modified-\\",
-        }
-    }
-
-    fn next(self) -> TodoSort {
-        let i = ALL_TODO_SORTS.iter().position(|x| *x == self).unwrap_or(0);
-        ALL_TODO_SORTS[(i + 1) % ALL_TODO_SORTS.len()]
-    }
-
-    fn prev(self) -> TodoSort {
-        let i = ALL_TODO_SORTS.iter().position(|x| *x == self).unwrap_or(0);
-        ALL_TODO_SORTS[(i + ALL_TODO_SORTS.len() - 1) % ALL_TODO_SORTS.len()]
-    }
-
-    /// Compare two projection rows on this axis. The sidebar's row shape is
-    /// `(id, label)`; priority comes from [`parse_priority_suffix`], the
-    /// `updated_at` timestamp from [`parse_updated_suffix`], and `Created`
-    /// degrades to id comparison (see the type doc). Rows missing the
-    /// `updated <ts>` token (stale projection) fall back to id so a
-    /// half-rewritten index doesn't panic.
-    fn cmp_rows(self, a: &(u64, String), b: &(u64, String)) -> std::cmp::Ordering {
-        match self {
-            TodoSort::PriorityDesc => {
-                let rank = |label: &str| match parse_priority_suffix(label) {
-                    Some("high") => 3,
-                    Some("medium") => 2,
-                    Some("low") => 1,
-                    _ => 0,
-                };
-                rank(&b.1).cmp(&rank(&a.1))
-            }
-            TodoSort::CreatedAsc => a.0.cmp(&b.0),
-            TodoSort::CreatedDesc => b.0.cmp(&a.0),
-            TodoSort::ModifiedAsc => match (parse_updated_suffix(&a.1), parse_updated_suffix(&b.1))
-            {
-                (Some(ua), Some(ub)) => ua.cmp(ub),
-                _ => a.0.cmp(&b.0),
-            },
-            TodoSort::ModifiedDesc => {
-                match (parse_updated_suffix(&a.1), parse_updated_suffix(&b.1)) {
-                    (Some(ua), Some(ub)) => ub.cmp(ua),
-                    _ => b.0.cmp(&a.0),
-                }
-            }
-        }
-    }
-}
 
 #[derive(Default)]
 struct PanoptPane {
@@ -550,15 +225,19 @@ struct PanoptPane {
     /// every manifest tick. Only the Todos pane writes it; `None` until the
     /// first publish.
     last_content_count: Option<usize>,
-}
 
-/// A parsed `.panopt/processes.md` line. The line format is preserved from
-/// the pre-V6 `roster.md` so the existing `[kind] #id label` parser still
-/// works; any trailing `(from #N)` is dropped from `label`.
-struct ProcessRow {
-    kind: String,
-    id: u64,
-    label: String,
+    /// Monotonic version of the presentation state this instance has published
+    /// to the per-mode shared view file (todo #116). `mirror_session` mirrors
+    /// focus and terminal panes across clients, but each client's sidebar is its
+    /// own plugin instance; this is how the selection/filter/scroll stay in sync.
+    /// Bumped on every local view change so peers can tell a newer snapshot from
+    /// an older one (last-writer-wins).
+    view_seq: u64,
+    /// The highest view `seq` this instance has already applied - either one it
+    /// wrote itself or one it adopted from a peer. The read-back guard in
+    /// [`PanoptPane::adopt_view_state`] only adopts strictly-newer seqs, so this
+    /// both skips our own writes and prevents regressing to a stale view.
+    last_applied_seq: u64,
 }
 
 /// A content pane flattened from Zellij's manifest.
@@ -585,19 +264,6 @@ struct PaneRow {
     /// Tab position from the `PaneManifest`. Used by the CloseTab gate to
     /// scope active-item aggregation to a single tab.
     tab: usize,
-}
-
-/// What a content pane is, derived from the command it was launched with.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PaneRole {
-    /// The shared `panopt _viewer` document pane.
-    Viewer,
-    /// An ad-hoc `panopt _agent` pane, started with `a`.
-    Agent,
-    /// A `panopt _process-run <id>` pane, by process id.
-    Process(u64),
-    /// A plain terminal the user opened.
-    Shell,
 }
 
 /// One item rendered in the pane.
@@ -689,8 +355,29 @@ impl ZellijPlugin for PanoptPane {
                 self.rebuild_items();
                 true
             }
-            Event::Key(key) => self.handle_key(key),
-            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            // Key and Mouse are the only events that carry local user intent to
+            // change the view. Snapshot the presentation fields around the
+            // handler and, if they moved, publish the new view so peer clients'
+            // same-mode instances adopt it (todo #116). Timer and PaneUpdate
+            // ticks deliberately do NOT publish - they re-clamp cursor/scroll
+            // against a changed list identically on every client, which is not a
+            // user action and must not race the shared seq.
+            Event::Key(key) => {
+                let before = self.view_fingerprint();
+                let handled = self.handle_key(key);
+                if self.view_fingerprint() != before {
+                    self.bump_and_persist_view();
+                }
+                handled
+            }
+            Event::Mouse(mouse) => {
+                let before = self.view_fingerprint();
+                let handled = self.handle_mouse(mouse);
+                if self.view_fingerprint() != before {
+                    self.bump_and_persist_view();
+                }
+                handled
+            }
             Event::Timer(_) => {
                 // Only the Todos pane drives the initial preview - one preview
                 // per cockpit boot is enough, and the other panes have nothing
@@ -756,6 +443,19 @@ impl ZellijPlugin for PanoptPane {
             "panopt:show-result" => {
                 self.handle_search_result(pipe_message.payload.as_deref());
                 return true;
+            }
+            "panopt:view-sync" => {
+                // A peer moved the shared sidebar view; adopt it now instead of
+                // waiting up to 1s for this instance's timer (todo #116).
+                // Broadcast unnarrowed like `focus-pane`, self-filtered on the
+                // payload (the originating mode's slug) so only matching
+                // instances react. Our own broadcast no-ops via the seq guard.
+                if pipe_message.payload.as_deref() == Some(self.mode.slug()) {
+                    self.adopt_view_state();
+                    self.rebuild_items();
+                    return true;
+                }
+                return false;
             }
             "panopt:focus-pane" => {
                 // `Alt-<n>` focus request (todo #110). Broadcast to every
@@ -1150,6 +850,91 @@ impl PanoptPane {
                 self.read_agent_labels();
             }
         }
+        // Pick up any newer presentation snapshot a peer published, so the
+        // sidebar stays identical across clients even between the instant
+        // `panopt:view-sync` pipes (todo #116). The caller re-runs
+        // `rebuild_items` (and thus `clamp_cursor`) right after, so an adopted
+        // cursor/scroll is clamped against this instance's current list.
+        self.adopt_view_state();
+    }
+
+    // --- shared sidebar presentation (todo #116) ---
+
+    /// The presentation fields that must stay identical across every client.
+    /// Captured before and after each input event so a view is published only on
+    /// a real local change, not on every keypress.
+    fn view_fingerprint(&self) -> (usize, usize, u8, u8, u8, bool) {
+        (
+            self.cursor,
+            self.scroll,
+            self.todo_filter.to_wire(),
+            self.todo_sort_1.to_wire(),
+            self.todo_sort_2.to_wire(),
+            self.show_help,
+        )
+    }
+
+    /// Publish this instance's view to the per-mode shared file and nudge peer
+    /// clients' same-mode instances to adopt it at once. Called only when an
+    /// input event actually moved the view.
+    fn bump_and_persist_view(&mut self) {
+        self.view_seq += 1;
+        // We are already showing this snapshot, so mark it applied: the
+        // read-back in `adopt_view_state` then skips our own write.
+        self.last_applied_seq = self.view_seq;
+        let view = ViewState {
+            cursor: self.cursor,
+            scroll: self.scroll,
+            filter: self.todo_filter,
+            sort_1: self.todo_sort_1,
+            sort_2: self.todo_sort_2,
+            show_help: self.show_help,
+            seq: self.view_seq,
+        };
+        write_view_state(self.mode, &view);
+        self.broadcast_view_sync();
+    }
+
+    /// Adopt the shared view when a peer published a newer one. The strict `>`
+    /// guard skips our own write (its seq equals `last_applied_seq`) and never
+    /// regresses to a stale snapshot. The caller re-clamps via `rebuild_items`,
+    /// so adopted bounds are validated against the local list.
+    fn adopt_view_state(&mut self) {
+        let Some(view) = read_view_state(self.mode) else {
+            return;
+        };
+        if view.seq <= self.last_applied_seq {
+            return;
+        }
+        self.cursor = view.cursor;
+        self.scroll = view.scroll;
+        self.todo_filter = view.filter;
+        self.todo_sort_1 = view.sort_1;
+        self.todo_sort_2 = view.sort_2;
+        self.show_help = view.show_help;
+        self.view_seq = view.seq;
+        self.last_applied_seq = view.seq;
+    }
+
+    /// Broadcast a `panopt:view-sync` pipe so peer clients' instances of this
+    /// mode re-read the shared file immediately instead of waiting for their 1s
+    /// timer. Broadcast unnarrowed (config narrowing proved unreliable for the
+    /// non-Todos modes - see [`PanoptPane::request_focus_pane`]); the payload
+    /// carries the mode slug so only the matching instances adopt. The 1s timer
+    /// is the correctness floor regardless - this pipe only trims latency.
+    fn broadcast_view_sync(&self) {
+        run_command(
+            &[
+                "zellij",
+                "action",
+                "pipe",
+                "--name",
+                "panopt:view-sync",
+                "--",
+                self.mode.slug(),
+            ],
+            BTreeMap::new(),
+        );
     }
 
     /// Flatten the pane manifest into the content-pane list - suppressed
@@ -2503,39 +2288,10 @@ impl ActiveKind {
     }
 }
 
-fn is_user_shell(basename: &str) -> bool {
-    matches!(
-        basename,
-        "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "nu" | "ash" | "elvish"
-    )
-}
-
 fn is_transient_pipe_pane(p: &PaneInfo) -> bool {
     p.terminal_command.as_deref().is_some_and(|c| {
         c.contains("zellij") && c.contains("action") && c.contains("pipe") && c.contains("panopt:")
     })
-}
-
-fn classify_pane(command: Option<&str>) -> PaneRole {
-    let Some(cmd) = command else {
-        return PaneRole::Shell;
-    };
-    if cmd.contains("_viewer") {
-        PaneRole::Viewer
-    } else if cmd.contains("_process-run") {
-        match cmd
-            .split_whitespace()
-            .filter_map(|t| t.parse::<u64>().ok())
-            .next_back()
-        {
-            Some(id) => PaneRole::Process(id),
-            None => PaneRole::Shell,
-        }
-    } else if cmd.contains("_agent") {
-        PaneRole::Agent
-    } else {
-        PaneRole::Shell
-    }
 }
 
 fn pane_label(p: &PaneRow) -> String {
@@ -2582,6 +2338,60 @@ fn write_content_count(count: usize) {
     }
 }
 
+/// Per-mode shared view file, keyed by [`Mode::letter`] so each mode's
+/// presentation is independent (Todos cursor never moves the Notes cursor) and
+/// only same-mode instances across clients share one file.
+fn view_state_path(mode: Mode) -> String {
+    format!("/host/.panopt/.cockpit/view-{}.json", mode.letter())
+}
+
+/// Atomically publish a [`ViewState`] (temp + rename), like the other
+/// `.cockpit/` writers.
+fn write_view_state(mode: Mode, view: &ViewState) {
+    let dir = "/host/.panopt/.cockpit";
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let body = format!(
+        "{{\"cursor\":{},\"scroll\":{},\"filter\":{},\"sort1\":{},\"sort2\":{},\"help\":{},\"seq\":{}}}",
+        view.cursor,
+        view.scroll,
+        view.filter.to_wire(),
+        view.sort_1.to_wire(),
+        view.sort_2.to_wire(),
+        view.show_help as u8,
+        view.seq,
+    );
+    let letter = mode.letter();
+    let tmp = format!("{dir}/.view-{letter}.tmp");
+    if fs::write(&tmp, body).is_ok() {
+        let _ = fs::rename(&tmp, view_state_path(mode));
+    }
+}
+
+/// Read the per-mode shared view, tolerant of a missing/partial file (returns
+/// `None` when there is no `seq` to compare). Unknown filter/sort codes from a
+/// newer writer fall back to defaults rather than dropping the whole read.
+fn read_view_state(mode: Mode) -> Option<ViewState> {
+    let body = fs::read_to_string(view_state_path(mode)).ok()?;
+    let seq = view_field(&body, "seq")?;
+    Some(ViewState {
+        cursor: view_field(&body, "cursor").unwrap_or(0) as usize,
+        scroll: view_field(&body, "scroll").unwrap_or(0) as usize,
+        filter: view_field(&body, "filter")
+            .and_then(|c| TodoFilter::from_wire(c as u8))
+            .unwrap_or_default(),
+        sort_1: view_field(&body, "sort1")
+            .and_then(|c| TodoSort::from_wire(c as u8))
+            .unwrap_or_default(),
+        sort_2: view_field(&body, "sort2")
+            .and_then(|c| TodoSort::from_wire(c as u8))
+            .unwrap_or(TodoSort::CreatedAsc),
+        show_help: view_field(&body, "help").unwrap_or(0) != 0,
+        seq,
+    })
+}
+
 /// Project the agent-label map to [`AGENT_LABELS_PATH`] atomically (temp +
 /// rename). Tiny JSON-ish format: `{"<tid>":"<label>",...}`. Labels never
 /// embed `"` so a hand-rolled serializer is enough and avoids dragging in a
@@ -2606,188 +2416,6 @@ fn write_agent_labels(labels: &BTreeMap<u32, String>) {
     }
 }
 
-/// Parse the agent-label projection back into `(tid, label)` pairs. Tolerant
-/// of an empty/malformed file: returns an empty iterator on any parse error.
-fn parse_agent_labels(body: &str) -> Vec<(u32, String)> {
-    let body = body.trim();
-    let Some(inner) = body.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
-        return Vec::new();
-    };
-    if inner.trim().is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for entry in split_top_level(inner, ',') {
-        let entry = entry.trim();
-        let Some(colon) = entry.find(':') else {
-            continue;
-        };
-        let key = entry[..colon].trim();
-        let value = entry[colon + 1..].trim();
-        let Some(tid) = key
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Some(label) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-            continue;
-        };
-        let unescaped = label.replace("\\\"", "\"").replace("\\\\", "\\");
-        out.push((tid, unescaped));
-    }
-    out
-}
-
-/// Split `body` on `sep`, respecting `"..."` strings so a separator inside a
-/// label does not split the entry. The projection writer escapes `"` and `\`
-/// in labels, so the only thing this needs to dodge is unescaped `,` inside
-/// a string.
-fn split_top_level(body: &str, sep: char) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut in_string = false;
-    let mut escape = false;
-    for c in body.chars() {
-        if escape {
-            current.push(c);
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            current.push(c);
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            current.push(c);
-            continue;
-        }
-        if c == sep && !in_string {
-            out.push(std::mem::take(&mut current));
-            continue;
-        }
-        current.push(c);
-    }
-    out.push(current);
-    out
-}
-
-fn parse_viewer_slot(command: Option<&str>) -> Option<String> {
-    let cmd = command?;
-    let mut tokens = cmd.split_whitespace();
-    while let Some(t) = tokens.next() {
-        if t == "--slot" {
-            return tokens.next().map(|s| s.to_string());
-        }
-    }
-    None
-}
-
-/// Parse a viewer routing file body - the JSON-ish payload written by
-/// [`write_routing`] - back into `(kind, id)`. Tolerant of an empty or
-/// malformed body: returns `(None, None)` so callers fall back to the
-/// generic `Viewer` title.
-fn parse_viewer_routing(body: &str) -> (Option<String>, Option<u64>) {
-    let trimmed = body.trim();
-    let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
-        return (None, None);
-    };
-    let mut kind: Option<String> = None;
-    let mut id: Option<u64> = None;
-    for entry in inner.split(',') {
-        let entry = entry.trim();
-        let Some(colon) = entry.find(':') else {
-            continue;
-        };
-        let key = entry[..colon].trim();
-        let value = entry[colon + 1..].trim();
-        let key = key.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
-        match key {
-            Some("kind") => {
-                kind = value
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .map(|s| s.to_string());
-            }
-            Some("id") => {
-                id = value.parse::<u64>().ok();
-            }
-            _ => {}
-        }
-    }
-    (kind, id)
-}
-
-/// Compose the viewer-pane title for a `(kind, id)` routing pair. The
-/// projection indexes are looked up so the title carries the resource's
-/// own name (e.g. `Todo #30 - fixup pane titles`) rather than just its id.
-fn viewer_title_for(
-    kind: Option<&str>,
-    id: Option<u64>,
-    todos: &[(u64, String)],
-    notes: &[(u64, String)],
-) -> String {
-    match (kind, id) {
-        (None, _) | (Some("empty"), _) => "Viewer".to_string(),
-        (Some("todo"), Some(id)) => match lookup_title(todos, id) {
-            Some(t) => format!("Todo #{id} - {t}"),
-            None => format!("Todo #{id}"),
-        },
-        (Some("note"), Some(id)) => match lookup_title(notes, id) {
-            Some(t) => format!("Note #{id} - {t}"),
-            None => format!("Note #{id}"),
-        },
-        (Some("todo-list"), _) => "Todos".to_string(),
-        (Some("note-list"), _) => "Notes".to_string(),
-        (Some("new-todo"), _) => "New todo".to_string(),
-        (Some("new-note"), _) => "New note".to_string(),
-        _ => "Viewer".to_string(),
-    }
-}
-
-/// Look up an index entry's label by id, stripping the trailing
-/// `" - status, priority"` (todos) or `" - updated ..."` (notes)
-/// suffix that the projection format appends. The result is the bare title
-/// the user typed.
-fn lookup_title(index: &[(u64, String)], id: u64) -> Option<String> {
-    let label = index.iter().find(|(i, _)| *i == id).map(|(_, l)| l)?;
-    // The title is everything BEFORE the suffix marker. " - " (with leading
-    // space) covers the normal case; a label that starts directly with "- "
-    // is the empty-title case, so the title is "".
-    let trimmed = if let Some(dash) = label.rfind(" - ") {
-        label[..dash].trim()
-    } else if label.starts_with("- ") {
-        ""
-    } else {
-        label.trim()
-    };
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-/// Prefix `label` with `kind: ` unless `label` already begins with that
-/// kind (case-insensitive). Avoids the silly `Agent: Agent 1` for the
-/// default ad-hoc-agent label while still tagging user-named ones like
-/// `Agent: panopt-bot`.
-fn kind_prefixed_title(kind: &str, label: &str) -> String {
-    let label = label.trim();
-    if label.is_empty() {
-        return kind.to_string();
-    }
-    let lk = label.to_lowercase();
-    if lk == kind.to_lowercase() || lk.starts_with(&format!("{} ", kind.to_lowercase())) {
-        label.to_string()
-    } else {
-        format!("{kind}: {label}")
-    }
-}
-
 fn read_index(path: &str) -> Vec<(u64, String)> {
     match fs::read_to_string(path) {
         Ok(body) => body.lines().filter_map(parse_index_line).collect(),
@@ -2800,44 +2428,6 @@ fn read_processes(path: &str) -> Vec<ProcessRow> {
         Ok(body) => body.lines().filter_map(parse_process_line).collect(),
         Err(_) => Vec::new(),
     }
-}
-
-fn parse_index_line(line: &str) -> Option<(u64, String)> {
-    let line = line.trim();
-    if !line.starts_with("- [") {
-        return None;
-    }
-    let hash = line.find("[#")? + 2;
-    let close = line[hash..].find(']')? + hash;
-    let id: u64 = line[hash..close].parse().ok()?;
-    let label_at = line[close..].find(") ")? + close + 2;
-    // The note/todo projections render as `- [#N](path) {title} - <sfx>`,
-    // so an empty title leaves the raw chunk starting with a space (one of the
-    // two literal spaces around `{title}`). `.trim()` collapses both the
-    // empty-title case and the non-empty case onto the same shape - a label
-    // like "- open, medium" (no title) or "wire it - open, medium" (with
-    // title); the suffix parsers below detect "no title" via the leading "- ".
-    let label = line.get(label_at..).unwrap_or("").trim().to_string();
-    Some((id, label))
-}
-
-/// Parse one `- [kind] #id label [(from #N)]` line from `processes.md`. The
-/// trailing `(from #N)` (when present) names the source agent tool and is
-/// dropped from `label`.
-fn parse_process_line(line: &str) -> Option<ProcessRow> {
-    let rest = line.trim().strip_prefix("- [")?;
-    let close = rest.find(']')?;
-    let kind = rest[..close].to_string();
-    let after = rest[close + 1..].trim_start().strip_prefix('#')?;
-    let space = after.find(' ')?;
-    let id: u64 = after[..space].parse().ok()?;
-    let mut label = after[space + 1..].trim().to_string();
-    if let Some(from_at) = label.rfind(" (from #") {
-        if label.ends_with(')') {
-            label.truncate(from_at);
-        }
-    }
-    Some(ProcessRow { kind, id, label })
 }
 
 /// The ANSI styling a printed row carries.
@@ -2886,307 +2476,6 @@ mod tests {
         pane.todos = (0..n).map(|i| (i as u64, format!("todo {i}"))).collect();
         pane.rebuild_items();
         pane
-    }
-
-    #[test]
-    fn parses_a_todo_index_line() {
-        let (id, label) = parse_index_line(
-            "- [ ] [#3](todos/3.md) wire the form - open, high, updated 2026-05-23 18:05:21",
-        )
-        .unwrap();
-        assert_eq!(id, 3);
-        assert_eq!(
-            label,
-            "wire the form - open, high, updated 2026-05-23 18:05:21"
-        );
-    }
-
-    #[test]
-    fn parse_priority_suffix_skips_the_trailing_updated_token() {
-        // The third token (`updated <ts>`) was added so the sidebar can sort
-        // by modified; the priority parser must keep returning the middle
-        // token rather than "high, updated 2026-...".
-        let label = "wire the form - open, high, updated 2026-05-23 18:05:21";
-        assert_eq!(parse_priority_suffix(label), Some("high"));
-        assert_eq!(parse_status_suffix(label), Some("open"));
-    }
-
-    #[test]
-    fn parse_updated_suffix_extracts_the_timestamp() {
-        let label = "wire the form - open, high, updated 2026-05-23 18:05:21";
-        assert_eq!(parse_updated_suffix(label), Some("2026-05-23 18:05:21"));
-    }
-
-    #[test]
-    fn parse_updated_suffix_returns_none_when_absent() {
-        // Stale on-disk projection (predates the timestamp) - the parser
-        // returns None so cmp_rows degrades to id ordering instead of
-        // panicking.
-        assert_eq!(parse_updated_suffix("wire the form - open, high"), None);
-        assert_eq!(parse_updated_suffix("plain title"), None);
-    }
-
-    #[test]
-    fn modified_desc_sorts_by_timestamp_not_id() {
-        // The lower-id row has the newer timestamp; ModifiedDesc must put it
-        // first. If the cmp falls back to id, this returns Greater (b before
-        // a) instead of Less, and the assertion fails.
-        let a = (
-            1u64,
-            "wire the form - open, high, updated 2026-05-29 09:00:00".to_string(),
-        );
-        let b = (
-            2u64,
-            "write readme - open, medium, updated 2026-05-21 10:00:00".to_string(),
-        );
-        assert_eq!(
-            TodoSort::ModifiedDesc.cmp_rows(&a, &b),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            TodoSort::ModifiedAsc.cmp_rows(&a, &b),
-            std::cmp::Ordering::Greater
-        );
-        // Sanity check that Created still uses id, unchanged.
-        assert_eq!(
-            TodoSort::CreatedAsc.cmp_rows(&a, &b),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    #[test]
-    fn parses_a_note_index_line() {
-        let (id, label) = parse_index_line("- [#7](note/7.md) design notes").unwrap();
-        assert_eq!(id, 7);
-        assert_eq!(label, "design notes");
-    }
-
-    #[test]
-    fn parses_a_note_index_line_with_updated_timestamp() {
-        let (id, label) =
-            parse_index_line("- [#1](note/1.md) Sample Notes - updated 2026-05-23 18:05:21")
-                .unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(label, "Sample Notes - updated 2026-05-23 18:05:21");
-    }
-
-    #[test]
-    fn ignores_non_index_lines() {
-        assert!(parse_index_line("# Todos").is_none());
-        assert!(parse_index_line("_(no todos)_").is_none());
-        assert!(parse_index_line("").is_none());
-    }
-
-    #[test]
-    fn empty_title_note_line_keeps_the_suffix_in_the_label() {
-        // After a user clears the title field, the projection renders
-        // `- [#N](note/N.md)  - updated <ts>` (double space). The
-        // parser strips one of the spaces, leaving the label as
-        // "- updated <ts>" - suffix-only, no title.
-        let (id, label) =
-            parse_index_line("- [#73](note/73.md)  - updated 2026-05-27 07:00:00").unwrap();
-        assert_eq!(id, 73);
-        assert_eq!(label, "- updated 2026-05-27 07:00:00");
-        // lookup_title recognises the leading "- " as the empty-title shape
-        // and returns None so the pane title falls back to "Note #N".
-        let pads = vec![(73u64, label)];
-        assert!(lookup_title(&pads, 73).is_none());
-    }
-
-    #[test]
-    fn empty_title_todo_line_still_parses_status_and_priority() {
-        // Empty title for a todo: "- [ ] [#75](todos/75.md)  - open, medium".
-        // The sort path needs the priority and the filter path needs the
-        // status; without `suffix_start`'s empty-title branch the label
-        // "- open, medium" would parse as no-suffix and the todo would sort
-        // to the bottom (rank 0) regardless of its real priority.
-        let (id, label) = parse_index_line("- [ ] [#75](todos/75.md)  - open, medium").unwrap();
-        assert_eq!(id, 75);
-        assert_eq!(label, "- open, medium");
-        assert_eq!(parse_status_suffix(&label), Some("open"));
-        assert_eq!(parse_priority_suffix(&label), Some("medium"));
-        let todos = vec![(75u64, label)];
-        assert!(lookup_title(&todos, 75).is_none());
-    }
-
-    #[test]
-    fn suffix_start_picks_the_right_marker_for_each_shape() {
-        // Normal case: title + suffix, separator is " - " (3 chars).
-        assert_eq!(suffix_start("wire up auth - open, high"), Some(15));
-        // Empty-title case: label is the suffix only, "- " consumed (2 chars).
-        assert_eq!(suffix_start("- open, high"), Some(2));
-        // Title with embedded " - " plus a trailing suffix: rfind picks the
-        // rightmost, which is the projection-level separator.
-        let s = "a - b - open, high";
-        assert_eq!(suffix_start(s), Some(s.rfind(" - ").unwrap() + 3));
-        // No suffix at all.
-        assert!(suffix_start("plain title").is_none());
-    }
-
-    #[test]
-    fn parses_a_process_line() {
-        let row = parse_process_line("- [agent] #1 NASTL-Mediator").unwrap();
-        assert_eq!(row.kind, "agent");
-        assert_eq!(row.id, 1);
-        assert_eq!(row.label, "NASTL-Mediator");
-    }
-
-    #[test]
-    fn parses_a_process_line_with_a_from_suffix() {
-        let row = parse_process_line("- [agent] #4 NASTL-Mediator (from #3)").unwrap();
-        assert_eq!(row.kind, "agent");
-        assert_eq!(row.id, 4);
-        assert_eq!(row.label, "NASTL-Mediator");
-    }
-
-    #[test]
-    fn ignores_non_process_lines() {
-        assert!(parse_process_line("# Processes").is_none());
-        assert!(parse_process_line("_(no processes)_").is_none());
-    }
-
-    #[test]
-    fn classify_pane_reads_the_launch_command() {
-        assert_eq!(
-            classify_pane(Some("/bin/panopt _viewer --slot main --port 7600")),
-            PaneRole::Viewer
-        );
-        assert_eq!(
-            classify_pane(Some("/bin/panopt _process-run --port 7600 5")),
-            PaneRole::Process(5)
-        );
-        assert_eq!(
-            classify_pane(Some("/bin/panopt _agent --id mediator-1a2b")),
-            PaneRole::Agent
-        );
-        assert_eq!(classify_pane(Some("/bin/zsh -l")), PaneRole::Shell);
-        assert_eq!(classify_pane(None), PaneRole::Shell);
-    }
-
-    #[test]
-    fn parse_viewer_routing_reads_kind_and_id() {
-        assert_eq!(
-            parse_viewer_routing(r#"{"kind":"todo","id":30}"#),
-            (Some("todo".to_string()), Some(30))
-        );
-        assert_eq!(
-            parse_viewer_routing(r#"{"kind":"empty"}"#),
-            (Some("empty".to_string()), None)
-        );
-        // Order is not constrained by the writer, but be tolerant anyway.
-        assert_eq!(
-            parse_viewer_routing(r#"{"id":7,"kind":"note"}"#),
-            (Some("note".to_string()), Some(7))
-        );
-    }
-
-    #[test]
-    fn parse_viewer_routing_tolerates_garbage() {
-        assert_eq!(parse_viewer_routing(""), (None, None));
-        assert_eq!(parse_viewer_routing("not json"), (None, None));
-        // Missing kind: returns just the id, the caller falls back to "Viewer".
-        assert_eq!(parse_viewer_routing(r#"{"id":3}"#), (None, Some(3)));
-    }
-
-    #[test]
-    fn viewer_title_for_each_known_kind() {
-        let todos = vec![(30u64, "fixup pane titles - open, high".to_string())];
-        let pads = vec![(5u64, "design notes - updated 2026-05-23".to_string())];
-        assert_eq!(viewer_title_for(None, None, &todos, &pads), "Viewer");
-        assert_eq!(
-            viewer_title_for(Some("empty"), None, &todos, &pads),
-            "Viewer"
-        );
-        assert_eq!(
-            viewer_title_for(Some("todo"), Some(30), &todos, &pads),
-            "Todo #30 - fixup pane titles"
-        );
-        // Unknown id: still useful, just no name.
-        assert_eq!(
-            viewer_title_for(Some("todo"), Some(99), &todos, &pads),
-            "Todo #99"
-        );
-        assert_eq!(
-            viewer_title_for(Some("note"), Some(5), &todos, &pads),
-            "Note #5 - design notes"
-        );
-        assert_eq!(
-            viewer_title_for(Some("todo-list"), None, &todos, &pads),
-            "Todos"
-        );
-        assert_eq!(
-            viewer_title_for(Some("note-list"), None, &todos, &pads),
-            "Notes"
-        );
-        assert_eq!(
-            viewer_title_for(Some("new-todo"), None, &todos, &pads),
-            "New todo"
-        );
-        assert_eq!(
-            viewer_title_for(Some("new-note"), None, &todos, &pads),
-            "New note"
-        );
-        // Unknown kind: do not invent a name, just label generically.
-        assert_eq!(
-            viewer_title_for(Some("rumor"), None, &todos, &pads),
-            "Viewer"
-        );
-    }
-
-    #[test]
-    fn kind_prefixed_title_avoids_doubling_the_kind_word() {
-        // Default ad-hoc agent label already names itself "Agent N" - the
-        // prefix would duplicate, so use the label verbatim.
-        assert_eq!(kind_prefixed_title("Agent", "Agent 1"), "Agent 1");
-        // User-named: the prefix carries the kind, so the user sees both.
-        assert_eq!(
-            kind_prefixed_title("Agent", "panopt-bot"),
-            "Agent: panopt-bot"
-        );
-        // Process-row labels from `panopt process add` typically lack the
-        // kind word, so the prefix is what makes the role legible.
-        assert_eq!(
-            kind_prefixed_title("Command", "just check"),
-            "Command: just check"
-        );
-        // Case-insensitive match so user typing `agent foo` still gets
-        // collapsed onto the canonical "Agent foo".
-        assert_eq!(kind_prefixed_title("Agent", "agent foo"), "agent foo");
-    }
-
-    #[test]
-    fn mode_hotkey_mapping_is_consistent() {
-        // `from_hotkey` and `hotkey_hint` are inverses, and `slug` round-trips
-        // through `parse` - the focus pipe relies on both to reach exactly the
-        // target instance (todo #110).
-        for (digit, mode) in [
-            ('1', Mode::Todos),
-            ('2', Mode::Agents),
-            ('3', Mode::Terminals),
-            ('4', Mode::Commands),
-            ('5', Mode::Notes),
-        ] {
-            assert_eq!(Mode::from_hotkey(digit), Some(mode));
-            assert_eq!(mode.hotkey_hint(), format!("alt+{digit}"));
-            assert_eq!(Mode::parse(mode.slug()), Some(mode));
-        }
-        assert_eq!(Mode::from_hotkey('0'), None);
-        assert_eq!(Mode::from_hotkey('6'), None);
-        assert_eq!(Mode::from_hotkey('a'), None);
-    }
-
-    #[test]
-    fn parse_viewer_slot_extracts_the_slot_token() {
-        assert_eq!(
-            parse_viewer_slot(Some("/bin/panopt _viewer --slot main --port 7600")),
-            Some("main".to_string())
-        );
-        assert_eq!(
-            parse_viewer_slot(Some("/bin/panopt _viewer --port 7600 --slot vt2")),
-            Some("vt2".to_string())
-        );
-        assert_eq!(parse_viewer_slot(Some("/bin/zsh -l")), None);
-        assert_eq!(parse_viewer_slot(None), None);
     }
 
     #[test]
@@ -3456,30 +2745,5 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.contains('t'));
         assert!(b.contains('s'));
-    }
-
-    #[test]
-    fn agent_labels_roundtrip_through_the_projection_format() {
-        let mut input = BTreeMap::new();
-        input.insert(4u32, "Mediator".to_string());
-        input.insert(9u32, "Edge \"case\" with, commas".to_string());
-        let mut body = String::from("{");
-        for (i, (tid, label)) in input.iter().enumerate() {
-            if i > 0 {
-                body.push(',');
-            }
-            let safe = label.replace('\\', "\\\\").replace('"', "\\\"");
-            body.push_str(&format!("\"{tid}\":\"{safe}\""));
-        }
-        body.push('}');
-        let parsed: BTreeMap<u32, String> = parse_agent_labels(&body).into_iter().collect();
-        assert_eq!(parsed, input);
-    }
-
-    #[test]
-    fn agent_labels_parser_tolerates_malformed_input() {
-        assert!(parse_agent_labels("").is_empty());
-        assert!(parse_agent_labels("not json").is_empty());
-        assert!(parse_agent_labels("{}").is_empty());
     }
 }

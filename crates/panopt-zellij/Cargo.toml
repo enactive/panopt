@@ -9,6 +9,7 @@ edition = "2021"
 # it only builds for the wasm target.
 [dependencies]
 zellij-tile = "0.44"
+panopt-zellij-logic = { path = "../panopt-zellij-logic" }
 
 [profile.release]
 opt-level = "z"

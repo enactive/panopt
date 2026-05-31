@@ -230,6 +230,13 @@ const MOUSE_MODE_ON: &str = "mouse_mode true";
 const PANE_FRAMES_OFF: &str = "pane_frames false";
 const PANE_FRAMES_ON: &str = "pane_frames true";
 
+/// The cockpit is a single shared viewport: every client attached to the
+/// session must see the same panes, focus, and tab, the way `tmux` mirrors a
+/// session. Zellij's `mirror_session true` makes all clients share one input
+/// state instead of each getting an independent focus/cursor (todo #116);
+/// without it, plugin panes and focus diverge between clients.
+const MIRROR_SESSION_ON: &str = "mirror_session true";
+
 /// Name of the focus-emphasis theme the cockpit defines and activates.
 const FOCUS_THEME_NAME: &str = "panopt";
 
@@ -846,6 +853,46 @@ fn ensure_pane_frames_enabled(base: &str) -> String {
     base.replace(PANE_FRAMES_OFF, PANE_FRAMES_ON)
 }
 
+/// Force session mirroring on so every attached client shares one viewport
+/// (tmux-style), the cockpit's whole multiplayer model. Zellij defaults
+/// `mirror_session` to false (independent per-client focus).
+///
+/// This is comment-aware: the stock Zellij config ships a doc line
+/// `// mirror_session true`, so a naive substring check would mistake that for
+/// the option being set and skip it (which is exactly the bug that left the
+/// cockpit unmirrored). We only treat a line that actually sets the option -
+/// not a `//` comment - as active: flip an active `false` to `true`, leave an
+/// active `true`, and otherwise append a real top-level directive.
+fn ensure_mirror_session_enabled(base: &str) -> String {
+    let is_active = |line: &str| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with("//") && trimmed.split_whitespace().next() == Some("mirror_session")
+    };
+    if base.lines().any(is_active) {
+        let trailing_nl = base.ends_with('\n');
+        let out = base
+            .lines()
+            .map(|line| {
+                if is_active(line) {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    format!("{indent}{MIRROR_SESSION_ON}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return if trailing_nl { out + "\n" } else { out };
+    }
+    let mut out = base.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(MIRROR_SESSION_ON);
+    out.push('\n');
+    out
+}
+
 /// Make the focused pane unmistakable by defining and activating the cockpit's
 /// `panopt` frame theme - unless the user has chosen their own theme, in which
 /// case we leave it alone (activating ours would swap every non-frame color
@@ -1063,6 +1110,7 @@ fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
         );
     }
     let tweaked = ensure_mouse_mode_enabled(&tweaked);
+    let tweaked = ensure_mirror_session_enabled(&tweaked);
     let (tweaked, locked_injected) = inject_locked_keybinds(&tweaked);
     if !locked_injected {
         eprintln!(
@@ -1128,10 +1176,10 @@ fn render_config(copy_helper: Option<&Path>) -> Result<PathBuf> {
 mod tests {
     use super::{
         active_theme_name, append_copy_command_if_unset, apply_focus_theme,
-        ensure_mouse_mode_enabled, ensure_pane_frames_enabled, grant_clipboard_in_cache,
-        inject_locked_keybinds, retarget_close_bindings, retarget_new_pane_binding,
-        retarget_pane_mode_splits, session_name, splice_into_themes_block, strip_ansi,
-        FOCUS_THEME_NAME, LAYOUT_TEMPLATE, PANE_SPLIT_BINDS,
+        ensure_mirror_session_enabled, ensure_mouse_mode_enabled, ensure_pane_frames_enabled,
+        grant_clipboard_in_cache, inject_locked_keybinds, retarget_close_bindings,
+        retarget_new_pane_binding, retarget_pane_mode_splits, session_name,
+        splice_into_themes_block, strip_ansi, FOCUS_THEME_NAME, LAYOUT_TEMPLATE, PANE_SPLIT_BINDS,
     };
     use std::path::Path;
 
@@ -1361,6 +1409,48 @@ mod tests {
         let out = ensure_mouse_mode_enabled("keybinds {}\n");
         assert!(out.ends_with("mouse_mode true\n"));
         assert_eq!(out.matches("mouse_mode true").count(), 1);
+    }
+
+    #[test]
+    fn ensure_mirror_session_enabled_flips_explicit_off() {
+        let out = ensure_mirror_session_enabled("keybinds {}\nmirror_session false\n");
+        assert!(out.contains("mirror_session true"));
+        assert!(!out.contains("mirror_session false"));
+        assert_eq!(out.matches("mirror_session true").count(), 1);
+    }
+
+    #[test]
+    fn ensure_mirror_session_enabled_appends_when_absent() {
+        let out = ensure_mirror_session_enabled("keybinds {}\n");
+        assert!(out.ends_with("mirror_session true\n"));
+        assert_eq!(out.matches("mirror_session true").count(), 1);
+    }
+
+    #[test]
+    fn ensure_mirror_session_enabled_ignores_a_commented_example() {
+        // The stock Zellij config ships this exact doc comment; the cockpit was
+        // launching unmirrored because a substring check matched it. The active
+        // directive must still be appended.
+        let base =
+            "// should the session be mirrored (true)\n//\n// mirror_session true\nkeybinds {}\n";
+        let out = ensure_mirror_session_enabled(base);
+        // The comment survives untouched...
+        assert!(out.contains("// mirror_session true"));
+        // ...and a real, uncommented directive is now present.
+        assert!(out.lines().any(|l| l.trim_start() == "mirror_session true"));
+    }
+
+    #[test]
+    fn ensure_mirror_session_enabled_is_idempotent_when_already_on() {
+        let base = "keybinds {}\nmirror_session true\n";
+        let out = ensure_mirror_session_enabled(base);
+        assert_eq!(out, base);
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.trim_start() == "mirror_session true")
+                .count(),
+            1
+        );
     }
 
     #[test]

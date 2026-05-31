@@ -1,0 +1,13 @@
+[package]
+name = "panopt-zellij-logic"
+version = "0.1.0"
+edition = "2021"
+
+# Transport-free logic for the Zellij sidebar plugin: the projection-line
+# parsers, the mode/filter/sort enums, and the shared view-state codec. Split
+# out of `panopt-zellij` so this pure code is a normal workspace member that
+# builds and tests on the host - the plugin crate itself only links against the
+# Zellij host ABI and so can never run its own `cargo test`. The plugin depends
+# on this crate by path and re-exports it; both targets (host + wasm) compile
+# the same source.
+[dependencies]

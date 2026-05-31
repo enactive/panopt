@@ -1360,8 +1360,13 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 name = "panopt-zellij"
 version = "0.1.0"
 dependencies = [
+ "panopt-zellij-logic",
  "zellij-tile",
 ]
+
+[[package]]
+name = "panopt-zellij-logic"
+version = "0.1.0"
 
 [[package]]
 name = "parking"

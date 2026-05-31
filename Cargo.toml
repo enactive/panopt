@@ -4,6 +4,7 @@ members = [
     "crates/panopt-tool-surface",
     "crates/panoptd",
     "crates/panopt",
+    "crates/panopt-zellij-logic",
 ]
 # panopt-zellij is a WASM-only plugin crate; excluded so `cargo build --workspace`
 # (which targets the host) does not try to build it.

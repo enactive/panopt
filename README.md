@@ -89,6 +89,29 @@ panes, and spawns a first Claude agent already wired in. Re-running
 Focus a sidebar pane to drive it; each pane shows its own key hints in
 the status bar.
 
+## Sharing a cockpit
+
+A cockpit is a single shared view, so more than one person can sit in it
+at once. Open another terminal on the same machine (or SSH into it) and
+either re-run `panopt up` in the same project, or attach to the cockpit's
+Zellij session directly:
+
+```sh
+zellij attach            # pick the cockpit's session from the list
+```
+
+Every attached terminal sees the **same** screen, mirrored live - the same
+sidebar selection, the same focused pane, the same content - the way `tmux`
+mirrors a session. Move the cursor, switch panes, or open a viewer on one,
+and it updates on all of them. That makes pairing and over-the-shoulder
+review work without anyone's view drifting out of sync.
+
+(PANopt sets this up for you: it enables Zellij's `mirror_session` so focus
+and terminal panes mirror, and keeps the sidebar panes - which Zellij renders
+separately per client - in sync on top of that. Stock Zellij otherwise gives
+each client an independent cursor and focus, so the cockpit would drift apart
+on every screen.)
+
 ## Driving PANopt from the shell
 
 The `panopt` CLI can do everything the cockpit does, so you can script it
