@@ -1,0 +1,64 @@
+plan #116
+
+---
+
+i don;t know what the heck you're talking about.  The issue is about zellij presentation in 'multiplayer' situatins.  it's not about panopt data (todos, etc.)
+
+---
+
+need to figure out why unit tests can't link.  I didn't change anything.
+
+---
+
+do b
+
+---
+
+mostly works, but weird side-effect: pane creation seems to be mediated by both sessions somehow.  if one player is in a sidebar pane and the second is on the right side and the second does alt-n (new pane), the pane appears briefly, then disappears.
+
+if both player are on the right and either one of them does alt-n, then *two* new panes appear
+
+---
+
+broken.  in a different way.  but quite broken.  
+if both are in sidebar, alt-n does nothing.
+1 is in sidebar 2 on right: alt-n on 1 creates new pane on right. shoudl do nothing.
+1 is in sidebar 2 on right: alt-n on 2 creates new pane on right, but it's immed. closed. 2's focus changes to sidebar.
+
+and more...
+
+---
+
+what about syncing focus?
+
+---
+
+yes
+
+---
+
+i don;t see any mirroring of pane changes anywhere.
+
+---
+
+done
+
+---
+
+done
+
+---
+
+done
+
+---
+
+to be clear: i want both players to see the same things all the time.  tmux seems to do this.
+
+---
+
+two to players have separate focuse.  no sync
+
+---
+
+seems to work
