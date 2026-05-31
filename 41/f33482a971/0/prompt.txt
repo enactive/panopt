@@ -1,0 +1,9 @@
+just found a bug.  turns out the sidebar pane content isn't syncronized.  todos, for instance
+
+---
+
+@'/Users/user/p/panopt/Screenshot 2026-05-31 at 11.27.30.png'
+
+---
+
+@Screenshot 2026-05-31 at @"Screenshot 2026-05-31 at 11.27.30.png"
