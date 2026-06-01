@@ -444,8 +444,10 @@ impl Store {
     /// same shape as [`Store::note_list`].
     ///
     /// `query` substring-matches `title`/`body` case-insensitively at the SQL
-    /// layer; `require_tags` is applied in Rust against the JSON tag column
-    /// (AND semantics), matching the parse-in-Rust pattern that
+    /// layer; a purely numeric query (optionally `#`-prefixed) *also* matches
+    /// the exact id, so a `#N` reference is reachable from search (see
+    /// [`query_as_id`]). `require_tags` is applied in Rust against the JSON tag
+    /// column (AND semantics), matching the parse-in-Rust pattern that
     /// [`Store::tags_list`] uses for the same column. With no filters this is
     /// equivalent to `note_list`.
     pub fn note_search(
@@ -461,11 +463,15 @@ impl Store {
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project.0)];
         if let Some(q) = query {
             let pat = format!("%{}%", q.to_lowercase());
-            sql.push_str(&format!(
-                " AND (LOWER(title) LIKE ?{0} OR LOWER(body) LIKE ?{0})",
-                binds.len() + 1
-            ));
+            let n = binds.len() + 1;
             binds.push(Box::new(pat));
+            let mut clause = format!("LOWER(title) LIKE ?{n} OR LOWER(body) LIKE ?{n}");
+            if let Some(id) = query_as_id(q) {
+                let m = binds.len() + 1;
+                binds.push(Box::new(id as i64));
+                clause.push_str(&format!(" OR id = ?{m}"));
+            }
+            sql.push_str(&format!(" AND ({clause})"));
         }
         sql.push_str(" ORDER BY id");
 
@@ -1040,9 +1046,11 @@ impl Store {
     /// [`Todo`] shape as [`Store::todo_list`].
     ///
     /// `query` substring-matches `title`/`body` case-insensitively at the SQL
-    /// layer; `status`, `priority`, and `assignee` are equality predicates
-    /// (assignee is case-insensitive, the others compare against the canonical
-    /// token from [`TodoStatus::as_str`] / [`Priority::as_str`]); and
+    /// layer; a purely numeric query (optionally `#`-prefixed) *also* matches
+    /// the exact id, so a `#N` reference is reachable from search (see
+    /// [`query_as_id`]). `status`, `priority`, and `assignee` are equality
+    /// predicates (assignee is case-insensitive, the others compare against the
+    /// canonical token from [`TodoStatus::as_str`] / [`Priority::as_str`]); and
     /// `require_tags` is applied in Rust after hydration (AND semantics),
     /// since tags are stored as a JSON-encoded column. With every filter
     /// absent or empty this matches `todo_list` exactly.
@@ -1062,11 +1070,15 @@ impl Store {
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project.0)];
         if let Some(q) = query {
             let pat = format!("%{}%", q.to_lowercase());
-            sql.push_str(&format!(
-                " AND (LOWER(title) LIKE ?{0} OR LOWER(body) LIKE ?{0})",
-                binds.len() + 1
-            ));
+            let n = binds.len() + 1;
             binds.push(Box::new(pat));
+            let mut clause = format!("LOWER(title) LIKE ?{n} OR LOWER(body) LIKE ?{n}");
+            if let Some(id) = query_as_id(q) {
+                let m = binds.len() + 1;
+                binds.push(Box::new(id as i64));
+                clause.push_str(&format!(" OR id = ?{m}"));
+            }
+            sql.push_str(&format!(" AND ({clause})"));
         }
         if let Some(s) = status {
             sql.push_str(&format!(" AND status = ?{}", binds.len() + 1));
@@ -1639,6 +1651,15 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// A search query that is just a number (optionally prefixed with `#`, e.g.
+/// `119` or `#119`) is treated as an exact id lookup against the unified
+/// per-project id, so a `#N` reference is reachable from search. Non-numeric
+/// queries return `None` and fall through to plain title/body matching.
+fn query_as_id(query: &str) -> Option<u64> {
+    let trimmed = query.trim();
+    trimmed.strip_prefix('#').unwrap_or(trimmed).parse().ok()
 }
 
 /// Read a project's global `next_id` counter, mapping a missing project row to
@@ -2894,5 +2915,85 @@ mod tests {
 
         fx.store.todo_delete(p, blocker).unwrap();
         assert!(fx.store.todo_get(p, blocked).unwrap().blockers.is_empty());
+    }
+
+    /// Todo #122: a numeric query reaches the item by its `#N` id, even when no
+    /// title/body text mentions that number. The `#`-prefixed form works too.
+    #[test]
+    fn note_search_matches_exact_id() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let _a = fx.store.note_create(p, "alpha".into()).unwrap();
+        let target = fx.store.note_create(p, "beta".into()).unwrap();
+        let _c = fx.store.note_create(p, "gamma".into()).unwrap();
+
+        let by_num: Vec<u64> = fx
+            .store
+            .note_search(p, Some(&target.to_string()), &[])
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(by_num.contains(&target), "bare number finds #N: {by_num:?}");
+
+        let by_hash: Vec<u64> = fx
+            .store
+            .note_search(p, Some(&format!("#{target}")), &[])
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            by_hash.contains(&target),
+            "#-prefixed form finds #N: {by_hash:?}"
+        );
+    }
+
+    /// The id predicate is an exact match, not a digit substring: searching `2`
+    /// must not drag in `#20` (or `#12`), only `#2`. Titles carry no digits so
+    /// the only matches come from the id clause.
+    #[test]
+    fn note_search_id_match_is_exact_not_substring() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        // ids 1..=20, all titled without digits so text matching can't fire.
+        for _ in 0..20 {
+            fx.store.note_create(p, "plain".into()).unwrap();
+        }
+        let ids: Vec<u64> = fx
+            .store
+            .note_search(p, Some("2"), &[])
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![2],
+            "only the exact id #2, not #12 or #20: {ids:?}"
+        );
+    }
+
+    /// The same exact-id reach applies to todos, alongside (not replacing) the
+    /// existing text and status/priority filters.
+    #[test]
+    fn todo_search_matches_exact_id() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let _first = fx.store.todo_create(p, "groceries".into()).unwrap();
+        let target = fx.store.todo_create(p, "taxes".into()).unwrap();
+
+        let hits: Vec<u64> = fx
+            .store
+            .todo_search(p, Some(&target.to_string()), None, None, None, &[])
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            hits,
+            vec![target],
+            "numeric query finds exactly #N: {hits:?}"
+        );
     }
 }
