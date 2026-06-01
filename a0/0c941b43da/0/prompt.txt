@@ -1,0 +1,25 @@
+read #123 and let's make some todos from it.
+
+---
+
+start
+
+---
+
+go
+
+---
+
+how to use it?  get this project identified?
+
+---
+
+how did you change the .gitignore?
+
+---
+
+i ran it!
+
+---
+
+wait.  i don't want project id dependent on claude.  maybe I don't use claude!
