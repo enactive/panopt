@@ -140,8 +140,8 @@ clean:
 # run a 'connected' agent externally (outside of panopt). this is for connecting a dev-time agent to the built system.
 # Uses `panopt agent-config` so the launched session gets a stable agent id,
 # a friendly display name, and the bearer token the daemon requires.
-devagent:
-    claude --mcp-config "$(cargo run -q -p panopt -- agent-config --name greg-main)"
+devagent name='greg-main':
+    claude --mcp-config "$(cargo run -q -p panopt -- agent-config --id {{name}} --name {{name}})"
 
 devagent_old:
     claude --mcp-config "$(cargo run -q -p panopt -- agent-config)"
