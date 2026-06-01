@@ -1,0 +1,57 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "81886331e463",
+  "session_id": "aa5f1a03-0b52-493d-832f-1369658b9820",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-01T03:43:56.222595131Z",
+  "branch": "project-identity",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-core/src/state.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "7b6aba586f6c",
+  "token_usage": {
+    "input_tokens": 5090,
+    "cache_creation_tokens": 61117,
+    "cache_read_tokens": 1798797,
+    "output_tokens": 17272,
+    "api_call_count": 39
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-01T03:43:56.201962067Z",
+    "agent_lines": 114,
+    "agent_removed": 13,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 114,
+    "total_lines_changed": 127,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 543,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1,
+        "docs/observe-design.md": 542
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 657,
+      "agent_lines_removed": 13
+    }
+  ]
+}
