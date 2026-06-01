@@ -13,6 +13,34 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProjectId(pub(crate) i64);
 
+/// One row of the cross-project switcher board, built by
+/// [`crate::Store::project_list`].
+///
+/// The board keys a row on `identity` - the stable repo key (note #123), not
+/// the filesystem path - so a clone, move, or worktree of one logical repo is
+/// the same row. `root` is the projection path the daemon currently records
+/// for that identity (the one checkout it has seen; the schema tracks a single
+/// projection location per project, not a checkout set). `name` is `root`'s
+/// basename reduced to the same character set the cockpit's `session_name`
+/// uses, so a caller can rebuild the Zellij session name (`panopt-<name>-<hash
+/// of root>`) from this row without re-deriving the sanitization rule.
+///
+/// The remaining fields are the live badges the switcher renders, each read
+/// straight from state the daemon already holds: connected agents, todo
+/// counts by status, advisory locks held, and the most recent mutation
+/// timestamp across the project's todos and notes (`None` when it has none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub identity: String,
+    pub root: String,
+    pub name: String,
+    pub agents_active: usize,
+    pub todos_open: usize,
+    pub todos_in_progress: usize,
+    pub locks_held: usize,
+    pub last_activity: Option<String>,
+}
+
 /// A shared, append-oriented note identified by a stable numeric id.
 ///
 /// The `id` (not the `title`) is the durable handle and the projected filename,

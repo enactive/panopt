@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use http::request::Parts;
 use panopt_core::{
     Agent, AgentTool, AgentToolPatch, CoreError, KeySource, Lock, Priority, Process, ProcessKind,
-    ProcessPatch, ProjectId, Note, NotePatch, Store, Todo, TodoPatch, TodoStatus,
+    ProcessPatch, ProjectId, ProjectSummary, Note, NotePatch, Store, Todo, TodoPatch, TodoStatus,
 };
 use panopt_tool_surface::params::{
     AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
@@ -96,6 +96,37 @@ impl NoteDetailDto {
 struct IdKindDto {
     kind: &'static str,
     label: String,
+}
+
+/// Wire shape for one project in `project_list` output: a project's identity,
+/// projection path, and the live badges the cross-project switcher renders.
+/// Mirrors [`panopt_core::ProjectSummary`] one-to-one; `last_activity` is
+/// `null` when the project has no todos or notes.
+#[derive(Serialize)]
+struct ProjectSummaryDto {
+    identity: String,
+    root: String,
+    name: String,
+    agents_active: usize,
+    todos_open: usize,
+    todos_in_progress: usize,
+    locks_held: usize,
+    last_activity: Option<String>,
+}
+
+impl From<ProjectSummary> for ProjectSummaryDto {
+    fn from(p: ProjectSummary) -> Self {
+        ProjectSummaryDto {
+            identity: p.identity,
+            root: p.root,
+            name: p.name,
+            agents_active: p.agents_active,
+            todos_open: p.todos_open,
+            todos_in_progress: p.todos_in_progress,
+            locks_held: p.locks_held,
+            last_activity: p.last_activity,
+        }
+    }
 }
 
 /// Wire shape for a todo in `todo_list` output: every field but the body and
@@ -1347,6 +1378,25 @@ impl Handler {
         };
         json_result(&dto)
     }
+
+    /// The cross-project board: one row per project the daemon knows about.
+    ///
+    /// Unlike every other tool this ignores the connection's `ws`/`project`
+    /// scope - the board is inherently global. It is a pure read and
+    /// deliberately does *not* call [`enter`], so listing projects never
+    /// registers the caller as an agent in any of them: a board viewer is not
+    /// "working in" the projects it renders.
+    async fn project_list(&self, _parts: Parts) -> Result<CallToolResult, McpError> {
+        let dtos: Vec<ProjectSummaryDto> = {
+            let st = self.state.lock().expect("state mutex poisoned");
+            st.project_list()
+                .map_err(map_core_err)?
+                .into_iter()
+                .map(ProjectSummaryDto::from)
+                .collect()
+        };
+        json_result(&dtos)
+    }
 }
 
 /// Every tool name in [`TOOL_SURFACE`], promoted to an enum so [`dispatch_local`]'s
@@ -1399,6 +1449,7 @@ enum Tool {
     ProcessUpdate,
     ProcessDelete,
     IdKind,
+    ProjectList,
 }
 
 impl Tool {
@@ -1448,6 +1499,7 @@ impl Tool {
             "process_update" => Tool::ProcessUpdate,
             "process_delete" => Tool::ProcessDelete,
             "id_kind" => Tool::IdKind,
+            "project_list" => Tool::ProjectList,
             _ => return None,
         })
     }
@@ -1649,6 +1701,7 @@ async fn dispatch_local<'a>(
             let args: IdKindArgs = parse_json_object(raw_args)?;
             handler.id_kind(parts, args).await
         }
+        Tool::ProjectList => handler.project_list(parts).await,
     }
 }
 
@@ -1703,7 +1756,10 @@ impl ServerHandler for Handler {
                  - Utilities: id_kind resolves a numeric id to its resource kind \
                  (todo / note / agent-tool / process) plus a short label. \
                  Useful since ids are unified per project and a `#N` reference \
-                 points to exactly one row.\n\
+                 points to exactly one row. project_list is the one cross-project \
+                 tool: it ignores the connection's scope and returns one row per \
+                 project (identity, root, name, and live agent/todo/lock badges) \
+                 for the switcher board.\n\
                  State is persisted, shared live across every agent on the same project, \
                  and mirrored into .panopt/*.md under the project root."
                     .to_string(),

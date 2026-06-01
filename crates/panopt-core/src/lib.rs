@@ -18,7 +18,7 @@ mod state;
 
 pub use error::CoreError;
 pub use model::{
-    Agent, AgentTool, AgentToolPatch, KeySource, Lock, Priority, Process, ProcessKind,
-    ProcessPatch, ProjectId, Note, NotePatch, Todo, TodoComment, TodoPatch, TodoStatus,
+    Agent, AgentTool, AgentToolPatch, KeySource, Lock, Note, NotePatch, Priority, Process,
+    ProcessKind, ProcessPatch, ProjectId, ProjectSummary, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 pub use state::Store;

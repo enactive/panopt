@@ -352,6 +352,19 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         schema_fn: schema_for::<ProcessDeleteArgs>,
     },
     ToolDef {
+        name: "project_list",
+        description: "List every project the daemon knows about - the cross-project board. \
+                      Unlike every other tool, this is NOT scoped to the connection's \
+                      project; it returns one row per project as a JSON array of \
+                      {identity, root, name, agents_active, todos_open, todos_in_progress, \
+                      locks_held, last_activity}. `identity` is the stable repo key the \
+                      row is keyed on; `root` is the project's projection path; `name` is \
+                      root's sanitized basename (so the Zellij session name is \
+                      `panopt-<name>-<hash of root>`); the rest are live badges \
+                      (`last_activity` is null when the project has no todos or notes).",
+        schema_fn: schema_for_no_args,
+    },
+    ToolDef {
         name: "id_kind",
         description: "Given a numeric id, return what kind of resource it is \
                       and a short label. Resolves across todos, notes, \

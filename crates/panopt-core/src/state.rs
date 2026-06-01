@@ -9,7 +9,7 @@
 //! file, so the state and the projected files can never drift: there is no code
 //! path that mutates without projecting.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ use crate::error::CoreError;
 use crate::locks::Locks;
 use crate::model::{
     Agent, AgentTool, AgentToolPatch, KeySource, Lock, Note, NotePatch, Priority, Process,
-    ProcessKind, ProcessPatch, ProjectId, Todo, TodoComment, TodoPatch, TodoStatus,
+    ProcessKind, ProcessPatch, ProjectId, ProjectSummary, Todo, TodoComment, TodoPatch, TodoStatus,
 };
 use crate::projection;
 use crate::registry::Registry;
@@ -45,6 +45,22 @@ const AGENT_MAX_IDLE: Duration = Duration::from_secs(1800);
 /// identity that has gone quiet is still in the roster but should not
 /// block a daemon shutdown).
 const ACTIVE_PRESENCE: Duration = Duration::from_secs(5);
+
+/// The basename of a project path, reduced to the character set the cockpit's
+/// Zellij session name accepts (ASCII alphanumerics, everything else folded to
+/// `-`). Kept byte-for-byte in step with `panopt`'s `session_name` so a
+/// [`ProjectSummary::name`] lets a caller rebuild the session name as
+/// `panopt-<name>-<hash of root>` without re-deriving this rule. A path with no
+/// final component (e.g. `/`) falls back to `project`, matching the launcher.
+fn sanitized_basename(root: &str) -> String {
+    let base = std::path::Path::new(root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+    base.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
 
 /// All of PANopt's coordination state.
 ///
@@ -300,6 +316,115 @@ impl Store {
             .into_iter()
             .map(|(pid, n)| (ProjectId(pid), n))
             .collect()
+    }
+
+    /// One [`ProjectSummary`] per project the daemon knows about, for the
+    /// cross-project switcher board (todo #120, design note #119).
+    ///
+    /// This is a pure read - a join of state the daemon already holds, never
+    /// new bookkeeping. The badges come from three sources: live agent counts
+    /// from the in-memory registry (the same [`ACTIVE_PRESENCE`] liveness
+    /// window as [`Self::connected_agents_by_project`]), advisory lock counts
+    /// from the in-memory lock table, and todo status counts plus the latest
+    /// mutation timestamp from SQLite. The aggregate queries are grouped by
+    /// `project_id` so the whole board is three statements, not one pair per
+    /// project.
+    ///
+    /// Rows are keyed and ordered by the project's row id (insertion order);
+    /// `identity` carries the stable repo key the row is logically keyed on.
+    /// Soft-deleted todos and notes are excluded, matching every other read.
+    pub fn project_list(&self) -> Result<Vec<ProjectSummary>, CoreError> {
+        // Live agents and held locks live in memory, not SQLite. Index agent
+        // counts by raw project id once so the per-project assembly is O(1).
+        let agents: HashMap<i64, usize> = self
+            .registry
+            .active_counts_by_project(ACTIVE_PRESENCE)
+            .into_iter()
+            .collect();
+
+        // Open / in-progress todo counts in one grouped pass. Other statuses
+        // (backlog, draft, terminal) are not board badges, so the query never
+        // fetches them.
+        let mut todo_counts: HashMap<i64, (usize, usize)> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT project_id, status, COUNT(*) FROM todos
+                  WHERE deleted_at IS NULL AND status IN ('open', 'in_progress')
+                  GROUP BY project_id, status",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as usize,
+                ))
+            })?;
+            for row in rows {
+                let (pid, status, count) = row?;
+                let entry = todo_counts.entry(pid).or_default();
+                match status.as_str() {
+                    "open" => entry.0 = count,
+                    "in_progress" => entry.1 = count,
+                    _ => {}
+                }
+            }
+        }
+
+        // Latest mutation across todos and notes, per project. An empty
+        // `updated_at` (legacy rows predating the column) sorts below any real
+        // timestamp, so MAX surfaces a real one when present; a project whose
+        // every row is empty (or that has no rows) yields no entry and reads
+        // as no activity.
+        let mut last_activity: HashMap<i64, String> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT project_id, MAX(updated_at) FROM (
+                     SELECT project_id, updated_at FROM todos WHERE deleted_at IS NULL
+                     UNION ALL
+                     SELECT project_id, updated_at FROM notes WHERE deleted_at IS NULL
+                 ) GROUP BY project_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (pid, ts) = row?;
+                if let Some(ts) = ts.filter(|s| !s.is_empty()) {
+                    last_activity.insert(pid, ts);
+                }
+            }
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, root, identity FROM projects ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            let (pid, root, identity) = row?;
+            let (todos_open, todos_in_progress) = todo_counts.get(&pid).copied().unwrap_or((0, 0));
+            summaries.push(ProjectSummary {
+                name: sanitized_basename(&root),
+                // `identity` is back-filled to `root` for every row by the V10
+                // migration, so the fallback only guards a row written between
+                // the column add and its back-fill.
+                identity: identity.unwrap_or_else(|| root.clone()),
+                root,
+                agents_active: agents.get(&pid).copied().unwrap_or(0),
+                todos_open,
+                todos_in_progress,
+                locks_held: self.locks.list(pid).len(),
+                last_activity: last_activity.remove(&pid),
+            });
+        }
+        Ok(summaries)
     }
 
     /// Prune silent agents across *every* project, release their locks, and
@@ -1749,6 +1874,95 @@ mod tests {
             "repo-key",
             "path call left identity intact"
         );
+    }
+
+    #[test]
+    fn project_list_joins_aggregates_per_project() {
+        let mut fx = Fixture::new();
+        let (alpha, _) = fx.project("alpha");
+        let (_beta, _) = fx.project("beta");
+
+        // alpha: two open todos, one in-progress, plus a backlog todo that must
+        // not be counted; a note; a held lock; and a live agent.
+        let _o1 = fx.store.todo_create(alpha, "open one".into()).unwrap();
+        let _o2 = fx.store.todo_create(alpha, "open two".into()).unwrap();
+        let ip = fx.store.todo_create(alpha, "wip".into()).unwrap();
+        let bl = fx.store.todo_create(alpha, "later".into()).unwrap();
+        fx.store
+            .todo_update(
+                alpha,
+                ip,
+                TodoPatch {
+                    status: Some(TodoStatus::InProgress),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fx.store
+            .todo_update(
+                alpha,
+                bl,
+                TodoPatch {
+                    status: Some(TodoStatus::Backlog),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fx.store.note_create(alpha, "a note".into()).unwrap();
+        fx.store
+            .lock_acquire(alpha, "agent-1", "build".into(), None)
+            .unwrap();
+        fx.store
+            .agent_touch(alpha, "agent-1", KeySource::Declared)
+            .unwrap();
+
+        let rows = fx.store.project_list().unwrap();
+        assert_eq!(rows.len(), 2, "one row per project");
+
+        // Rows come back in project-id (insertion) order: alpha then beta.
+        let a = &rows[0];
+        assert_eq!(a.name, "alpha");
+        assert_eq!(a.todos_open, 2, "backlog todo is not an open badge");
+        assert_eq!(a.todos_in_progress, 1);
+        assert_eq!(a.locks_held, 1);
+        assert_eq!(a.agents_active, 1);
+        assert!(
+            a.last_activity.is_some(),
+            "a project with todos/notes has a last_activity timestamp"
+        );
+        assert_eq!(a.identity, a.root, "path-keyed project: identity == root");
+
+        // beta is untouched: every badge is zero and there is no activity.
+        let b = &rows[1];
+        assert_eq!(b.name, "beta");
+        assert_eq!(b.todos_open, 0);
+        assert_eq!(b.todos_in_progress, 0);
+        assert_eq!(b.locks_held, 0);
+        assert_eq!(b.agents_active, 0);
+        assert_eq!(b.last_activity, None);
+    }
+
+    #[test]
+    fn project_list_names_track_repo_identity_not_path() {
+        // Two checkouts of one repo identity collapse to a single board row,
+        // and its `name` is the basename of the projection path the daemon
+        // recorded first - not re-derived per checkout.
+        let mut fx = Fixture::new();
+        let a = fx.dir.path().join("checkout-a");
+        let b = fx.dir.path().join("checkout-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        fx.store.ensure_project_by_identity("repo-key", &a).unwrap();
+        fx.store.ensure_project_by_identity("repo-key", &b).unwrap();
+
+        let rows = fx.store.project_list().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "same identity is one row, not one per checkout"
+        );
+        assert_eq!(rows[0].identity, "repo-key");
+        assert_eq!(rows[0].name, "checkout-a");
     }
 
     #[test]
