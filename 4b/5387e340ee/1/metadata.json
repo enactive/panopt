@@ -1,0 +1,75 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "4b5387e340ee",
+  "session_id": "ed4e4805-630d-4313-b131-96dfe91901c0",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-01T04:58:32.715797659Z",
+  "branch": "project-identity",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "crates/panopt-core/src/lib.rs",
+    "crates/panopt-core/src/model.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "2419463fc47a",
+  "token_usage": {
+    "input_tokens": 4374,
+    "cache_creation_tokens": 303155,
+    "cache_read_tokens": 5794150,
+    "output_tokens": 35617,
+    "api_call_count": 76
+  },
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-01T04:58:32.677457372Z",
+    "agent_lines": 317,
+    "agent_removed": 6,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 317,
+    "total_lines_changed": 323,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 543,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1,
+        "docs/observe-design.md": 542
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 860,
+      "agent_lines_removed": 6
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 860,
+      "agent_lines_removed": 6
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 860,
+      "agent_lines_removed": 6
+    }
+  ]
+}
