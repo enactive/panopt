@@ -6,12 +6,17 @@ edition.workspace = true
 # Deliberately minimal: no MCP, async, or HTTP crate. `rusqlite` is allowed - it
 # is a synchronous embedded database, none of those three. `serde_json` is the
 # one serialization crate, used only to store a todo's tag list as a JSON array
-# column. `cargo tree -p panopt-core` is still expected to contain none of rmcp /
-# axum / tokio - that is the mechanical check for the transport-agnostic-core
-# principle.
+# column. `serde` + `toml` are for the agent-type profiles (agent_profiles), a
+# read-only config layer parsed from TOML; `dirs` resolves the user override
+# path. None of these pull in rmcp / axum / tokio. `cargo tree -p panopt-core`
+# is still expected to contain none of those three - that is the mechanical
+# check for the transport-agnostic-core principle.
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
+dirs = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]

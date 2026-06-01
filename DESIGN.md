@@ -559,6 +559,45 @@ is the ephemeral set of MCP agents *currently connected*, while agent_tools
 and processes are the durable set of agents/commands/terminals the project
 is configured to run and the live instances of them.
 
+### 6.7 Agent type profiles
+
+Above the per-project config/instance split sits a third, global level: the
+*agent type*. An `agent_tools` row names a `tool_type` (`claude-code`,
+`codex`, ...); the profile for that type holds everything needed to *interop*
+with that specific agent program. Crucially, a type is **data, not code**: a
+profile parameterizes two generic interpreters rather than carrying a bespoke
+adapter.
+
+- **spawn** - a launch template: an `argv` vector, an `env` map, and a set of
+  `files` to materialize, all carrying `{{placeholder}}` references. The spawn
+  interpreter renders these against the facts PANopt supplies (`panopt_bin`,
+  `host`, `port`, `ws`, `project`, `agent_id`, `name`, `token`, `model`) into a
+  concrete process launch. env-vs-flag-vs-config-file is not three mechanisms
+  but one template shape - *where a placeholder lands* - so one engine launches
+  every CLI agent. This is what lets PANopt render the launch itself rather than
+  leaning on the agent's own `${VAR}` expansion (which the cockpit's hand-built
+  claude config currently does; see `crates/panopt/src/mcp.rs`).
+- **status** - regexes per activity state (`thinking` / `idle` / `waiting` /
+  `done`) matched against the agent's output by the status interpreter.
+
+The only irreducible code is the interpreters themselves (substitution, pattern
+matching) and the providers that produce the injectable facts - both fixed and
+generic, never per-type. A genuinely novel agent (a different launch handshake,
+a non-screen-scraped status source) needs a new interpreter *step kind*, but
+that step then becomes declarable data for every type after it.
+
+Profiles are global and live in files, not SQLite: they are referenced by a
+`tool_type` *string*, not addressed as a `#N` resource, so keeping them out of
+the database preserves the unified per-project id invariant (Section 6.4). Two
+layers merge, both global: shipped defaults compiled into the binary
+(`crates/panopt-core/src/agent_profiles/defaults.toml`, where claude-code
+lives) and a user override at `<config-dir>/panopt/agent-types.toml`, absent by
+default. The merge is keyed by `tool_type`; within a profile, scalars override,
+maps (`env`, `files`, status patterns) merge by inner key, and lists (`argv`,
+each pattern list) replace wholesale. Every placeholder is validated at load -
+a `{{name}}` outside the known set, or a `{{file:NAME}}` with no matching
+`files` entry, fails the daemon at startup rather than at spawn time.
+
 ## 7. Proof of Concept
 
 Two proofs of concept were built and verified, each retiring the load-bearing

@@ -1,0 +1,61 @@
+# Shipped agent-type profiles.
+#
+# Each top-level table is one `tool_type` - the string an `agent_tools` row
+# stores to say what kind of agent a config launches. This file is compiled
+# into the binary (`include_str!`) and is the authoritative default set; a user
+# override at `<config-dir>/panopt/agent-types.toml` is merged on top (scalars
+# override, maps merge by inner key, lists replace wholesale). See
+# `panopt-core::agent_profiles` for the merge rule, the placeholder set, and
+# load-time validation.
+#
+# A profile is pure data driving generic interpreters: `spawn` is a template the
+# spawn interpreter renders into a concrete (argv, env, files) launch; `status`
+# is regexes the status interpreter matches against the agent's output. There is
+# no per-type code - adding an agent type that fits this shape is a new table
+# here (or in the override), not a code change.
+
+[claude-code]
+display_name = "Claude Code"
+
+[claude-code.spawn]
+# Launch claude with a generated stdio MCP config that boots `panopt _mcp-proxy`.
+# The proxy holds the long-lived MCP session and forwards to panoptd over HTTP,
+# so the session survives daemon restarts. This mirrors the cockpit's
+# hand-built launch (crates/panopt/src/mcp.rs) - except panopt renders the
+# `{{...}}` placeholders itself rather than leaning on claude's own `${VAR}`
+# expansion, which is what lets the same engine launch agents that don't expand
+# env vars.
+argv = ["claude", "--mcp-config", "{{file:mcp_config}}"]
+
+[claude-code.spawn.files]
+# Rendered to a temp file at spawn; its path replaces `{{file:mcp_config}}` in
+# argv. A multi-line TOML literal string ('''...''') holds the JSON verbatim.
+mcp_config = '''
+{
+  "mcpServers": {
+    "panopt": {
+      "type": "stdio",
+      "command": "{{panopt_bin}}",
+      "args": [
+        "--port", "{{port}}",
+        "_mcp-proxy",
+        "--host", "{{host}}",
+        "--ws", "{{ws}}",
+        "--project", "{{project}}",
+        "--id", "{{agent_id}}",
+        "--name", "{{name}}",
+        "--token", "{{token}}"
+      ]
+    }
+  }
+}
+'''
+
+[claude-code.status]
+# Regexes matched against the agent's terminal output to derive its activity.
+# PROVISIONAL: the interpreter semantics (precedence, idle fallthrough) and the
+# fixture-validated patterns land in #138; this file only declares the shape so
+# the schema and loader have real data to exercise. Lists replace wholesale on
+# override.
+thinking = ['esc to interrupt']
+waiting = ['Do you want', 'Would you like']
