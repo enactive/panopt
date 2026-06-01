@@ -1,0 +1,17 @@
+create a new branch to do #135. don't be afraid to ask about anything that's unclear.
+
+---
+
+For #136's profile storage — confirm format and layering?
+
+---
+
+toml. yes to recording on #136
+
+---
+
+#141: who actually spawns an agent process when an instance starts?
+
+---
+
+yes
