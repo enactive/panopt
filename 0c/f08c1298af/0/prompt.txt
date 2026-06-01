@@ -1,0 +1,9 @@
+investigate #130
+
+---
+
+why not allow all (optional) and have sensible defaults ?
+
+---
+
+yes
