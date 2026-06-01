@@ -38,6 +38,9 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+mod render;
+pub use render::{build_launch, Facts, Launch, RenderError};
+
 /// The shipped default profile set, compiled into the binary.
 const DEFAULTS_TOML: &str = include_str!("defaults.toml");
 
