@@ -15,10 +15,12 @@ mod id_kind;
 mod mcp;
 mod mcp_proxy;
 mod mcpclient;
-mod paths;
-mod process;
 mod note;
 mod note_form;
+mod paths;
+mod process;
+mod project;
+mod project_identity;
 mod search;
 mod todo;
 mod todo_form;
@@ -91,6 +93,15 @@ enum Cmd {
         /// Project root (default: the current directory).
         #[arg(long)]
         ws: Option<PathBuf>,
+    },
+    /// Manage this project's committed identity (`.panopt/project-id`), the
+    /// stable repo key PANopt prefers over the checkout path.
+    Project {
+        /// Project root (default: the current directory).
+        #[arg(long, global = true)]
+        ws: Option<PathBuf>,
+        #[command(subcommand)]
+        action: project::ProjectCmd,
     },
     /// Print the daemon's bearer token to stdout.
     ///
@@ -183,6 +194,11 @@ enum Cmd {
         /// Project root the agent is scoped to.
         #[arg(long)]
         ws: PathBuf,
+        /// Opaque project identity key (becomes `?project=` on the panoptd URL).
+        /// Defaults to deriving it from `ws`: committed `.panopt/project-id` ->
+        /// remote URL -> root commit -> path.
+        #[arg(long)]
+        project: Option<String>,
         /// Stable agent id (becomes `?agent=` on the panoptd URL).
         #[arg(long)]
         id: String,
@@ -258,6 +274,7 @@ fn main() -> anyhow::Result<()> {
             token,
             ws,
         } => agent_config::run(host, cli.port, id, name, token, ws),
+        Cmd::Project { ws, action } => project::run(ws, action),
         Cmd::Token => {
             use anyhow::Context;
             let token = panopt_core::auth::read_token(&paths::token()?)
@@ -276,10 +293,11 @@ fn main() -> anyhow::Result<()> {
         Cmd::McpProxy {
             host,
             ws,
+            project,
             id,
             name,
             token,
-        } => mcp_proxy::run(host, cli.port, ws, id, name, token),
+        } => mcp_proxy::run(host, cli.port, ws, project, id, name, token),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
         Cmd::CloseGateExec {

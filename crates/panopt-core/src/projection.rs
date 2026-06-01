@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use crate::model::{Agent, AgentTool, Lock, Process, Note, Todo, TodoStatus};
+use crate::model::{Agent, AgentTool, Lock, Note, Process, Todo, TodoStatus};
 
 /// Per-process counter giving each temp file a unique name, so two concurrent
 /// writes to the same target never collide on the temp path.
@@ -350,19 +350,18 @@ pub(crate) fn render_locks_md(locks: &[Lock]) -> String {
 /// Create the `.panopt/` projection tree and its initial files.
 ///
 /// Called from [`crate::Store::ensure_project`]. Writes `.panopt/.gitignore`
-/// (`*`) so git ignores the whole projection, plus an empty `todos.md` index,
-/// `agents.md`, and `locks.md` so the files a user pins in an editor exist
-/// before any tool call.
+/// (`*` with a `!project-id` negation) so git ignores the whole projection
+/// *except* the committed identity file (note #123, todo #124) - that one file
+/// must travel with the tree, while the rest is regenerated state. Also writes
+/// an empty `todos.md` index, `agents.md`, and `locks.md` so the files a user
+/// pins in an editor exist before any tool call.
 pub(crate) fn bootstrap(ws: &Path) -> io::Result<()> {
     fs::create_dir_all(panopt_dir(ws))?;
     fs::create_dir_all(note_dir(ws))?;
     fs::create_dir_all(todos_dir(ws))?;
-    atomic_write(&panopt_dir(ws).join(".gitignore"), "*\n")?;
+    atomic_write(&panopt_dir(ws).join(".gitignore"), "*\n!project-id\n")?;
     atomic_write(&todos_index_path(ws), &render_todos_index_md(&[]))?;
-    atomic_write(
-        &notes_index_path(ws),
-        &render_notes_index_md(&[]),
-    )?;
+    atomic_write(&notes_index_path(ws), &render_notes_index_md(&[]))?;
     atomic_write(&agent_tools_path(ws), &render_agent_tools_md(&[]))?;
     atomic_write(&processes_path(ws), &render_processes_md(&[]))?;
     // Empty roster - `now` is irrelevant because nothing is rendered.
@@ -415,14 +414,8 @@ pub(crate) fn project_note(ws: &Path, pad: &Note) -> io::Result<()> {
 /// `(id, title, updated_at)` list, and sweep per-note files whose
 /// note has been deleted. Mirrors the sweep in [`project_todos`] so the
 /// index is the source of truth for which files should exist.
-pub(crate) fn project_notes_index(
-    ws: &Path,
-    pads: &[(u64, String, String)],
-) -> io::Result<()> {
-    atomic_write(
-        &notes_index_path(ws),
-        &render_notes_index_md(pads),
-    )?;
+pub(crate) fn project_notes_index(ws: &Path, pads: &[(u64, String, String)]) -> io::Result<()> {
+    atomic_write(&notes_index_path(ws), &render_notes_index_md(pads))?;
 
     let live: HashSet<u64> = pads.iter().map(|(id, _, _)| *id).collect();
     if let Ok(entries) = fs::read_dir(note_dir(ws)) {
@@ -717,9 +710,11 @@ mod tests {
 
         assert!(dir.path().join(".panopt/note").is_dir());
         assert!(dir.path().join(".panopt/todos").is_dir());
+        // The whole projection is ignored except the committed identity file,
+        // which must travel with the tree (note #123).
         assert_eq!(
             fs::read_to_string(dir.path().join(".panopt/.gitignore")).unwrap(),
-            "*\n"
+            "*\n!project-id\n"
         );
         assert!(dir.path().join(".panopt/todos.md").is_file());
         assert!(dir.path().join(".panopt/notes.md").is_file());
@@ -746,10 +741,7 @@ mod tests {
 
     #[test]
     fn empty_notes_index_renders_placeholder() {
-        assert_eq!(
-            render_notes_index_md(&[]),
-            "# Notes\n\n_(no notes)_\n"
-        );
+        assert_eq!(render_notes_index_md(&[]), "# Notes\n\n_(no notes)_\n");
     }
 
     #[test]

@@ -57,6 +57,13 @@ pub fn spawn(name: Option<String>) -> Result<()> {
 pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Result<()> {
     let config = mcp::ensure()?;
     let ws = resolve_ws(ws)?;
+    // Resolve the project's stable repo identity once, here at the launch edge,
+    // and carry it into the pane as `PANOPT_PROJECT`. The MCP template forwards
+    // it to the proxy as `--project`, so the pane keys on repo identity rather
+    // than its checkout path, and the proxy need not re-derive it (shelling git)
+    // on every connect. An empty value (never expected here) makes the proxy
+    // fall back to deriving from `ws`.
+    let project = crate::project_identity::resolve(&ws).key;
     let id = id.unwrap_or_else(|| mint_id(None));
     let token_path = paths::token()?;
     let token = panopt_core::auth::read_token(&token_path)
@@ -74,6 +81,7 @@ pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Resul
         .arg(&config)
         .env("PANOPT_BIN", &panopt_bin)
         .env("PANOPT_WS", &ws)
+        .env("PANOPT_PROJECT", &project)
         .env("PANOPT_AGENT", &id)
         .env("PANOPT_NAME", &id)
         .env("PANOPT_PORT", port.to_string())
@@ -101,10 +109,14 @@ pub fn leave(ws: Option<PathBuf>, id: String, port: u16) -> Result<()> {
     let ws = resolve_ws(ws)?;
     let token = panopt_core::auth::read_token(&paths::token()?)
         .context("reading the panopt token (start the daemon with `panopt up`)")?;
+    // Key on the same repo identity the dead agent connected with, so we release
+    // locks in the right project even if the daemon keyed it by identity.
+    let project = crate::project_identity::resolve(&ws).key;
     let encode = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
     let url = format!(
-        "http://127.0.0.1:{port}/mcp?ws={}&agent={}&token={}",
+        "http://127.0.0.1:{port}/mcp?ws={}&project={}&agent={}&token={}",
         encode(&ws.to_string_lossy()),
+        encode(&project),
         encode(&id),
         encode(&token),
     );

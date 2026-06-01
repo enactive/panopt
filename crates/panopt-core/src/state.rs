@@ -86,32 +86,115 @@ impl Store {
     /// slashes collapse onto one project. The first call for a project in this
     /// process bootstraps its `.panopt/` tree and re-projects every file from
     /// current state.
+    ///
+    /// This is the path-keyed entry point: identity defaults to the canonical
+    /// path, exactly the pre-V10 behavior (one project per path). A caller that
+    /// has resolved a stable repo key at the edge passes it explicitly via
+    /// [`Store::ensure_project_by_identity`] instead.
     pub fn ensure_project(&mut self, root: &Path) -> Result<ProjectId, CoreError> {
         let canonical =
             std::fs::canonicalize(root).map_err(|_| CoreError::Workspace(root.to_path_buf()))?;
         let root_str = canonical.to_string_lossy().into_owned();
+        self.ensure_project_keyed(&root_str, &canonical, &root_str)
+    }
 
+    /// Resolve a project by its opaque `identity` key, projecting into `root`.
+    ///
+    /// `identity` is a stable repo key resolved at the edge (the launcher /
+    /// agent-config) - to core it is just an opaque string, so no git dependency
+    /// crosses the core boundary. `root` is the projection location for *this*
+    /// checkout (where its `.panopt/*.md` mirror is written); it is canonicalized
+    /// like [`Store::ensure_project`]. Two checkouts that resolve to the same
+    /// identity share one project row even when their paths differ.
+    pub fn ensure_project_by_identity(
+        &mut self,
+        identity: &str,
+        root: &Path,
+    ) -> Result<ProjectId, CoreError> {
+        let canonical =
+            std::fs::canonicalize(root).map_err(|_| CoreError::Workspace(root.to_path_buf()))?;
+        let root_str = canonical.to_string_lossy().into_owned();
+        self.ensure_project_keyed(identity, &canonical, &root_str)
+    }
+
+    /// Shared core of the two `ensure_project*` entry points: look a project up
+    /// by its `identity`, inserting a row (carrying both `root` and `identity`)
+    /// on first sight, then bootstrap and re-project this checkout once per
+    /// process. Lookup keys on `identity` rather than `root`; for path-keyed
+    /// callers the two are equal, so this is behavior-identical to the pre-V10
+    /// `WHERE root = ?` lookup while letting an explicit identity unify checkouts
+    /// at different paths.
+    ///
+    /// On an identity miss it adopts a pre-existing row keyed by the same `root`:
+    /// an identity-keyed caller re-keys it to `identity` (upgrading a back-filled
+    /// path row, or following an identity change), while a path-keyed caller
+    /// leaves it untouched. This both avoids colliding on `UNIQUE(root)` and
+    /// keeps path-only clients from clobbering an established repo identity.
+    fn ensure_project_keyed(
+        &mut self,
+        identity: &str,
+        canonical: &Path,
+        root_str: &str,
+    ) -> Result<ProjectId, CoreError> {
         let existing: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM projects WHERE root = ?1",
-                [&root_str],
+                "SELECT id FROM projects WHERE identity = ?1",
+                [identity],
                 |r| r.get(0),
             )
             .optional()?;
         let id = match existing {
             Some(id) => id,
             None => {
-                self.conn
-                    .execute("INSERT INTO projects (root) VALUES (?1)", [&root_str])?;
-                self.conn.last_insert_rowid()
+                // No row carries this identity yet. Before inserting, adopt a
+                // legacy row keyed by this same `root` - one whose identity was
+                // back-filled to its path by the V10 migration, or created by a
+                // path-only client - by re-keying it to the resolved identity.
+                // Without this, the first identity-aware connect for an existing
+                // path-keyed project would collide on the UNIQUE(root) constraint
+                // instead of upgrading the row in place.
+                let legacy: Option<i64> = self
+                    .conn
+                    .query_row("SELECT id FROM projects WHERE root = ?1", [root_str], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                match legacy {
+                    // A row already exists for this path under a different
+                    // identity. An identity-keyed caller (the edge resolver,
+                    // where `identity != root_str`) is authoritative and re-keys
+                    // it - covering both the first upgrade of a back-filled path
+                    // row and a later identity change (a new remote, or `project
+                    // init`). A path-keyed caller (`identity == root_str`) never
+                    // clobbers an identity another connection established, so it
+                    // reuses the row untouched. That asymmetry stops path-only
+                    // clients (the `panopt todo` CLI) from thrashing a project
+                    // back to path identity between proxy connects.
+                    Some(id) => {
+                        if identity != root_str {
+                            self.conn.execute(
+                                "UPDATE projects SET identity = ?1 WHERE id = ?2",
+                                rusqlite::params![identity, id],
+                            )?;
+                        }
+                        id
+                    }
+                    None => {
+                        self.conn.execute(
+                            "INSERT INTO projects (root, identity) VALUES (?1, ?2)",
+                            [root_str, identity],
+                        )?;
+                        self.conn.last_insert_rowid()
+                    }
+                }
             }
         };
 
         let project = ProjectId(id);
         if self.reprojected.insert(id) {
-            projection::bootstrap(&canonical)?;
-            self.reproject_all(&canonical, project)?;
+            projection::bootstrap(canonical)?;
+            self.reproject_all(canonical, project)?;
         }
         Ok(project)
     }
@@ -1595,6 +1678,56 @@ mod tests {
             let id = self.store.ensure_project(&root).unwrap();
             (id, root)
         }
+    }
+
+    /// The `identity` column of a project row, read directly for assertions.
+    fn identity_of(store: &Store, project: ProjectId) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT identity FROM projects WHERE id = ?1",
+                [project.0],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn ensure_project_by_identity_adopts_unifies_and_resists_clobber() {
+        let mut fx = Fixture::new();
+        let a = fx.dir.path().join("checkout-a");
+        std::fs::create_dir_all(&a).unwrap();
+
+        // A path-keyed connect seeds the row with identity == canonical path.
+        let p_path = fx.store.ensure_project(&a).unwrap();
+        let canon_a = std::fs::canonicalize(&a)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(identity_of(&fx.store, p_path), canon_a);
+
+        // The edge resolver connects with a repo identity for the same path: it
+        // adopts the existing row (no UNIQUE(root) collision) and re-keys it.
+        let p_id = fx.store.ensure_project_by_identity("repo-key", &a).unwrap();
+        assert_eq!(p_path, p_id, "identity connect adopts the path-keyed row");
+        assert_eq!(identity_of(&fx.store, p_id), "repo-key");
+
+        // A second checkout at a different path but the same identity unifies
+        // onto the same project row - the whole point of repo identity.
+        let b = fx.dir.path().join("checkout-b");
+        std::fs::create_dir_all(&b).unwrap();
+        let p_other = fx.store.ensure_project_by_identity("repo-key", &b).unwrap();
+        assert_eq!(p_id, p_other, "same identity unifies distinct checkouts");
+
+        // A later path-only client (the CLI) must NOT clobber the established
+        // repo identity back to the path.
+        let p_path2 = fx.store.ensure_project(&a).unwrap();
+        assert_eq!(p_id, p_path2);
+        assert_eq!(
+            identity_of(&fx.store, p_id),
+            "repo-key",
+            "path call left identity intact"
+        );
     }
 
     #[test]

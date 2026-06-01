@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -295,6 +295,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 9 {
         apply_v9(conn)?;
     }
+    if version < 10 {
+        apply_v10(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -348,6 +351,36 @@ fn apply_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
         return Ok(());
     }
     conn.execute_batch("ALTER TABLE scratchpads RENAME TO notes;")
+}
+
+/// Version 10: project identity distinct from the projection path (note #123,
+/// todo #124).
+///
+/// Through V9 a project *was* its filesystem path: `projects.root` was both the
+/// identity key (the unique row) and the projection location (where `.panopt/*.md`
+/// is written). That conflation fragments one logical project the moment its repo
+/// is cloned to another path, moved, checked out as a worktree, or mirrored on
+/// another machine. V10 splits the two roles: `root` stays the projection
+/// location, and a new `identity` column holds an opaque, stable repo key.
+///
+/// Identity is computed at the edge (the launcher / agent-config), never derived
+/// inside core - so to `panopt-core` it is just an opaque string, and no git
+/// dependency crosses the core boundary. The key cannot be a `UNIQUE` column on
+/// an `ALTER TABLE ADD COLUMN` (SQLite forbids it), so the column is added plain,
+/// back-filled from `root` to preserve today's one-project-per-path behavior for
+/// every existing row, then a unique index enforces distinctness going forward.
+///
+/// Guarded like the other column migrations against dev-database drift: the
+/// `ADD COLUMN` runs through [`add_column_if_missing`] and the index is
+/// `IF NOT EXISTS`, so a database that ran an in-development V10 binary before its
+/// `user_version` bump landed upgrades cleanly. The back-fill only touches rows
+/// whose `identity` is still NULL, so it is safe to re-run.
+fn apply_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "projects", "identity", "TEXT")?;
+    conn.execute_batch(
+        "UPDATE projects SET identity = root WHERE identity IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_identity ON projects(identity);",
+    )
 }
 
 /// True if a table named `table` exists. Used by migrations that must stay
@@ -926,6 +959,100 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert!(table_exists(&conn, "notes").unwrap());
+    }
+
+    #[test]
+    fn v9_database_upgrades_to_v10_backfilling_identity_from_root() {
+        // Stand up a V9 database with two projects, then migrate. V10 adds the
+        // `identity` column and back-fills it from each row's `root`, preserving
+        // today's one-project-per-path identity for every pre-existing row.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        apply_v8(&conn).unwrap();
+        apply_v9(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, next_id) VALUES (1, '/a', 1);
+             INSERT INTO projects (id, root, next_id) VALUES (2, '/b', 1);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Every pre-V10 row's identity is back-filled from its root.
+        let mut stmt = conn
+            .prepare("SELECT root, identity FROM projects ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("/a".to_string(), "/a".to_string()),
+                ("/b".to_string(), "/b".to_string()),
+            ]
+        );
+
+        // The unique index rejects a second row reusing an existing identity,
+        // even when its root (projection path) differs.
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, identity) VALUES (3, '/b-worktree', '/b');",
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn v10_migration_tolerates_a_transitional_database_with_identity_already_present() {
+        // The drift case the column migrations guard against: an in-development
+        // V10 binary added the column + index but did not bump `user_version`,
+        // so the database reports V9 yet already carries `identity`. `migrate`
+        // should finish cleanly instead of failing on a duplicate column/index.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        apply_v8(&conn).unwrap();
+        apply_v9(&conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE projects ADD COLUMN identity TEXT;
+             CREATE UNIQUE INDEX idx_projects_identity ON projects(identity);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn.execute_batch("INSERT INTO projects (id, root) VALUES (1, '/x');")
+            .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The back-fill still runs for the row inserted with a NULL identity.
+        let identity: String = conn
+            .query_row("SELECT identity FROM projects WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(identity, "/x");
     }
 
     #[test]

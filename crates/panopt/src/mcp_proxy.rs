@@ -72,11 +72,30 @@ pub fn run(
     host: String,
     port: u16,
     ws: PathBuf,
+    project: Option<String>,
     id: String,
     name: String,
     token: String,
 ) -> Result<()> {
-    let url = build_url(&host, port, &ws, &id, &name, &token);
+    // Resolve the project identity here, at the edge: an explicit `--project`
+    // wins, otherwise derive it from the workspace (committed `.panopt/project-id`
+    // -> remote URL -> root commit -> path; see `project_identity`). Resolving in
+    // the proxy means every spawned agent - cockpit-templated or hand-launched -
+    // sends a stable repo identity to the daemon, and the daemon never needs git.
+    // An empty `--project` (an unset `${PANOPT_PROJECT}` in the cockpit template)
+    // falls through to derivation rather than poisoning the key.
+    let project = match project.filter(|p| !p.is_empty()) {
+        Some(p) => p,
+        None => {
+            let resolved = crate::project_identity::resolve(&ws);
+            eprintln!(
+                "panopt-proxy: derived project identity {:?} (via {:?})",
+                resolved.key, resolved.source
+            );
+            resolved.key
+        }
+    };
+    let url = build_url(&host, port, &ws, &project, &id, &name, &token);
     let mut backend = Backend::new(url, id, name);
 
     // Eagerly bring up the panoptd session so the agent registers in the
@@ -120,11 +139,20 @@ pub fn run(
     Ok(())
 }
 
-fn build_url(host: &str, port: u16, ws: &Path, id: &str, name: &str, token: &str) -> String {
+fn build_url(
+    host: &str,
+    port: u16,
+    ws: &Path,
+    project: &str,
+    id: &str,
+    name: &str,
+    token: &str,
+) -> String {
     let encode = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
     format!(
-        "http://{host}:{port}/mcp?ws={}&agent={}&name={}&token={}",
+        "http://{host}:{port}/mcp?ws={}&project={}&agent={}&name={}&token={}",
         encode(&ws.to_string_lossy()),
+        encode(project),
         encode(id),
         encode(name),
         encode(token),
@@ -394,6 +422,7 @@ mod tests {
             "127.0.0.1",
             7600,
             Path::new("/tmp/with spaces"),
+            "github.com/acme/widget",
             "user-host",
             "Display Name",
             "tok/en+with=stuff",
@@ -401,6 +430,10 @@ mod tests {
         // Slashes, spaces, and special URL characters must be escaped so a
         // malformed query string cannot break the request.
         assert!(url.contains("ws=%2Ftmp%2Fwith%20spaces"), "{url}");
+        assert!(
+            url.contains("project=github%2Ecom%2Facme%2Fwidget"),
+            "{url}"
+        );
         assert!(url.contains("name=Display%20Name"), "{url}");
         assert!(url.contains("token=tok%2Fen%2Bwith%3Dstuff"), "{url}");
     }

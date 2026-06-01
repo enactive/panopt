@@ -430,12 +430,19 @@ fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     )
 }
 
-/// Resolve the project for a request from the `ws` query parameter on the MCP
-/// server URL.
+/// Resolve the project for a request from its `ws` and optional `project` query
+/// parameters.
 ///
-/// Agents register PANopt per project with `?ws=<project path>` appended to the
-/// URL, so the daemon scopes every call without inferring anything. The path is
-/// percent-decoded, so workspace paths containing spaces survive the round trip.
+/// `ws` is the projection location - the checkout whose `.panopt/*.md` mirror the
+/// daemon writes - and is always required. `project` is the opaque repo identity
+/// key, resolved at the edge (the proxy / agent-config) so no git dependency
+/// crosses into the daemon. When `project` is present the daemon keys the project
+/// on it, so two checkouts of one repo - at different paths or on different
+/// machines - share one project row. When it is absent the daemon falls back to
+/// path identity, exactly the pre-identity behavior, which keeps path-only
+/// clients (an older proxy, a direct `?ws=` caller) working unchanged.
+///
+/// Both values are percent-decoded, so paths with spaces survive the round trip.
 fn resolve_project(store: &mut Store, parts: &Parts) -> Result<ProjectId, McpError> {
     let path = query_param(parts.uri.query(), "ws").ok_or_else(|| {
         McpError::invalid_params(
@@ -443,9 +450,12 @@ fn resolve_project(store: &mut Store, parts: &Parts) -> Result<ProjectId, McpErr
             None,
         )
     })?;
-    store
-        .ensure_project(std::path::Path::new(&path))
-        .map_err(map_core_err)
+    let ws = std::path::Path::new(&path);
+    match query_param(parts.uri.query(), "project").filter(|p| !p.is_empty()) {
+        Some(identity) => store.ensure_project_by_identity(&identity, ws),
+        None => store.ensure_project(ws),
+    }
+    .map_err(map_core_err)
 }
 
 /// The calling agent's stable key and the source it came from.

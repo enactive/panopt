@@ -270,19 +270,51 @@ daemon host, `panopt token` to extract the token, and `panopt agent-config
 --host <addr> --token <value>` on the agent host - lives in the README.
 
 There is one daemon instance, and it serves every project at once. A project
-is selected per connection by a `ws` query parameter on the MCP URL:
-`http://HOST:PORT/mcp?ws=<absolute project path>&agent=<id>&name=<friendly>&token=<token>`.
-An agent's launcher (cockpit-spawned or `panopt agent-config` for
-hand-launched) captures that path from `$PWD`, so registration is the moment
-the project is named - the daemon never has to guess. The daemon
-canonicalizes the path, so symlinks and trailing slashes collapse onto one
-project, and distinct git worktrees are distinct projects unless deliberately
-pointed at the same path. The URL also carries an `agent` parameter (a
-stable per-agent id used as the registry key) and an optional `name`
-parameter that the daemon applies as an implicit `identify` on first sight,
-so a single URL is enough to land an agent as a first-class citizen
-(Sections 6.3 and 9). Every project's state lives in one SQLite database the
-daemon owns (Section 6.4).
+is selected per connection by two query parameters on the MCP URL, which
+deliberately split two roles an earlier design conflated (note #123, todo
+#124):
+`http://HOST:PORT/mcp?ws=<absolute project path>&project=<identity>&agent=<id>&name=<friendly>&token=<token>`.
+
+- **`ws` is the projection location** - the checkout whose `.panopt/*.md`
+  mirror this connection reads and writes. It is inherently path-bound and is
+  always required. The daemon canonicalizes it, so symlinks and trailing
+  slashes collapse.
+- **`project` is the identity** - an opaque, stable repo key the daemon uses
+  as the database key, so the project a connection joins is decoupled from
+  where it happens to be checked out. Two checkouts of one repo - at different
+  paths, in separate worktrees, or on different machines - share one project
+  row when they resolve to the same identity. When `project` is omitted the
+  daemon falls back to keying on the canonical `ws` path (the original
+  behavior), so a path-only client still works.
+
+Identity is resolved **at the edge** - the proxy/`agent-config`, never the
+daemon - so no git dependency crosses into `panopt-core`; to the daemon the key
+is an opaque string. The resolver is a fallback chain, first match wins:
+
+1. a `.panopt/project-id` (a UUID) committed in the tree - authoritative;
+2. else the normalized remote origin URL;
+3. else the root-commit hash;
+4. else the canonical `ws` path (a non-git directory).
+
+Identity is **not** derived purely from git, because git cannot answer the
+real question. A fork shares its upstream's entire history, so they have an
+identical root-commit hash - deriving identity from it would silently merge a
+fork into its upstream. "Same project?" is human intent, not data, so the
+committed `project-id` sits on top of the chain: `panopt project init` writes
+(or rewrites) it, which is how a fork declares itself separate and how any tree
+opts into an id that travels with it. The file is the one thing under
+`.panopt/` that is committed rather than ignored (the projection `.gitignore`
+is `*\n!project-id\n`).
+
+The cross-project switcher (todo #120) builds on this: a project row keys on
+repo identity and lists its *checkouts* (the paths/sessions) beneath it, rather
+than presenting each checkout as its own project.
+
+The URL also carries an `agent` parameter (a stable per-agent id used as the
+registry key) and an optional `name` parameter that the daemon applies as an
+implicit `identify` on first sight, so a single URL is enough to land an agent
+as a first-class citizen (Sections 6.3 and 9). Every project's state lives in
+one SQLite database the daemon owns (Section 6.4).
 
 ### 5.4 Coordination plane (agents to daemon)
 

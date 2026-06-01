@@ -115,11 +115,17 @@ pub fn run(ws: Option<PathBuf>, cmd: TodoCmd, port: u16) -> Result<()> {
 pub(crate) fn observer_url(ws: Option<PathBuf>, port: u16) -> Result<String> {
     let ws = resolve_ws(ws)?;
     let encoded_ws = utf8_percent_encode(&ws.to_string_lossy(), NON_ALPHANUMERIC).to_string();
+    // Resolve the project identity at this edge - the same way the agent proxy
+    // does - so the daemon keys on the repo identity for *any* client, not just
+    // Claude-spawned agents. For a project with a committed `.panopt/project-id`
+    // this is a cheap file read; only a git repo with no declared id shells git.
+    let project = crate::project_identity::resolve(&ws).key;
+    let encoded_project = utf8_percent_encode(&project, NON_ALPHANUMERIC).to_string();
     let token = panopt_core::auth::read_token(&paths::token()?)
         .context("reading the panopt token (start the daemon with `panopt up`)")?;
     let encoded_token = utf8_percent_encode(&token, NON_ALPHANUMERIC).to_string();
     Ok(format!(
-        "http://127.0.0.1:{port}/mcp?ws={encoded_ws}&observer=1&token={encoded_token}"
+        "http://127.0.0.1:{port}/mcp?ws={encoded_ws}&project={encoded_project}&observer=1&token={encoded_token}"
     ))
 }
 

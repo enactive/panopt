@@ -5,7 +5,8 @@
 //! then forwards everything to panoptd over HTTP and reconnects across
 //! daemon restarts so Claude Code's session stays up. `claude` expands
 //! `${PANOPT_BIN}` / `${PANOPT_HOST}` / `${PANOPT_PORT}` / `${PANOPT_WS}` /
-//! `${PANOPT_AGENT}` / `${PANOPT_NAME}` / `${PANOPT_TOKEN}` from the
+//! `${PANOPT_PROJECT}` / `${PANOPT_AGENT}` / `${PANOPT_NAME}` /
+//! `${PANOPT_TOKEN}` from the
 //! per-pane environment when it reads the file, so a single file gives
 //! each agent a distinct stable identity, a friendly display name, and
 //! the bearer token the daemon requires (DESIGN.md Sections 5.3 and 9).
@@ -32,6 +33,7 @@ const AGENT_MCP_JSON: &str = r#"{
         "_mcp-proxy",
         "--host", "${PANOPT_HOST:-127.0.0.1}",
         "--ws", "${PANOPT_WS}",
+        "--project", "${PANOPT_PROJECT}",
         "--id", "${PANOPT_AGENT}",
         "--name", "${PANOPT_NAME}",
         "--token", "${PANOPT_TOKEN}"
@@ -80,6 +82,7 @@ mod tests {
             "${PANOPT_PORT",
             "${PANOPT_HOST",
             "${PANOPT_WS}",
+            "${PANOPT_PROJECT}",
             "${PANOPT_AGENT}",
             "${PANOPT_NAME}",
             "${PANOPT_TOKEN}",
