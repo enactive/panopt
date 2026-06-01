@@ -1,0 +1,17 @@
+what PO agents are attacthed?
+
+---
+
+modify the just devagent command to take agent name as an argument instead of using 'greg-main'
+
+---
+
+call agent-list
+
+---
+
+it's not working.  there should be two agents since I opened a second one with 'just devagent entirely'
+
+---
+
+call agent-list
