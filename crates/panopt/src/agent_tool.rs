@@ -39,7 +39,8 @@ pub enum AgentToolCmd {
         /// Working directory for the launched command.
         #[arg(long)]
         cwd: Option<String>,
-        /// Free-form tag for categorization. Defaults to "agent".
+        /// Agent-type profile key (e.g. "claude-code"). Must name a known
+        /// profile; defaults to claude-code when omitted.
         #[arg(long = "tool-type")]
         tool_type: Option<String>,
     },

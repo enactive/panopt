@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::agent_profiles::{ProfileSet, DEFAULT_PROFILE_KEY};
 use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
@@ -69,6 +70,11 @@ fn sanitized_basename(root: &str) -> String {
 /// re-projection that follows it complete with no other writer interleaving.
 pub struct Store {
     conn: Connection,
+    /// The agent-type profile registry, loaded once at [`Store::open`]. Used to
+    /// validate an `agent_tools.tool_type` against the known profiles - an
+    /// application-level check standing in for the SQL foreign key the
+    /// file-backed registry cannot provide.
+    profiles: ProfileSet,
     /// In-memory roster of connected agents. Not persisted - see [`Registry`].
     registry: Registry,
     /// In-memory advisory locks. Not persisted - see [`Locks`].
@@ -88,8 +94,12 @@ impl Store {
         let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         db::migrate(&conn)?;
+        // Fail fast at startup if a shipped or override profile is malformed,
+        // rather than at the first agent_tool write or spawn.
+        let profiles = ProfileSet::load()?;
         Ok(Self {
             conn,
+            profiles,
             registry: Registry::default(),
             locks: Locks::default(),
             reprojected: HashSet::new(),
@@ -745,6 +755,42 @@ impl Store {
 
     // --- agent_tools ---
 
+    /// Whether `tool_type` names a known agent-type profile. The check surfaces
+    /// (the config form's type dropdown, the spawn path) use to stay within the
+    /// registry.
+    pub fn known_tool_type(&self, tool_type: &str) -> bool {
+        self.profiles.contains(tool_type)
+    }
+
+    /// The known agent-type keys, sorted - the choices a config form offers.
+    pub fn agent_types(&self) -> Vec<String> {
+        self.profiles.keys().map(str::to_owned).collect()
+    }
+
+    /// Reject a `tool_type` with no profile in the registry. The
+    /// application-level stand-in for the foreign key the file-backed registry
+    /// cannot provide.
+    fn validate_tool_type(&self, tool_type: &str) -> Result<(), CoreError> {
+        if self.profiles.contains(tool_type) {
+            Ok(())
+        } else {
+            Err(CoreError::UnknownToolType(tool_type.to_string()))
+        }
+    }
+
+    /// Map the legacy `tool_type='agent'` sentinel (and empty) onto the default
+    /// profile key on read. V11 rewrites these in the database; this is the
+    /// cheap safety net for a restored or un-migrated database where V11 never
+    /// ran. A *specific* but unknown key is left as-is so the UI can flag it as
+    /// a dangling reference rather than having it silently masked.
+    fn normalize_tool_type(raw: String) -> String {
+        if raw.is_empty() || raw == "agent" {
+            DEFAULT_PROFILE_KEY.to_string()
+        } else {
+            raw
+        }
+    }
+
     /// Create an agent tool (configuration) in `project` and return its id.
     /// `position` defaults to the new id so tools sort by creation order
     /// while staying reorderable.
@@ -759,6 +805,7 @@ impl Store {
         tool_type: String,
         enabled: bool,
     ) -> Result<u64, CoreError> {
+        self.validate_tool_type(&tool_type)?;
         let pid = project.0;
         let id = {
             let tx = self.conn.transaction()?;
@@ -806,7 +853,7 @@ impl Store {
                 display_name: r.get(2)?,
                 command: r.get(3)?,
                 cwd: r.get(4)?,
-                tool_type: r.get(5)?,
+                tool_type: Self::normalize_tool_type(r.get(5)?),
                 enabled: r.get::<_, i64>(6)? != 0,
                 position: r.get(7)?,
                 created_at: r.get(8)?,
@@ -842,6 +889,7 @@ impl Store {
             entry.cwd = v;
         }
         if let Some(v) = patch.tool_type {
+            self.validate_tool_type(&v)?;
             entry.tool_type = v;
         }
         if let Some(v) = patch.enabled {
@@ -901,7 +949,7 @@ impl Store {
                         display_name: r.get(1)?,
                         command: r.get(2)?,
                         cwd: r.get(3)?,
-                        tool_type: r.get(4)?,
+                        tool_type: Self::normalize_tool_type(r.get(4)?),
                         enabled: r.get::<_, i64>(5)? != 0,
                         position: r.get(6)?,
                         created_at: r.get(7)?,
@@ -1991,7 +2039,7 @@ mod tests {
                     String::new(),
                     String::new(),
                     String::new(),
-                    "agent".into(),
+                    "claude-code".into(),
                     true,
                 )
                 .unwrap(),
@@ -2046,7 +2094,7 @@ mod tests {
                 String::new(),
                 "claude".into(),
                 String::new(),
-                "agent".into(),
+                "claude-code".into(),
                 true,
             )
             .unwrap();
@@ -2078,7 +2126,7 @@ mod tests {
                 String::new(),
                 "claude".into(),
                 String::new(),
-                "agent".into(),
+                "claude-code".into(),
                 true,
             )
             .unwrap();
@@ -2977,7 +3025,7 @@ mod tests {
                 "Mediator".into(),
                 "claude --model sonnet".into(),
                 String::new(),
-                "agent".into(),
+                "claude-code".into(),
                 true,
             )
             .unwrap();
@@ -3014,6 +3062,98 @@ mod tests {
             fx.store.agent_tool_delete(p, id),
             Err(CoreError::AgentToolNotFound(_))
         ));
+    }
+
+    #[test]
+    fn agent_tool_create_validates_tool_type_against_the_registry() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+
+        // A known profile key is accepted.
+        assert!(fx
+            .store
+            .agent_tool_create(
+                p,
+                "ok".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "claude-code".into(),
+                true,
+            )
+            .is_ok());
+
+        // An unknown key is rejected with a typed, caller-fixable error.
+        let err = fx
+            .store
+            .agent_tool_create(
+                p,
+                "bad".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "no-such-type".into(),
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(err, CoreError::UnknownToolType(t) if t == "no-such-type"));
+    }
+
+    #[test]
+    fn agent_tool_update_validates_a_changed_tool_type() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        let id = fx
+            .store
+            .agent_tool_create(
+                p,
+                "t".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "claude-code".into(),
+                true,
+            )
+            .unwrap();
+
+        // Retyping to an unknown profile is rejected...
+        let err = fx
+            .store
+            .agent_tool_update(
+                p,
+                id,
+                AgentToolPatch {
+                    tool_type: Some("ghost".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, CoreError::UnknownToolType(_)));
+
+        // ...while a known retype, and a patch that leaves tool_type alone, both
+        // succeed.
+        assert!(fx
+            .store
+            .agent_tool_update(
+                p,
+                id,
+                AgentToolPatch {
+                    tool_type: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            )
+            .is_ok());
+        assert!(fx
+            .store
+            .agent_tool_update(
+                p,
+                id,
+                AgentToolPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .is_ok());
     }
 
     #[test]

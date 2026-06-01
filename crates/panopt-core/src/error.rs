@@ -30,6 +30,17 @@ pub enum CoreError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// An `agent_tools.tool_type` named a type with no profile in the loaded
+    /// registry. The registry lives in a file, not the database, so this is an
+    /// application-level check, not a SQL foreign key (see `agent_profiles`).
+    #[error("unknown agent type '{0}': not a known profile")]
+    UnknownToolType(String),
+
+    /// The agent-type profiles failed to load (parse error or a bad placeholder
+    /// in a shipped/override profile). Fails the daemon at startup.
+    #[error("agent profiles: {0}")]
+    Profiles(#[from] crate::agent_profiles::ProfileError),
+
     /// No project row exists with the given internal id. Indicates a stale
     /// [`crate::ProjectId`] used after its row vanished - a bug, not a user
     /// error.

@@ -437,11 +437,14 @@ fn map_core_err(e: CoreError) -> McpError {
         | CoreError::AgentToolNotFound(_)
         | CoreError::ProcessNotFound(_)
         | CoreError::BadRequest(_)
+        | CoreError::UnknownToolType(_)
         | CoreError::Workspace(_) => McpError::invalid_params(e.to_string(), None),
-        // Internal: a stale project handle, a database fault, or a failed write.
-        CoreError::ProjectNotFound(_) | CoreError::Db(_) | CoreError::Projection(_) => {
-            McpError::internal_error(e.to_string(), None)
-        }
+        // Internal: a stale project handle, a database fault, a failed write, or
+        // malformed agent profiles (normally caught at startup, not per-call).
+        CoreError::ProjectNotFound(_)
+        | CoreError::Db(_)
+        | CoreError::Projection(_)
+        | CoreError::Profiles(_) => McpError::internal_error(e.to_string(), None),
     }
 }
 
@@ -1208,7 +1211,8 @@ impl Handler {
                 args.display_name.unwrap_or_default(),
                 args.command.unwrap_or_default(),
                 args.cwd.unwrap_or_default(),
-                args.tool_type.unwrap_or_else(|| "agent".to_string()),
+                args.tool_type
+                    .unwrap_or_else(|| panopt_core::agent_profiles::DEFAULT_PROFILE_KEY.to_string()),
                 args.enabled.unwrap_or(true),
             )
             .map_err(map_core_err)?

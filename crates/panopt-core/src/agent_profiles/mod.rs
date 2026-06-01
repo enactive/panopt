@@ -46,6 +46,13 @@ pub use status::{StatusError, StatusMatcher};
 /// The shipped default profile set, compiled into the binary.
 const DEFAULTS_TOML: &str = include_str!("defaults.toml");
 
+/// The profile a config defaults to when none is chosen, and the key the V11
+/// migration rewrites the legacy `tool_type='agent'` sentinel to. Lives here so
+/// the default agent type is named in exactly one place (db.rs binds it, the
+/// handler falls back to it, the read-time safety net maps stale values onto
+/// it). claude-code is the only agent PANopt has ever launched.
+pub const DEFAULT_PROFILE_KEY: &str = "claude-code";
+
 /// The facts the spawn interpreter can substitute into a spawn template. A
 /// `{{placeholder}}` naming anything outside this set (other than
 /// `{{file:NAME}}`) is rejected at load. The spawn interpreter (#137) is the

@@ -525,13 +525,28 @@ PANopt splits a project's launchable agents and commands across two tables, a
 config layer and an instance layer, mirroring Solo's two-layer model:
 
 - **`agent_tools`** - durable per-project configurations: name, command, cwd,
-  a free-form `tool_type`, and an `enabled` flag controlling whether the
-  config is offered in spawn UIs. One tool can back many running instances.
+  a `tool_type` that names an agent-type profile (Section 6.7), and an
+  `enabled` flag controlling whether the config is offered in spawn UIs. One
+  tool can back many running instances. Because the profile registry lives in
+  a file, not a table, `tool_type` cannot be a SQL foreign key; it is validated
+  at the application layer (`Store::agent_tool_create`/`_update` reject a key
+  with no profile), and a row left referencing a since-removed profile is
+  flagged in the UI rather than hard-failing.
 - **`processes`** - per-project instances of an agent, command, or terminal:
   `kind` (`agent` / `command` / `terminal`), name, command, cwd, an optional
   `agent_tool_id` back-reference, plus nullable lifecycle columns (`pid`,
-  `status`, `agent_state`, `last_seen`) reserved for a future follow-up that
-  owns spawn lifecycle.
+  `status`, `agent_state`, `last_seen`).
+
+A `processes` row's columns divide into two roles - a spec/status split. The
+**desired** (spec) columns are copied from the source config at spawn - `kind`,
+`name`, `command`, `cwd`, and the `agent_tool_id` back-reference - and a later
+edit to the tool does not perturb them. The **runtime** (status) columns -
+`pid`, `status`, `agent_state`, `last_seen` - are written by the lifecycle
+layer while the instance runs and are NULL when it is not. The config is what
+*should* run; the row's runtime columns are what *is* running; the two may
+legitimately diverge (edited-but-not-restarted, crashed, never-started). This is
+why config and instance stay distinct even at today's one-instance-per-config:
+run-level identity is where a session or plan attaches, not the durable slot.
 
 The split lets a project carry two Claude instances both spawned from agent
 tool `#3`, with each instance addressable by its own `#N`. When a process is

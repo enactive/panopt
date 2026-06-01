@@ -11,9 +11,11 @@
 
 use rusqlite::Connection;
 
+use crate::agent_profiles::DEFAULT_PROFILE_KEY;
+
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -298,6 +300,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 10 {
         apply_v10(conn)?;
     }
+    if version < 11 {
+        apply_v11(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -380,6 +385,65 @@ fn apply_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "UPDATE projects SET identity = root WHERE identity IS NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_identity ON projects(identity);",
+    )
+}
+
+/// Version 11: `agent_tools.tool_type` becomes a key into the agent-type
+/// profile registry rather than a free-form category (todo #139).
+///
+/// Through V10 the column was `TEXT NOT NULL DEFAULT 'agent'` and every row
+/// carried the coarse sentinel `'agent'` (V6 set it; nothing ever changed it).
+/// The agent model now treats `tool_type` as the *key* of a profile
+/// ([`crate::agent_profiles`]) - `claude-code`, `codex`, ... - so the sentinel
+/// has to become a real key. PANopt has only ever launched claude (the pane
+/// wrapper runs `claude`), so the data is uniformly one type and the rewrite is
+/// safe and data-grounded.
+///
+/// Two steps, conservative:
+/// 1. Rewrite only the exact `'agent'` sentinel to [`DEFAULT_PROFILE_KEY`];
+///    any already-specific key (a hand-set value) is left untouched.
+/// 2. Rebuild the table to drop `DEFAULT 'agent'`, so a future insert must
+///    supply a real key (the config form always does) instead of silently
+///    re-introducing the sentinel. SQLite cannot `ALTER COLUMN`, so dropping a
+///    default means the 12-step table rebuild; `agent_tools` is referenced by
+///    no foreign key (`processes.agent_tool_id` is a plain INTEGER), so the
+///    rebuild needs no `foreign_keys` dance and no index recreation.
+///
+/// Validation that a `tool_type` names a *known* profile is application-level
+/// (in `state::Store`), not a SQL foreign key - the registry lives in a file,
+/// not a table, so the database cannot constrain against it.
+fn apply_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Step 1: rewrite the legacy sentinel. Bound, not interpolated, and sourced
+    // from the one Rust constant that names the default profile.
+    conn.execute(
+        "UPDATE agent_tools SET tool_type = ?1 WHERE tool_type = 'agent'",
+        [DEFAULT_PROFILE_KEY],
+    )?;
+    // Step 2: rebuild without the `DEFAULT 'agent'`. Column set mirrors the V6
+    // create plus the V7 `deleted_at`.
+    conn.execute_batch(
+        "CREATE TABLE agent_tools_new (
+             project_id   INTEGER NOT NULL REFERENCES projects(id),
+             id           INTEGER NOT NULL,
+             name         TEXT    NOT NULL,
+             display_name TEXT    NOT NULL DEFAULT '',
+             command      TEXT    NOT NULL DEFAULT '',
+             cwd          TEXT    NOT NULL DEFAULT '',
+             tool_type    TEXT    NOT NULL,
+             enabled      INTEGER NOT NULL DEFAULT 1,
+             position     INTEGER NOT NULL DEFAULT 0,
+             created_at   TEXT    NOT NULL,
+             deleted_at   TEXT,
+             PRIMARY KEY (project_id, id)
+         );
+         INSERT INTO agent_tools_new
+             (project_id, id, name, display_name, command, cwd, tool_type,
+              enabled, position, created_at, deleted_at)
+             SELECT project_id, id, name, display_name, command, cwd, tool_type,
+                    enabled, position, created_at, deleted_at
+               FROM agent_tools;
+         DROP TABLE agent_tools;
+         ALTER TABLE agent_tools_new RENAME TO agent_tools;",
     )
 }
 
@@ -466,8 +530,8 @@ mod tests {
         migrate(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO projects (id, root) VALUES (1, '/x');
-             INSERT INTO agent_tools (project_id, id, name, created_at)
-                 VALUES (1, 1, 'Claude', '');
+             INSERT INTO agent_tools (project_id, id, name, tool_type, created_at)
+                 VALUES (1, 1, 'Claude', 'claude-code', '');
              INSERT INTO processes (project_id, id, kind, name, agent_tool_id, created_at)
                  VALUES (1, 2, 'agent', 'claude-1', 1, '');",
         )
@@ -598,8 +662,8 @@ mod tests {
         // The post-V6 tables and the unified counter all exist; the old
         // `roster` table is gone.
         conn.execute_batch(
-            "INSERT INTO agent_tools (project_id, id, name, created_at)
-                 VALUES (1, 1, 'Run', '');
+            "INSERT INTO agent_tools (project_id, id, name, tool_type, created_at)
+                 VALUES (1, 1, 'Run', 'claude-code', '');
              INSERT INTO processes (project_id, id, kind, name, created_at)
                  VALUES (1, 2, 'command', 'Run', '');",
         )
@@ -737,7 +801,8 @@ mod tests {
             .unwrap();
         assert_eq!(tool_id, 1);
         assert_eq!(tool_name, "claude");
-        assert_eq!(tool_type, "agent");
+        // V11 rewrites the legacy 'agent' sentinel to the default profile key.
+        assert_eq!(tool_type, DEFAULT_PROFILE_KEY);
         assert_eq!(enabled, 1, "migrated agent tools default to enabled");
 
         // The command + terminal rows landed in processes at their original
@@ -824,6 +889,63 @@ mod tests {
                 .unwrap();
             assert_eq!(alive, 1, "{table} row survives V7 migration as live");
         }
+    }
+
+    #[test]
+    fn v11_rewrites_legacy_tool_type_and_drops_default() {
+        // Stand up a V10 database, populate agent_tools with the legacy 'agent'
+        // sentinel (via the V6 column default) alongside an already-specific
+        // key, then let V11 run.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        apply_v8(&conn).unwrap();
+        apply_v9(&conn).unwrap();
+        apply_v10(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 10).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO projects (id, root, identity) VALUES (1, '/x', '/x');
+             -- legacy row: omit tool_type so the V6 DEFAULT 'agent' applies
+             INSERT INTO agent_tools (project_id, id, name, created_at)
+                 VALUES (1, 1, 'legacy', '');
+             -- already-specific row: must be left untouched by the rewrite
+             INSERT INTO agent_tools (project_id, id, name, tool_type, created_at)
+                 VALUES (1, 2, 'specific', 'codex', '');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The sentinel is rewritten to the default profile key; the specific
+        // key is conserved.
+        let legacy: String = conn
+            .query_row("SELECT tool_type FROM agent_tools WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy, DEFAULT_PROFILE_KEY);
+        let specific: String = conn
+            .query_row("SELECT tool_type FROM agent_tools WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(specific, "codex");
+
+        // The DEFAULT 'agent' is gone: an insert omitting tool_type now fails
+        // the NOT NULL constraint rather than silently re-introducing it.
+        let omitted = conn.execute_batch(
+            "INSERT INTO agent_tools (project_id, id, name, created_at) VALUES (1, 3, 'x', '');",
+        );
+        assert!(
+            omitted.is_err(),
+            "tool_type DEFAULT 'agent' must be dropped"
+        );
     }
 
     #[test]
