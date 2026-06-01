@@ -1,0 +1,40 @@
+which todos relates to refining the agents model? separating agent instance and agent profiles.
+
+---
+
+are #27 and #83 duplicate? if so, let's reconcile (?) them. if not. why not?
+
+---
+
+yes, add the cross-reference comments.  need to address agent instance life cycle and how it relates to the UI.  where shoud that go? or is it already present?
+
+---
+
+I'd like a clean ordering of
+
+---
+
+I'd like a clean ordering of
+- create plumbing / structure for both agent configs and agent instances
+- create form for creating/editing agent configs
+- modify ui to start/stop/report agent instances
+
+in fact, there are probably *three* levels...  
+- agent types (claude code, codex, pi, opencode, etc): this holds all info necessary to interop with each specific agent type
+- agent configs: this is a slot in the project's agents pane that can be lifecycle-managed and with further configuration.
+- agent instances: the actual running agents one-per-config 
+
+there's some question about whether configs and instances need to be different by this def.  they map one-to-one.
+discuss.
+
+---
+
+think hard about type being only code.  I have to believe that there's some need for runtime config at this level.. ?
+
+---
+
+disagree on launch mechanism.  sb data.
+
+---
+
+ready to lay out the todos.  use as many as you think necessary.  find the natural breaks...
