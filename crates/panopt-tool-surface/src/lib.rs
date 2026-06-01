@@ -171,7 +171,10 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
     },
     ToolDef {
         name: "todo_create",
-        description: "Create a new todo with a title. Returns its numeric id.",
+        description: "Create a new todo. Only title is required; body, status, \
+                      priority, assignee, and tags are optional and fall back to \
+                      sensible defaults (empty body, open, medium, unassigned, no \
+                      tags). Returns its numeric id.",
         schema_fn: schema_for::<TodoCreateArgs>,
     },
     ToolDef {

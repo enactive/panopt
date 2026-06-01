@@ -832,10 +832,39 @@ impl Handler {
         parts: Parts,
         args: TodoCreateArgs,
     ) -> Result<CallToolResult, McpError> {
+        // Validate the enum-valued fields up front so a bad status/priority
+        // never leaves an orphaned half-created todo behind.
+        let status = match &args.status {
+            Some(s) => Some(parse_status(s)?),
+            None => None,
+        };
+        let priority = match &args.priority {
+            Some(p) => Some(parse_priority(p)?),
+            None => None,
+        };
+        // Every field but title is optional and the schema defaults the rest;
+        // only touch the freshly-created row when the caller supplied extras.
+        let patch = TodoPatch {
+            title: None,
+            body: args.body,
+            status,
+            priority,
+            assignee: args.assignee,
+            tags: args.tags,
+        };
+        let has_extras = patch.body.is_some()
+            || patch.status.is_some()
+            || patch.priority.is_some()
+            || patch.assignee.is_some()
+            || patch.tags.is_some();
         let id = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            st.todo_create(project, args.title).map_err(map_core_err)?
+            let id = st.todo_create(project, args.title).map_err(map_core_err)?;
+            if has_extras {
+                st.todo_update(project, id, patch).map_err(map_core_err)?;
+            }
+            id
         };
         Ok(CallToolResult::success(vec![Content::text(id.to_string())]))
     }

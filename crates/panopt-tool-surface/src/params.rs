@@ -79,6 +79,22 @@ pub struct NoteSearchArgs {
 pub struct TodoCreateArgs {
     /// Short description of the todo.
     pub title: String,
+    /// Free-form description body. Omit for an empty body.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Initial status: one of open, in_progress, backlog, draft, completed,
+    /// not_done. Omit to default to open.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Priority: one of high, medium, low. Omit to default to medium.
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Assignee name. Omit to leave unassigned.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// Initial tag list. Omit for no tags.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
