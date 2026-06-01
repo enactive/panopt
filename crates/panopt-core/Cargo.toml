@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
 dirs = "5"
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
