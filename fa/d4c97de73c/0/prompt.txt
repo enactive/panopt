@@ -1,0 +1,17 @@
+do #151
+
+---
+
+no.  now I just did /q in a claude agent pane - the only pane on the right, and it opened a *new* empty pane on the right....
+
+---
+
+Just a question, don't change anything, but can't you simply, before you close a window, look to see how many windows are left? And if there's only one, then do the right thing.
+
+---
+
+Yeah, but slash queue in a particular app doesn't actually close the pane. So why is that a blocker?
+
+---
+
+Look, the original problem here was that when I did Control-C, it didn't work. Now you're talking about Slash-Q. I don't care if Slash-Q leaves a husk if subsequently I have to do a Control-C to close it and that triggers the check. That's fine.
