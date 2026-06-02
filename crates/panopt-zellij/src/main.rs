@@ -225,6 +225,13 @@ struct PanoptPane {
     /// every manifest tick. Only the Todos pane writes it; `None` until the
     /// first publish.
     last_content_count: Option<usize>,
+    /// Whether this instance has ever seen a live content pane in the manifest.
+    /// Gates [`PanoptPane::ensure_content_slot`] so the reclaim only fires on a
+    /// real drop-to-zero (a pane the user had, now gone or dead) and never at
+    /// boot, where a PaneUpdate can momentarily show zero content before the
+    /// layout's `--slot main` viewer is registered - acting there would race a
+    /// duplicate pane in front of the real one.
+    has_had_content: bool,
 
     /// Monotonic version of the presentation state this instance has published
     /// to the per-mode shared view file (todo #116). `mirror_session` mirrors
@@ -1063,6 +1070,7 @@ impl PanoptPane {
                 .map(|p| p.id);
         }
         self.publish_content_count();
+        self.ensure_content_slot();
         self.sync_pane_titles();
     }
 
@@ -1952,6 +1960,16 @@ impl PanoptPane {
             self.refuse_gate("cannot create panes from the sidebar");
             return;
         }
+        self.spawn_blank_viewer();
+    }
+
+    /// Spawn a fresh empty `_viewer` pane with its own routing slot, no gate.
+    /// Split out of [`Self::spawn_blank_pane`] so the content floor can summon
+    /// a replacement pane even when focus has fallen to the sidebar (where the
+    /// `spawn_blank_pane` gate refuses) - the floor only reaches here when the
+    /// session has no suppressed pane to resurface, so a fresh one is the only
+    /// way to stop the sidebar expanding to full width.
+    fn spawn_blank_viewer(&mut self) {
         let Some(ws) = self.launch_cwd() else {
             return;
         };
@@ -2029,7 +2047,7 @@ impl PanoptPane {
         // (focus falls to the sidebar, where pane creation is refused). Refuse
         // the explicit keybind close cleanly here, same shape as the sidebar
         // refusal above and ahead of the active-work dialog whose confirm path
-        // would otherwise bypass this. `ensure_content_floor` is the safety net
+        // would otherwise bypass this. `ensure_content_slot` is the safety net
         // for the close paths a keybind gate cannot see (Ctrl-c, exit, crash).
         if self.content_pane_count() <= 1 {
             self.refuse_gate("cannot close the last content pane");
@@ -2230,6 +2248,62 @@ impl PanoptPane {
             .iter()
             .filter(|p| !p.floating && !p.exited)
             .count()
+    }
+
+    /// Count the *live* content panes drawn on the right: not floating (an
+    /// overlay, not the content slot), not suppressed (running but hidden
+    /// behind a swapped-in pane), and not exited. The exited exclusion is the
+    /// subtle one - a `panopt _agent`/`_viewer` is a Zellij command pane, so
+    /// when its command exits (e.g. `/q` in an agent) the pane does not close,
+    /// it lingers drawn showing the exit status. That husk holds its tile, so
+    /// the sidebar does not expand, but it is dead content: not a slot the user
+    /// can do anything with. When this count hits zero the right side has no
+    /// usable pane - either nothing at all (full-width sidebar) or only a husk -
+    /// and [`Self::ensure_content_slot`] reclaims it. Distinct from
+    /// `content_pane_count`, which counts suppressed panes (a hidden-but-
+    /// swappable pane is still a reason to refuse a *deliberate* close) but is
+    /// only used to gate that close.
+    fn live_content_pane_count(&self) -> usize {
+        self.panes
+            .iter()
+            .filter(|p| !p.floating && !p.suppressed && !p.exited)
+            .count()
+    }
+
+    /// Keep exactly one live, usable content pane on the right. Covers the
+    /// close paths neither the keybind gate nor the viewer's in-pane gate can
+    /// see: an agent `/q`/exit leaving a dead husk, a crash, or a swap that
+    /// suppressed the boot viewer behind a pane the user then closed - and the
+    /// outright-empty case (#151) where Zellij would re-tile the sidebar to
+    /// full width with no obvious way back.
+    ///
+    /// When no live content is drawn, hand off to [`Self::clear_slot`], which
+    /// routes a viewer to `empty` and swaps it into the slot *in place of*
+    /// whatever sits there - replacing a dead husk by suppressing it (never
+    /// closing it: the plugin-never-closes-panes invariant holds), reusing the
+    /// suppressed boot viewer when one exists, or spawning a fresh empty viewer
+    /// only as a last resort. The result is always one clean empty pane, never
+    /// a second pane beside the husk.
+    ///
+    /// Reads only this instance's own live manifest, so it is correct even if a
+    /// stale `content-count` file from another cockpit session on the same
+    /// project is misleading. Gatekeeper-only, like the other session-wide
+    /// projections, so the five instances don't all react to the same manifest.
+    fn ensure_content_slot(&mut self) {
+        if self.mode != Mode::Todos || !self.permitted {
+            return;
+        }
+        if self.live_content_pane_count() > 0 {
+            self.has_had_content = true;
+            return;
+        }
+        // Zero before we have ever seen content is the cockpit still booting
+        // the layout's `--slot main` viewer, not a drop - acting here would
+        // race a duplicate pane in front of the real one. Wait for it.
+        if !self.has_had_content {
+            return;
+        }
+        self.clear_slot();
     }
 
     /// Publish [`Self::content_pane_count`] to [`CONTENT_COUNT_PATH`] so each
@@ -2675,6 +2749,112 @@ mod tests {
         );
         sidebar.ingest_panes(PaneManifest { panes });
         assert_eq!(sidebar.slot_pane, Some(PaneId::Terminal(7)));
+    }
+
+    #[test]
+    fn live_content_count_excludes_suppressed_panes() {
+        use std::collections::HashMap;
+        // A visible agent in front of the suppressed boot viewer. The whole-
+        // session count (which gates the deliberate close) sees both; the live
+        // count (which the reclaim watches) sees only the agent - a hidden pane
+        // does nothing to stop the sidebar expanding.
+        let mut panes = HashMap::new();
+        panes.insert(
+            0usize,
+            vec![
+                PaneInfo {
+                    id: 3,
+                    is_selectable: true,
+                    is_suppressed: true,
+                    terminal_command: Some(
+                        "/bin/panopt _viewer --slot main --port 7600".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                PaneInfo {
+                    id: 9,
+                    is_selectable: true,
+                    terminal_command: Some("/bin/panopt _agent --id a".to_string()),
+                    ..Default::default()
+                },
+            ],
+        );
+        let mut sidebar = pane_with(Mode::Todos);
+        sidebar.ingest_panes(PaneManifest { panes });
+        assert_eq!(sidebar.content_pane_count(), 2);
+        assert_eq!(sidebar.live_content_pane_count(), 1);
+    }
+
+    #[test]
+    fn exited_husk_is_not_live_content() {
+        use std::collections::HashMap;
+        // `/q` in an agent pane exits its command, but the `_agent` command
+        // pane does not close - it lingers drawn, showing the exit status. It
+        // holds its tile (so the sidebar does not expand) but it is dead: not a
+        // usable slot. The live count must therefore read zero so the reclaim
+        // fires and swaps a clean empty viewer in over the husk - rather than a
+        // stale husk being mistaken for usable content and left on screen.
+        let mut panes = HashMap::new();
+        panes.insert(
+            0usize,
+            vec![
+                PaneInfo {
+                    id: 9,
+                    is_selectable: true,
+                    exited: true,
+                    terminal_command: Some("/bin/panopt _agent --id a".to_string()),
+                    ..Default::default()
+                },
+                PaneInfo {
+                    id: 3,
+                    is_selectable: true,
+                    is_suppressed: true,
+                    terminal_command: Some(
+                        "/bin/panopt _viewer --slot main --port 7600".to_string(),
+                    ),
+                    ..Default::default()
+                },
+            ],
+        );
+        let mut sidebar = pane_with(Mode::Todos);
+        sidebar.ingest_panes(PaneManifest { panes });
+        // The husk is excluded from the deliberate-close count (it is gone as
+        // far as swappable content goes)...
+        assert_eq!(sidebar.content_pane_count(), 1);
+        // ...and it is not live content either, so the reclaim treats the right
+        // side as having no usable pane and steps in.
+        assert_eq!(sidebar.live_content_pane_count(), 0);
+        // The boot viewer is still around (suppressed) for `clear_slot` to swap
+        // back over the husk.
+        assert_eq!(sidebar.first_suppressed_viewer(), Some(PaneId::Terminal(3)));
+    }
+
+    #[test]
+    fn floor_waits_for_the_boot_viewer_before_arming() {
+        use std::collections::HashMap;
+        // A PaneUpdate can arrive with zero content before the layout's
+        // `--slot main` viewer is registered. The floor must not arm then
+        // (spawning would duplicate the boot viewer); `has_had_content` stays
+        // false until a visible content pane is actually seen, and flips once
+        // one is.
+        let mut sidebar = pane_with(Mode::Todos);
+        sidebar.ingest_panes(PaneManifest {
+            panes: HashMap::new(),
+        });
+        assert!(!sidebar.has_had_content);
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            0usize,
+            vec![PaneInfo {
+                id: 3,
+                is_selectable: true,
+                terminal_command: Some("/bin/panopt _viewer --slot main --port 7600".to_string()),
+                ..Default::default()
+            }],
+        );
+        sidebar.ingest_panes(PaneManifest { panes });
+        assert!(sidebar.has_had_content);
     }
 
     #[test]
