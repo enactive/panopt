@@ -119,9 +119,7 @@ impl Target {
     fn content_path(&self, ws: &Path) -> Option<PathBuf> {
         let panopt = ws.join(".panopt");
         match self {
-            Target::Todo(_) | Target::NewTodo | Target::Note(_) | Target::NewNote => {
-                None
-            }
+            Target::Todo(_) | Target::NewTodo | Target::Note(_) | Target::NewNote => None,
             Target::TodoList => Some(panopt.join("todos.md")),
             Target::NoteList => Some(panopt.join("notes.md")),
             Target::Empty => None,
@@ -181,15 +179,17 @@ struct ListEntry {
 /// What subset of todos the list view shows. Applied to a todo `ListEntry`'s
 /// `status` and `is_blocked`; non-todo entries are always shown.
 ///
-/// `OpenUnblocked` is the default because that is the working set most of the
-/// time - todos ready to pick up, with no upstream work waiting. The user
-/// cycles through the other variants with `f` / `F` in the list view.
+/// `Active` is the default because that is the working set most of the time -
+/// todos ready to pick up (open, no upstream work waiting) together with the
+/// ones already in progress, so starting a todo doesn't make it vanish from
+/// the default view. The user cycles through the other variants with `f` / `F`
+/// in the list view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum TodoFilter {
     All,
     Open,
     #[default]
-    OpenUnblocked,
+    Active,
     InProgress,
     Backlog,
     Draft,
@@ -203,7 +203,7 @@ impl TodoFilter {
         match self {
             TodoFilter::All => "all",
             TodoFilter::Open => "open",
-            TodoFilter::OpenUnblocked => "open-unblocked",
+            TodoFilter::Active => "active",
             TodoFilter::InProgress => "in_progress",
             TodoFilter::Backlog => "backlog",
             TodoFilter::Draft => "draft",
@@ -250,7 +250,9 @@ impl TodoFilter {
         match self {
             TodoFilter::All => true,
             TodoFilter::Open => status == "open",
-            TodoFilter::OpenUnblocked => status == "open" && !entry.is_blocked,
+            TodoFilter::Active => {
+                (status == "open" && !entry.is_blocked) || status == "in_progress"
+            }
             TodoFilter::InProgress => status == "in_progress",
             TodoFilter::Backlog => status == "backlog",
             TodoFilter::Draft => status == "draft",
@@ -265,7 +267,7 @@ impl TodoFilter {
 const ALL_FILTERS: [TodoFilter; 8] = [
     TodoFilter::All,
     TodoFilter::Open,
-    TodoFilter::OpenUnblocked,
+    TodoFilter::Active,
     TodoFilter::InProgress,
     TodoFilter::Backlog,
     TodoFilter::Draft,
@@ -1046,9 +1048,7 @@ impl Viewer {
                 }
                 Err(e) => Content::Message(format!("could not load todo #{id}: {e:#}")),
             },
-            Target::NewNote => {
-                Content::NoteForm(Box::new(NoteForm::blank(&self.url)))
-            }
+            Target::NewNote => Content::NoteForm(Box::new(NoteForm::blank(&self.url))),
             Target::Note(id) => match load_note(&self.url, *id) {
                 Ok(pad) => {
                     let tags: Vec<String> = pad["tags"]
@@ -1075,13 +1075,11 @@ impl Viewer {
                 Ok(entries) => Content::List(entries),
                 // Fall back to the projection: it carries less detail (no
                 // blocker info), but it keeps the pane useful when the
-                // daemon is unreachable. The `open-unblocked` filter is
-                // approximated as `open` in this mode.
+                // daemon is unreachable. The open-unblocked half of the
+                // `active` filter is approximated as `open` in this mode.
                 Err(_) => Content::List(read_todo_index(path.as_deref())),
             },
-            Target::NoteList => {
-                Content::List(read_index(path.as_deref(), Target::Note))
-            }
+            Target::NoteList => Content::List(read_index(path.as_deref(), Target::Note)),
         };
         self.clamp();
     }
@@ -1294,8 +1292,8 @@ fn read_index(path: Option<&Path>, into_target: impl Fn(u64) -> Target) -> Vec<L
 /// `todo_list` fails. Each line carries the status token (parsed out of the
 /// `- <status>, <priority>` suffix the projection writes), but blocker info
 /// is absent here - the projection does not record blockers per-line. With
-/// no blocker info, `OpenUnblocked` degrades to "open" (we never hide a
-/// todo whose blocker state we cannot determine).
+/// no blocker info, the open-unblocked half of `Active` degrades to "open"
+/// (we never hide a todo whose blocker state we cannot determine).
 fn read_todo_index(path: Option<&Path>) -> Vec<ListEntry> {
     let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {
         return Vec::new();
@@ -1487,10 +1485,7 @@ mod tests {
     fn target_parse_and_key_round_trip() {
         assert_eq!(Target::parse("todo", Some(4)), Some(Target::Todo(4)));
         assert_eq!(Target::parse("new-todo", None), Some(Target::NewTodo));
-        assert_eq!(
-            Target::parse("note-list", None),
-            Some(Target::NoteList)
-        );
+        assert_eq!(Target::parse("note-list", None), Some(Target::NoteList));
         assert_eq!(Target::parse("empty", None), Some(Target::Empty));
         assert_eq!(Target::parse("todo", None), None);
         assert_eq!(Target::Todo(4).key(), "todo:4");
@@ -1528,14 +1523,8 @@ mod tests {
 
     #[test]
     fn parse_recognizes_new_note() {
-        assert_eq!(
-            Target::parse("new-note", None),
-            Some(Target::NewNote)
-        );
-        assert_eq!(
-            Target::parse("note", Some(7)),
-            Some(Target::Note(7))
-        );
+        assert_eq!(Target::parse("new-note", None), Some(Target::NewNote));
+        assert_eq!(Target::parse("note", Some(7)), Some(Target::Note(7)));
     }
 
     /// A viewer with `n` list entries and the given viewport height, used to
@@ -1692,17 +1681,17 @@ mod tests {
     }
 
     #[test]
-    fn open_unblocked_hides_blocked_open_todos_and_other_statuses() {
+    fn active_shows_unblocked_open_and_in_progress() {
         let viewer = viewer_with_statuses(
             &[
-                ("open", false),        // visible
+                ("open", false),        // visible: open & unblocked
                 ("open", true),         // hidden: blocked
-                ("in_progress", false), // hidden: wrong status
-                ("completed", false),   // hidden: wrong status
+                ("in_progress", false), // visible: already in progress
+                ("completed", false),   // hidden: terminal status
             ],
-            TodoFilter::OpenUnblocked,
+            TodoFilter::Active,
         );
-        assert_eq!(viewer.visible_indices(), vec![0]);
+        assert_eq!(viewer.visible_indices(), vec![0, 2]);
     }
 
     #[test]

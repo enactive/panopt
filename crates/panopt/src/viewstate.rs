@@ -22,7 +22,7 @@ pub struct ViewState {
     /// Selected row, for a navigable list.
     pub cursor: usize,
     /// Free-form per-target hints, e.g. the todo list's status filter. The
-    /// shape is `{ "todo_filter": "open-unblocked" }`; unknown keys are
+    /// shape is `{ "todo_filter": "active" }`; unknown keys are
     /// ignored on read so adding new ones is safe.
     pub extras: serde_json::Map<String, Value>,
 }

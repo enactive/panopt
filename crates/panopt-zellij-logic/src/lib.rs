@@ -101,18 +101,19 @@ impl Mode {
 /// Status filter applied to the Todos pane. Each variant matches a wire
 /// token from the projection's `- <status>, <priority>` suffix.
 ///
-/// `OpenUnblocked` is the default working-set filter, but the sidebar reads
-/// only the projection (no MCP), and the index doesn't carry blocker info;
-/// in this pane `OpenUnblocked` degrades to "open" until the projection
-/// learns to record blockers per row. The viewer pane on the right uses MCP
-/// and applies the full blocker-aware filter, so the precise unblocked
-/// view is available there.
+/// `Active` is the default working-set filter: the todos you can actually act
+/// on right now - open-and-unblocked, plus whatever is already in progress.
+/// The sidebar reads only the projection (no MCP), and the index doesn't
+/// carry blocker info; in this pane the open-unblocked half of `Active`
+/// degrades to plain "open" until the projection learns to record blockers
+/// per row. The viewer pane on the right uses MCP and applies the full
+/// blocker-aware filter, so the precise unblocked view is available there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TodoFilter {
     All,
     Open,
     #[default]
-    OpenUnblocked,
+    Active,
     InProgress,
     Backlog,
     Draft,
@@ -123,7 +124,7 @@ pub enum TodoFilter {
 pub const ALL_TODO_FILTERS: [TodoFilter; 8] = [
     TodoFilter::All,
     TodoFilter::Open,
-    TodoFilter::OpenUnblocked,
+    TodoFilter::Active,
     TodoFilter::InProgress,
     TodoFilter::Backlog,
     TodoFilter::Draft,
@@ -136,7 +137,7 @@ impl TodoFilter {
         match self {
             TodoFilter::All => "all",
             TodoFilter::Open => "open",
-            TodoFilter::OpenUnblocked => "open-unblocked",
+            TodoFilter::Active => "active",
             TodoFilter::InProgress => "in_progress",
             TodoFilter::Backlog => "backlog",
             TodoFilter::Draft => "draft",
@@ -163,7 +164,8 @@ impl TodoFilter {
 
     /// Whether the projection-index label passes this filter. The label is
     /// the trailing text after the link, e.g. `"the title - open, high"`.
-    /// Without blocker info, `OpenUnblocked` is approximated as `Open`.
+    /// Without blocker info, the open-unblocked half of `Active` is
+    /// approximated as plain "open".
     pub fn includes_label(self, label: &str) -> bool {
         if matches!(self, TodoFilter::All) {
             return true;
@@ -175,7 +177,8 @@ impl TodoFilter {
         };
         match self {
             TodoFilter::All => true,
-            TodoFilter::Open | TodoFilter::OpenUnblocked => status == "open",
+            TodoFilter::Open => status == "open",
+            TodoFilter::Active => status == "open" || status == "in_progress",
             TodoFilter::InProgress => status == "in_progress",
             TodoFilter::Backlog => status == "backlog",
             TodoFilter::Draft => status == "draft",
@@ -272,7 +275,7 @@ pub fn parse_updated_suffix(label: &str) -> Option<&str> {
 /// is lexicographically orderable). The `Created` axes still degrade to
 /// **id order**, which is correct given per-project ids are monotonic and
 /// never reused: `id asc ≡ creation order asc`. This mirrors the existing
-/// `OpenUnblocked → Open` degradation in [`TodoFilter::includes_label`].
+/// `Active → open|in_progress` degradation in [`TodoFilter::includes_label`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TodoSort {
     #[default]
