@@ -231,6 +231,30 @@ impl ProcessKind {
     }
 }
 
+/// The lifecycle status values a [`Process`] row carries in its free-form
+/// `status` column (todo #141). Centralized here so the daemon, the edge
+/// wrapper, and the cockpit plugin all agree on the literals rather than each
+/// spelling `"running"` inline. The column stays a plain string (no SQL CHECK)
+/// to keep migrations forward-only; these are the values panopt itself writes.
+///
+/// The progression is `STARTING` (daemon wrote the desired-state row, no pane
+/// yet) -> `RUNNING` (the edge wrapper reported a live pid) and, on the stop
+/// path, `STOPPED` (the process was signalled; its pane is left standing).
+/// `EXITED` (pane death detected by the plugin) is reserved for the liveness
+/// child (#142) and is defined but not driven here.
+pub mod process_status {
+    /// Desired-state row written by `process_start`; awaiting a reconciler.
+    pub const STARTING: &str = "starting";
+    /// The edge wrapper reported a live pid for this instance.
+    pub const RUNNING: &str = "running";
+    /// `process_stop` signalled the process; the pane is left standing.
+    pub const STOPPED: &str = "stopped";
+    /// Pane death observed (reserved for #142; not written here). Allowed to be
+    /// unused until the liveness child consumes it.
+    #[allow(dead_code)]
+    pub const EXITED: &str = "exited";
+}
+
 /// A durable, per-project agent configuration: the "what to launch" half of
 /// the two-layer process model (todo #27). One tool can back many running
 /// [`Process`] instances. Modeled on a row of Solo's `agent_tools` table.
@@ -305,10 +329,17 @@ pub struct Process {
     /// that have no backing tool. Deleting a tool sets this to `None`
     /// (ON DELETE SET NULL) so the live instance keeps running.
     pub agent_tool_id: Option<u64>,
-    /// OS process id, populated only once panoptd owns the spawn lifecycle.
+    /// OS process id, reported by the edge wrapper at spawn (todo #141). The
+    /// pid survives the wrapper's `exec` into the agent, so it identifies the
+    /// live process for `process_stop` to signal.
     pub pid: Option<i64>,
-    /// Free-form lifecycle status (`"running"`, `"exited"`, ...). `None`
-    /// until lifecycle ownership lands.
+    /// Opaque pane identifier reported best-effort by the cockpit plugin once
+    /// it reconciles a `starting` row into a Zellij pane (todo #141). Used for
+    /// focus/management; not the liveness anchor (the pid is).
+    pub pane_id: Option<String>,
+    /// Free-form lifecycle status, one of [`process_status`]. `None` for rows
+    /// created before lifecycle ownership (`process_create`) - only
+    /// `process_start` and the report/stop paths populate it.
     pub status: Option<String>,
     /// Free-form agent state (`"idle"`, `"thinking"`, `"planning"`),
     /// produced by a future TUI-parsing layer.
@@ -331,6 +362,7 @@ pub struct ProcessPatch {
     pub position: Option<i64>,
     pub agent_tool_id: Option<Option<u64>>,
     pub pid: Option<Option<i64>>,
+    pub pane_id: Option<Option<String>>,
     pub status: Option<Option<String>>,
     pub agent_state: Option<Option<String>>,
     pub last_seen: Option<Option<String>>,

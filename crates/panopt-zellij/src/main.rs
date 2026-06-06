@@ -167,6 +167,16 @@ struct PanoptPane {
     /// label is what the human sees, this is what the daemon knows.
     agent_pane_ids: BTreeMap<u32, String>,
 
+    /// Process ids the gatekeeper has already reconciled into a pane, keyed by
+    /// process id -> the terminal pane it spawned (todo #141). A daemon-owned
+    /// `starting` row is reconciled into a `_process-run` pane exactly once;
+    /// this guards the window between the spawn and the next pane manifest
+    /// (where [`Self::process_pane`] can't yet see the new pane) so a single
+    /// start can't fan out into a pile of duplicate panes. Pruned to the live
+    /// process set each poll. Only the Todos gatekeeper populates it, so the
+    /// five plugin instances don't each spawn the same row.
+    reconciled_panes: BTreeMap<u64, u32>,
+
     /// Whether any plugin pane is currently the focused pane in its tab.
     /// Updated by [`PanoptPane::ingest_panes`] but only from a non-transient
     /// manifest: a transient `zellij action pipe` pane briefly steals focus
@@ -405,6 +415,10 @@ impl ZellijPlugin for PanoptPane {
                 }
                 self.reload_data();
                 self.rebuild_items();
+                // Turn any daemon-owned `starting` row into a live pane. Driven
+                // off the same 1s poll that refreshed `self.processes`, gated to
+                // the Todos gatekeeper inside the method.
+                self.reconcile_starting_processes();
                 // PaneUpdate-driven `sync_pane_titles` only fires when Zellij
                 // sends a pane manifest - typing into the form does not. Without
                 // this call, every right-pane title (most visibly a freshly
@@ -1846,6 +1860,71 @@ impl PanoptPane {
             id.to_string(),
         ];
         self.spawn_in_slot(args, focus);
+    }
+
+    /// Reconcile daemon-owned `starting` process rows into panes (todo #141).
+    ///
+    /// panoptd writes a `starting` row as the *desired* state; this gatekeeper
+    /// is the effector that turns it into a live Zellij pane by spawning the
+    /// same `_process-run` shim a manual activation uses. That shim resolves the
+    /// spawn plan and reports its pid (flipping the row to `running`); here we
+    /// report the pane it landed in. Each row is reconciled exactly once
+    /// (`reconciled_panes` guards the gap before the new pane shows up in the
+    /// manifest), and only by the Todos gatekeeper, so a single start yields a
+    /// single pane rather than one per plugin instance.
+    ///
+    /// Stop is deliberately *not* reconciled: `process_stop` kills the process
+    /// and leaves the pane standing (the plugin never closes panes), so a
+    /// `stopped` row needs no pane action.
+    fn reconcile_starting_processes(&mut self) {
+        if self.mode != Mode::Todos || !self.permitted {
+            return;
+        }
+        // Prune entries whose row is gone. A stopped instance restarts under a
+        // fresh id (the daemon never reuses one), so a pruned id never returns.
+        let live: Vec<u64> = self.processes.iter().map(|r| r.id).collect();
+        self.reconciled_panes.retain(|id, _| live.contains(id));
+
+        let starting: Vec<u64> = self
+            .processes
+            .iter()
+            .filter(|r| r.status.as_deref() == Some("starting"))
+            .map(|r| r.id)
+            .collect();
+        for id in starting {
+            if self.reconciled_panes.contains_key(&id) || self.process_pane(id).is_some() {
+                continue;
+            }
+            let id_str = id.to_string();
+            let args = vec![
+                "_process-run".to_string(),
+                "--port".to_string(),
+                self.port.clone(),
+                id_str.clone(),
+            ];
+            // Reconcile in the background - a new instance appearing must not
+            // yank keyboard focus off whatever pane the user is in.
+            if let Some(PaneId::Terminal(tid)) = self.spawn_in_slot(args, false) {
+                self.reconciled_panes.insert(id, tid);
+                // Hand the daemon the pane the instance landed in. The pid is
+                // reported separately by the in-pane shim; this is best-effort.
+                if let Some(cwd) = self.launch_cwd() {
+                    let tid_str = tid.to_string();
+                    self.run_panopt(
+                        &[
+                            "_process-report",
+                            "--port",
+                            self.port.as_str(),
+                            "--id",
+                            id_str.as_str(),
+                            "--pane-id",
+                            tid_str.as_str(),
+                        ],
+                        cwd,
+                    );
+                }
+            }
+        }
     }
 
     fn route_pane_to_slot(&mut self, pane: PaneId, focus: bool) {

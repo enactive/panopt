@@ -27,6 +27,17 @@ pub fn mcp_config() -> Result<PathBuf> {
     Ok(config_dir()?.join("agent-mcp.json"))
 }
 
+/// A per-instance scratch directory the spawn-spec interpreter (`build_launch`)
+/// materializes a process's `files` into (e.g. a rendered MCP config). Keyed by
+/// the process id so concurrently-started instances don't clobber each other's
+/// files, and stable across a re-run of the same pane so the file path the
+/// agent reads stays valid. Created on demand.
+pub fn instance_dir(id: u64) -> Result<PathBuf> {
+    let dir = data_dir()?.join("instances").join(id.to_string());
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// Where the launcher writes `panoptd`'s log when it starts the daemon.
 pub fn daemon_log() -> Result<PathBuf> {
     Ok(data_dir()?.join("panoptd.log"))

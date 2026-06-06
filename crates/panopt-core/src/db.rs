@@ -15,7 +15,7 @@ use crate::agent_profiles::DEFAULT_PROFILE_KEY;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -303,6 +303,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 11 {
         apply_v11(conn)?;
     }
+    if version < 12 {
+        apply_v12(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -445,6 +448,22 @@ fn apply_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
          DROP TABLE agent_tools;
          ALTER TABLE agent_tools_new RENAME TO agent_tools;",
     )
+}
+
+/// Version 12: instance lifecycle ownership (todo #141).
+///
+/// `process_start` now writes a desired-state `processes` row that a reconciler
+/// turns into a live pane; the edge wrapper reports its pid and the cockpit
+/// plugin reports the Zellij pane it landed in. The pid already had a column
+/// (reserved in V6); the pane identifier did not, so V12 adds `pane_id`. It is
+/// nullable and opaque to core - the plugin chooses the value (today a Zellij
+/// terminal id), core only stores and projects it.
+///
+/// Guarded like the other column migrations against dev-database drift via
+/// [`add_column_if_missing`], so a database that ran an in-development V12
+/// binary before its `user_version` bump landed upgrades cleanly.
+fn apply_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "processes", "pane_id", "TEXT")
 }
 
 /// True if a table named `table` exists. Used by migrations that must stay

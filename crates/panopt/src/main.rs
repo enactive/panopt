@@ -217,6 +217,18 @@ enum Cmd {
         /// Numeric id of the process to start.
         id: u64,
     },
+    /// Internal: report the pane a reconciled instance landed in.
+    #[command(name = "_process-report", hide = true)]
+    ProcessReport {
+        #[arg(long)]
+        ws: Option<PathBuf>,
+        /// Numeric id of the process being reported on.
+        #[arg(long)]
+        id: u64,
+        /// Opaque pane identifier (the Zellij terminal id) to record.
+        #[arg(long = "pane-id")]
+        pane_id: String,
+    },
     /// Internal: a long-lived cockpit viewer pane.
     #[command(name = "_viewer", hide = true)]
     ViewerExec {
@@ -299,6 +311,7 @@ fn main() -> anyhow::Result<()> {
             token,
         } => mcp_proxy::run(host, cli.port, ws, project, id, name, token),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
+        Cmd::ProcessReport { ws, id, pane_id } => process::exec_report(ws, id, pane_id, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
         Cmd::CloseGateExec {
             scope,

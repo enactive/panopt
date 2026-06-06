@@ -25,7 +25,8 @@ use panopt_core::{
 use panopt_tool_surface::params::{
     AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
     IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs,
-    ProcessGetArgs, ProcessUpdateArgs, NoteAppendArgs, NoteCreateArgs,
+    ProcessGetArgs, ProcessReportArgs, ProcessStartArgs, ProcessStopArgs, ProcessUpdateArgs,
+    NoteAppendArgs, NoteCreateArgs,
     NoteDeleteArgs, NoteGetArgs, NoteReadArgs, NoteSearchArgs,
     NoteUpdateArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs,
     TodoCommentUpdateArgs, TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs,
@@ -266,6 +267,7 @@ struct ProcessDto {
     position: i64,
     agent_tool_id: Option<u64>,
     pid: Option<i64>,
+    pane_id: Option<String>,
     status: Option<String>,
     agent_state: Option<String>,
     last_seen: Option<String>,
@@ -284,6 +286,7 @@ impl ProcessDto {
             position: p.position,
             agent_tool_id: p.agent_tool_id,
             pid: p.pid,
+            pane_id: p.pane_id,
             status: p.status,
             agent_state: p.agent_state,
             last_seen: p.last_seen,
@@ -610,6 +613,19 @@ fn parse_process_kind(s: &str) -> Result<ProcessKind, McpError> {
             None,
         )
     })
+}
+
+/// Send `SIGTERM` to `pid`, best-effort. Used by `process_stop` to terminate a
+/// co-located instance whose pid the state layer handed back. A failure (the
+/// process already exited, or it lives on another host the daemon can't reach -
+/// the documented remote wrinkle) is intentionally ignored: the row is already
+/// marked `stopped`, and the goal is to leave the pane standing regardless.
+fn signal_terminate(pid: i64) {
+    // SAFETY: `kill` is a plain libc call with no memory effects; a bad pid
+    // just returns -1/ESRCH, which we discard.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
 }
 
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
@@ -1374,6 +1390,63 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
+    async fn process_start(
+        &self,
+        parts: Parts,
+        args: ProcessStartArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            ProcessDto::from_entry(
+                st.process_start(project, args.agent_tool_id)
+                    .map_err(map_core_err)?,
+            )
+        };
+        json_result(&dto)
+    }
+
+    async fn process_report(
+        &self,
+        parts: Parts,
+        args: ProcessReportArgs,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.process_report(
+                project,
+                args.process_id,
+                args.pid,
+                args.pane_id,
+                args.agent_state,
+            )
+            .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    async fn process_stop(
+        &self,
+        parts: Parts,
+        args: ProcessStopArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let pid = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.process_stop(project, args.process_id)
+                .map_err(map_core_err)?
+        };
+        // The state layer stays pure: it flips the row to `stopped` and hands
+        // back the pid to signal. Sending the signal is a host effect, so it
+        // lives here. Best-effort and co-located - a remote-host instance (the
+        // documented wrinkle) just won't be reachable by this kill.
+        if let Some(pid) = pid {
+            signal_terminate(pid);
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
     async fn id_kind(&self, parts: Parts, args: IdKindArgs) -> Result<CallToolResult, McpError> {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
@@ -1452,6 +1525,9 @@ enum Tool {
     ProcessGet,
     ProcessUpdate,
     ProcessDelete,
+    ProcessStart,
+    ProcessStop,
+    ProcessReport,
     IdKind,
     ProjectList,
 }
@@ -1502,6 +1578,9 @@ impl Tool {
             "process_get" => Tool::ProcessGet,
             "process_update" => Tool::ProcessUpdate,
             "process_delete" => Tool::ProcessDelete,
+            "process_start" => Tool::ProcessStart,
+            "process_stop" => Tool::ProcessStop,
+            "process_report" => Tool::ProcessReport,
             "id_kind" => Tool::IdKind,
             "project_list" => Tool::ProjectList,
             _ => return None,
@@ -1700,6 +1779,18 @@ async fn dispatch_local<'a>(
         Tool::ProcessDelete => {
             let args: ProcessDeleteArgs = parse_json_object(raw_args)?;
             handler.process_delete(parts, args).await
+        }
+        Tool::ProcessStart => {
+            let args: ProcessStartArgs = parse_json_object(raw_args)?;
+            handler.process_start(parts, args).await
+        }
+        Tool::ProcessStop => {
+            let args: ProcessStopArgs = parse_json_object(raw_args)?;
+            handler.process_stop(parts, args).await
+        }
+        Tool::ProcessReport => {
+            let args: ProcessReportArgs = parse_json_object(raw_args)?;
+            handler.process_report(parts, args).await
         }
         Tool::IdKind => {
             let args: IdKindArgs = parse_json_object(raw_args)?;

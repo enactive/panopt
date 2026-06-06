@@ -352,6 +352,31 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         schema_fn: schema_for::<ProcessDeleteArgs>,
     },
     ToolDef {
+        name: "process_start",
+        description: "Start an instance of an agent config (the instance lifecycle). \
+                      Writes a desired-state process row in `starting` that the cockpit \
+                      reconciles into a live pane; the daemon never spawns the pane \
+                      itself. One live instance per config: if one is already starting or \
+                      running, that row is returned instead of spawning a second. Returns \
+                      the process row as JSON.",
+        schema_fn: schema_for::<ProcessStartArgs>,
+    },
+    ToolDef {
+        name: "process_stop",
+        description: "Stop a running instance: signal its process and flip the row to \
+                      `stopped`. The pane is left standing (panopt owns processes; Zellij \
+                      and the user own panes).",
+        schema_fn: schema_for::<ProcessStopArgs>,
+    },
+    ToolDef {
+        name: "process_report",
+        description: "Report runtime facts for an instance from its executing host: the \
+                      edge wrapper reports `pid` (which flips the row to `running`), the \
+                      cockpit plugin reports `pane_id`. Fields are individually optional \
+                      so the two reporters can call independently.",
+        schema_fn: schema_for::<ProcessReportArgs>,
+    },
+    ToolDef {
         name: "project_list",
         description: "List every project the daemon knows about - the cross-project board. \
                       Unlike every other tool, this is NOT scoped to the connection's \

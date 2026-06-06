@@ -22,3 +22,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
+libc = "0.2"

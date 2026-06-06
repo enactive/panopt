@@ -248,9 +248,11 @@ pub(crate) fn render_agent_tools_md(tools: &[AgentTool]) -> String {
 
 /// Render the processes projection as a markdown list, one line per instance:
 /// kind, id, and label, with a trailing `(from #N)` for processes that carry
-/// a back-reference to an agent tool. The line format preserves the shape the
-/// cockpit plugin already parses for the pre-V6 roster file, so the existing
-/// `(kind, id, label)` tuple keeps decoding cleanly.
+/// a back-reference to an agent tool, and a trailing ` · <status>` once the row
+/// has a lifecycle status (todo #141). The leading `[kind] #id label (from #N)`
+/// shape is preserved so the cockpit plugin's existing parser keeps decoding
+/// the `(kind, id, label)` tuple cleanly; the status suffix is what lets the
+/// plugin reconcile a `starting` row into a pane off this projection alone.
 pub(crate) fn render_processes_md(processes: &[Process]) -> String {
     let mut out = String::from("# Processes\n\n");
     if processes.is_empty() {
@@ -269,12 +271,17 @@ pub(crate) fn render_processes_md(processes: &[Process]) -> String {
             Some(tid) => format!(" (from #{tid})"),
             None => String::new(),
         };
+        let status_suffix = match p.status.as_deref() {
+            Some(s) if !s.is_empty() => format!(" · {s}"),
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "- [{}] #{} {}{}\n",
+            "- [{}] #{} {}{}{}\n",
             p.kind.as_str(),
             p.id,
             label,
-            tool_suffix
+            tool_suffix,
+            status_suffix
         ));
     }
     out
@@ -829,6 +836,34 @@ mod tests {
             "# Processes\n\n\
              - [agent] #1 Mediator (from #7)\n\
              - [command] #2 Run server\n"
+        );
+    }
+
+    #[test]
+    fn processes_render_lifecycle_status_suffix() {
+        let processes = vec![
+            Process {
+                id: 1,
+                kind: ProcessKind::Agent,
+                display_name: "Mediator".into(),
+                agent_tool_id: Some(7),
+                status: Some("starting".into()),
+                ..Default::default()
+            },
+            Process {
+                id: 2,
+                kind: ProcessKind::Agent,
+                display_name: "Worker".into(),
+                agent_tool_id: Some(8),
+                status: Some("running".into()),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            render_processes_md(&processes),
+            "# Processes\n\n\
+             - [agent] #1 Mediator (from #7) · starting\n\
+             - [agent] #2 Worker (from #8) · running\n"
         );
     }
 

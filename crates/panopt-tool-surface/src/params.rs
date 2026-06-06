@@ -357,6 +357,36 @@ pub struct ProcessDeleteArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProcessStartArgs {
+    /// Numeric id of the agent config (agent_tool) to start an instance of.
+    pub agent_tool_id: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProcessStopArgs {
+    /// Numeric id of the process (instance) to stop.
+    pub process_id: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProcessReportArgs {
+    /// Numeric id of the process (instance) being reported on.
+    pub process_id: u64,
+    /// OS process id of the live instance. Setting it flips the row to
+    /// `running`. Reported by the edge wrapper, whose pid survives its exec
+    /// into the agent.
+    #[serde(default)]
+    pub pid: Option<i64>,
+    /// Opaque identifier of the pane the instance landed in. Reported
+    /// best-effort by the cockpit plugin. Omit to leave unchanged.
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    /// Latest derived agent activity state. Omit to leave unchanged.
+    #[serde(default)]
+    pub agent_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct IdentifyArgs {
     /// Human-readable name for this agent, shown to others in the registry.
     pub name: String,

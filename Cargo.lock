@@ -1130,6 +1130,7 @@ dependencies = [
  "clap",
  "dirs",
  "http",
+ "libc",
  "panopt-core",
  "panopt-tool-surface",
  "percent-encoding",

@@ -364,11 +364,16 @@ impl TodoSort {
 
 /// A parsed `.panopt/processes.md` line. The line format is preserved from
 /// the pre-V6 `roster.md` so the existing `[kind] #id label` parser still
-/// works; any trailing `(from #N)` is dropped from `label`.
+/// works; any trailing `(from #N)` is dropped from `label` and any trailing
+/// ` · <status>` (todo #141) is lifted into `status`.
 pub struct ProcessRow {
     pub kind: String,
     pub id: u64,
     pub label: String,
+    /// Lifecycle status (`starting`/`running`/`stopped`/...), or `None` for a
+    /// row that predates lifecycle ownership. Drives the cockpit's reconcile of
+    /// a `starting` row into a pane.
+    pub status: Option<String>,
 }
 
 /// What a content pane is, derived from the command it was launched with.
@@ -644,9 +649,11 @@ pub fn parse_index_line(line: &str) -> Option<(u64, String)> {
     Some((id, label))
 }
 
-/// Parse one `- [kind] #id label [(from #N)]` line from `processes.md`. The
-/// trailing `(from #N)` (when present) names the source agent tool and is
-/// dropped from `label`.
+/// Parse one `- [kind] #id label [(from #N)] [· status]` line from
+/// `processes.md`. The trailing ` · <status>` (when present) is the lifecycle
+/// status and is lifted into [`ProcessRow::status`]; the trailing `(from #N)`
+/// names the source agent tool and is dropped from `label`. Both suffixes are
+/// peeled from the end in render order (status last, then the tool ref).
 pub fn parse_process_line(line: &str) -> Option<ProcessRow> {
     let rest = line.trim().strip_prefix("- [")?;
     let close = rest.find(']')?;
@@ -655,12 +662,25 @@ pub fn parse_process_line(line: &str) -> Option<ProcessRow> {
     let space = after.find(' ')?;
     let id: u64 = after[..space].parse().ok()?;
     let mut label = after[space + 1..].trim().to_string();
+    // ` · <status>` is the final segment (see `render_processes_md`); peel it
+    // before the tool ref so the middle-dot separator can't be mistaken for
+    // part of the label or the `(from #N)` chunk.
+    let status = label.rfind(" · ").map(|at| {
+        let s = label[at + " · ".len()..].trim().to_string();
+        label.truncate(at);
+        s
+    });
     if let Some(from_at) = label.rfind(" (from #") {
         if label.ends_with(')') {
             label.truncate(from_at);
         }
     }
-    Some(ProcessRow { kind, id, label })
+    Some(ProcessRow {
+        kind,
+        id,
+        label,
+        status,
+    })
 }
 
 #[cfg(test)]
@@ -816,6 +836,25 @@ mod tests {
         assert_eq!(row.kind, "agent");
         assert_eq!(row.id, 4);
         assert_eq!(row.label, "NASTL-Mediator");
+        assert_eq!(row.status, None);
+    }
+
+    #[test]
+    fn parses_a_process_line_with_status_and_from_suffix() {
+        let row = parse_process_line("- [agent] #4 NASTL-Mediator (from #3) · starting").unwrap();
+        assert_eq!(row.kind, "agent");
+        assert_eq!(row.id, 4);
+        assert_eq!(row.label, "NASTL-Mediator");
+        assert_eq!(row.status.as_deref(), Some("starting"));
+    }
+
+    #[test]
+    fn parses_a_process_line_with_status_and_no_from_suffix() {
+        let row = parse_process_line("- [command] #2 Build · running").unwrap();
+        assert_eq!(row.kind, "command");
+        assert_eq!(row.id, 2);
+        assert_eq!(row.label, "Build");
+        assert_eq!(row.status.as_deref(), Some("running"));
     }
 
     #[test]

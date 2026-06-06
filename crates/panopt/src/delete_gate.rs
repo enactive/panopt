@@ -195,10 +195,7 @@ mod tests {
     #[test]
     fn parses_known_kinds() {
         assert!(matches!(Kind::parse("todo").unwrap(), Kind::Todo));
-        assert!(matches!(
-            Kind::parse("note").unwrap(),
-            Kind::Note
-        ));
+        assert!(matches!(Kind::parse("note").unwrap(), Kind::Note));
         assert!(matches!(
             Kind::parse("agent-tool").unwrap(),
             Kind::AgentTool

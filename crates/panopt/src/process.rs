@@ -13,11 +13,13 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use panopt_core::agent_profiles::{build_launch, Facts, ProfileSet};
 use serde_json::{json, Map, Value};
 
 use crate::daemon;
 use crate::mcpclient::Client;
-use crate::todo::{insert_opt, observer_url, render_scalar};
+use crate::todo::{insert_opt, observer_url, render_scalar, resolve_ws};
+use crate::{paths, project_identity};
 
 /// What to do to the project's processes.
 #[derive(Subcommand)]
@@ -64,6 +66,18 @@ pub enum ProcessCmd {
     /// Delete a process.
     Rm {
         /// Numeric id of the process to delete.
+        id: u64,
+    },
+    /// Start an instance of an agent config (the instance lifecycle). Writes a
+    /// `starting` process row the cockpit reconciles into a live pane.
+    Start {
+        /// Numeric id of the agent config (#N from `agent-tool list`).
+        config_id: u64,
+    },
+    /// Stop a running instance: signal its process and mark the row stopped.
+    /// The pane is left standing for the user to own.
+    Stop {
+        /// Numeric id of the process (instance) to stop.
         id: u64,
     },
 }
@@ -125,22 +139,58 @@ fn dispatch(client: &Client, cmd: ProcessCmd) -> Result<()> {
             client.call("process_delete", json!({ "process_id": id }))?;
             println!("deleted process #{id}");
         }
+        ProcessCmd::Start { config_id } => {
+            let row = client.call("process_start", json!({ "agent_tool_id": config_id }))?;
+            let id = row["id"].as_u64().unwrap_or(0);
+            let status = row["status"].as_str().unwrap_or("?");
+            println!("started process #{id} ({status}) from config #{config_id}");
+        }
+        ProcessCmd::Stop { id } => {
+            client.call("process_stop", json!({ "process_id": id }))?;
+            println!("stopped process #{id}");
+        }
     }
     Ok(())
 }
 
-/// `panopt _process-run` - start a process in the current pane.
+/// `panopt _process-run` - run a process instance in the current pane.
 ///
-/// Looks the process up in the daemon and `exec`s its command, so the Zellij
-/// pane the sidebar plugin opened becomes the agent, command, or shell itself,
-/// with no PANopt wrapper left around it. Rerunning the exited pane through
-/// Zellij re-runs this shim, which re-fetches and re-execs.
+/// This is the edge effector of the instance lifecycle (todo #141): the cockpit
+/// plugin opens a pane running this shim, which resolves the spawn plan *here*,
+/// on the executing host, and `exec`s it - so the Zellij pane becomes the agent
+/// itself, with no PANopt wrapper left around it.
+///
+/// Two paths, keyed on whether the process has a backing agent config:
+///
+/// - **Agent-backed** (`agent_tool_id` set): look up the config's `tool_type`,
+///   render its profile's spawn template (`build_launch`) against host-local
+///   facts (this binary's path, the on-disk token, the daemon host/port). The
+///   resolution must happen on this host - the daemon can't know our binary
+///   path or token for a remote pane - which is why the interpreter runs at the
+///   edge rather than in the daemon. The pid is reported back *before* the
+///   `exec` (the pid survives `exec`, so the agent inherits it), which flips the
+///   row `starting -> running`.
+/// - **Bare** (no config): run the row's `command` via the shell, or an
+///   interactive shell for a command-less terminal row. Unchanged behavior.
+///
+/// Rerunning the exited pane through Zellij re-runs this shim, which re-fetches
+/// and re-execs.
 pub fn exec_entry(ws: Option<PathBuf>, id: u64, port: u16) -> Result<()> {
     daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws.clone(), port)?)?;
     let entry = client.call("process_get", json!({ "process_id": id }));
+    let entry = match entry {
+        Ok(e) => e,
+        Err(e) => {
+            client.close();
+            return Err(e).with_context(|| format!("looking up process #{id}"));
+        }
+    };
+
+    if let Some(tool_id) = entry["agent_tool_id"].as_u64() {
+        return exec_agent_instance(client, &entry, id, tool_id, ws, port);
+    }
     client.close();
-    let entry = entry.with_context(|| format!("looking up process #{id}"))?;
 
     let command = entry["command"].as_str().unwrap_or("").trim().to_string();
     let cwd = entry["cwd"].as_str().unwrap_or("").trim().to_string();
@@ -160,6 +210,114 @@ pub fn exec_entry(ws: Option<PathBuf>, id: u64, port: u16) -> Result<()> {
     }
     let err = cmd.exec();
     Err(err).context("could not start the process's command")
+}
+
+/// Resolve and exec an agent-backed instance (the `agent_tool_id` branch of
+/// [`exec_entry`]). Consumes `client` so the daemon session is closed before the
+/// `exec` replaces this process image.
+fn exec_agent_instance(
+    client: Client,
+    entry: &Value,
+    id: u64,
+    tool_id: u64,
+    ws: Option<PathBuf>,
+    port: u16,
+) -> Result<()> {
+    // The config supplies the profile key; the row supplies the per-instance
+    // identity (copied from the config at start, so edits don't perturb us).
+    let config = client.call("agent_tool_get", json!({ "agent_tool_id": tool_id }));
+    let report = |pid: u32| {
+        // Best-effort: report the pid (which survives the exec below) so the
+        // daemon flips the row to `running`. A failure here just leaves the row
+        // `starting`; it must not block the spawn.
+        let _ = client.call("process_report", json!({ "process_id": id, "pid": pid }));
+    };
+    let config = match config {
+        Ok(c) => c,
+        Err(e) => {
+            client.close();
+            return Err(e).with_context(|| format!("looking up agent config #{tool_id}"));
+        }
+    };
+    let tool_type = config["tool_type"].as_str().unwrap_or("").to_string();
+
+    let ws_path = resolve_ws(ws)?;
+    let token = panopt_core::auth::read_token(&paths::token()?)
+        .context("reading the panopt token (start the daemon with `panopt up`)")?;
+    let panopt_bin = std::env::current_exe()
+        .context("looking up panopt's own path for the agent's MCP config")?;
+    let host = std::env::var("PANOPT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    // The row's name is the stable agent id (copied from the config); fall back
+    // to a synthetic id only if a row somehow has no name.
+    let agent_id = entry["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent-{id}"));
+    let name = entry["display_name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&agent_id)
+        .to_string();
+
+    let profiles = ProfileSet::load().context("loading agent-type profiles")?;
+    let profile = profiles.get(&tool_type).ok_or_else(|| {
+        anyhow::anyhow!("agent config #{tool_id} names unknown agent type '{tool_type}'")
+    })?;
+
+    let facts = Facts {
+        panopt_bin: panopt_bin.to_string_lossy().into_owned(),
+        host,
+        port,
+        ws: ws_path.to_string_lossy().into_owned(),
+        project: project_identity::resolve(&ws_path).key,
+        agent_id,
+        name,
+        token,
+        model: profile.default_model.clone(),
+    };
+    let dir = paths::instance_dir(id)?;
+    let launch = build_launch(profile, &facts, &dir)
+        .with_context(|| format!("rendering the spawn plan for process #{id}"))?;
+
+    report(std::process::id());
+    client.close();
+
+    let (program, rest) = launch
+        .argv
+        .split_first()
+        .context("the resolved spawn plan has an empty argv")?;
+    let mut cmd = Command::new(program);
+    cmd.args(rest);
+    cmd.envs(&launch.env);
+    let cwd = entry["cwd"].as_str().unwrap_or("").trim();
+    if !cwd.is_empty() {
+        cmd.current_dir(cwd);
+    } else {
+        cmd.current_dir(&ws_path);
+    }
+    let err = cmd.exec();
+    Err(err).with_context(|| format!("could not exec the agent ({})", program.clone()))
+}
+
+/// `panopt _process-report` - report runtime facts for an instance.
+///
+/// The cockpit plugin shells this after it reconciles a `starting` row into a
+/// pane, to hand the daemon the Zellij pane id it landed in (the pid is
+/// reported separately by the in-pane wrapper). Best-effort, like
+/// [`crate::agent::leave`]: a missing daemon is logged by the caller, not
+/// surfaced.
+pub fn exec_report(ws: Option<PathBuf>, id: u64, pane_id: String, port: u16) -> Result<()> {
+    daemon::ensure(None, port)?;
+    let client = Client::connect(&observer_url(ws, port)?)?;
+    let result = client.call(
+        "process_report",
+        json!({ "process_id": id, "pane_id": pane_id }),
+    );
+    client.close();
+    result
+        .map(|_| ())
+        .context("reporting the process's pane id")
 }
 
 fn print_list(v: &Value) {
@@ -205,6 +363,12 @@ fn print_entry(e: &Value) {
     }
     if let Some(s) = e["status"].as_str().filter(|s| !s.is_empty()) {
         println!("  status:         {s}");
+    }
+    if let Some(pid) = e["pid"].as_i64() {
+        println!("  pid:            {pid}");
+    }
+    if let Some(p) = e["pane_id"].as_str().filter(|s| !s.is_empty()) {
+        println!("  pane_id:        {p}");
     }
     if let Some(s) = e["agent_state"].as_str().filter(|s| !s.is_empty()) {
         println!("  agent_state:    {s}");

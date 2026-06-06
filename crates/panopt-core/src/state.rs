@@ -20,8 +20,9 @@ use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
 use crate::model::{
-    Agent, AgentTool, AgentToolPatch, KeySource, Lock, Note, NotePatch, Priority, Process,
-    ProcessKind, ProcessPatch, ProjectId, ProjectSummary, Todo, TodoComment, TodoPatch, TodoStatus,
+    process_status, Agent, AgentTool, AgentToolPatch, KeySource, Lock, Note, NotePatch, Priority,
+    Process, ProcessKind, ProcessPatch, ProjectId, ProjectSummary, Todo, TodoComment, TodoPatch,
+    TodoStatus,
 };
 use crate::projection;
 use crate::registry::Registry;
@@ -1025,7 +1026,7 @@ impl Store {
     pub fn process_list(&self, project: ProjectId) -> Result<Vec<Process>, CoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, name, display_name, command, cwd, position,
-                    agent_tool_id, pid, status, agent_state, last_seen, created_at
+                    agent_tool_id, pid, pane_id, status, agent_state, last_seen, created_at
                FROM processes
               WHERE project_id = ?1 AND deleted_at IS NULL
               ORDER BY position, id",
@@ -1042,10 +1043,11 @@ impl Store {
                 position: r.get(6)?,
                 agent_tool_id: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
                 pid: r.get(8)?,
-                status: r.get(9)?,
-                agent_state: r.get(10)?,
-                last_seen: r.get(11)?,
-                created_at: r.get(12)?,
+                pane_id: r.get(9)?,
+                status: r.get(10)?,
+                agent_state: r.get(11)?,
+                last_seen: r.get(12)?,
+                created_at: r.get(13)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1097,6 +1099,9 @@ impl Store {
         if let Some(v) = patch.pid {
             entry.pid = v;
         }
+        if let Some(v) = patch.pane_id {
+            entry.pane_id = v;
+        }
         if let Some(v) = patch.status {
             entry.status = v;
         }
@@ -1109,9 +1114,9 @@ impl Store {
         self.conn.execute(
             "UPDATE processes
                 SET name = ?1, display_name = ?2, command = ?3, cwd = ?4,
-                    position = ?5, agent_tool_id = ?6, pid = ?7, status = ?8,
-                    agent_state = ?9, last_seen = ?10
-              WHERE project_id = ?11 AND id = ?12",
+                    position = ?5, agent_tool_id = ?6, pid = ?7, pane_id = ?8,
+                    status = ?9, agent_state = ?10, last_seen = ?11
+              WHERE project_id = ?12 AND id = ?13",
             params![
                 entry.name,
                 entry.display_name,
@@ -1120,6 +1125,7 @@ impl Store {
                 entry.position,
                 entry.agent_tool_id.map(|v| v as i64),
                 entry.pid,
+                entry.pane_id,
                 entry.status,
                 entry.agent_state,
                 entry.last_seen,
@@ -1144,11 +1150,131 @@ impl Store {
         self.reproject_processes(project)
     }
 
+    /// Start an instance of the agent config `agent_tool_id`: the daemon half
+    /// of the lifecycle (todo #141). Writes the desired-state row that a
+    /// reconciler (the cockpit plugin) turns into a live pane - the daemon
+    /// never spawns the pane itself, so this is pure record-keeping.
+    ///
+    /// The config must exist and be enabled. The policy is **one live instance
+    /// per config**: if a non-deleted instance of this config is already
+    /// `starting` or `running`, that row is returned unchanged (a no-op the
+    /// caller can treat as "focus the existing one") rather than spawning a
+    /// second. Otherwise a fresh row is written in
+    /// [`process_status::STARTING`], copying the config's command/cwd/name at
+    /// spawn time (copy-on-spawn, DESIGN S6.6) so later edits to the config do
+    /// not perturb the running instance.
+    pub fn process_start(
+        &mut self,
+        project: ProjectId,
+        agent_tool_id: u64,
+    ) -> Result<Process, CoreError> {
+        let config = self.fetch_agent_tool(project, agent_tool_id)?;
+        if !config.enabled {
+            return Err(CoreError::BadRequest(format!(
+                "agent config #{agent_tool_id} is disabled"
+            )));
+        }
+        // 1:1 policy: a config already has at most one live instance. A row
+        // counts as live while it is starting (pane pending) or running; a
+        // stopped/exited row is spent and a fresh start replaces it.
+        if let Some(existing) = self.process_list(project)?.into_iter().find(|p| {
+            p.agent_tool_id == Some(agent_tool_id)
+                && matches!(
+                    p.status.as_deref(),
+                    Some(process_status::STARTING) | Some(process_status::RUNNING)
+                )
+        }) {
+            return Ok(existing);
+        }
+
+        let pid = project.0;
+        let id = {
+            let tx = self.conn.transaction()?;
+            let next = next_id(&tx, pid)?;
+            tx.execute(
+                "INSERT INTO processes
+                    (project_id, id, kind, name, display_name, command, cwd,
+                     position, agent_tool_id, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+                params![
+                    pid,
+                    next,
+                    ProcessKind::Agent.as_str(),
+                    config.name,
+                    config.display_name,
+                    config.command,
+                    config.cwd,
+                    next,
+                    agent_tool_id as i64,
+                    process_status::STARTING,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE projects SET next_id = ?1 WHERE id = ?2",
+                params![next + 1, pid],
+            )?;
+            tx.commit()?;
+            next as u64
+        };
+        self.reproject_processes(project)?;
+        self.fetch_process(project, id)
+    }
+
+    /// Report runtime facts for an instance from its executing host (todo
+    /// #141): the edge wrapper reports its `pid`, the cockpit plugin reports
+    /// the `pane_id` it landed the process in. Each is optional so the two
+    /// reporters can call independently and idempotently. Setting a `pid`
+    /// flips the row to [`process_status::RUNNING`] and stamps `last_seen` -
+    /// the pid is the liveness anchor, so its arrival is what means "live".
+    pub fn process_report(
+        &mut self,
+        project: ProjectId,
+        id: u64,
+        pid: Option<i64>,
+        pane_id: Option<String>,
+        agent_state: Option<String>,
+    ) -> Result<(), CoreError> {
+        let mut patch = ProcessPatch {
+            pane_id: pane_id.map(Some),
+            agent_state: agent_state.map(Some),
+            ..Default::default()
+        };
+        if let Some(pid) = pid {
+            patch.pid = Some(Some(pid));
+            patch.status = Some(Some(process_status::RUNNING.to_string()));
+            patch.last_seen = Some(Some(now_text(&self.conn)?));
+        }
+        self.process_update(project, id, patch)
+    }
+
+    /// Stop an instance (todo #141): flip its status to
+    /// [`process_status::STOPPED`] and return its pid so the caller (the
+    /// daemon, which lives on the executing host in the co-located case) can
+    /// signal the process. Core itself sends no OS signal - that host effect
+    /// belongs to the daemon, not the state layer.
+    ///
+    /// The pane is deliberately left untouched: panopt owns *processes*,
+    /// Zellij and the user own *panes* (the plugin never closes a pane). The
+    /// stopped row keeps its pid for the record; the returned pid is what to
+    /// signal.
+    pub fn process_stop(&mut self, project: ProjectId, id: u64) -> Result<Option<i64>, CoreError> {
+        let entry = self.fetch_process(project, id)?;
+        self.process_update(
+            project,
+            id,
+            ProcessPatch {
+                status: Some(Some(process_status::STOPPED.to_string())),
+                ..Default::default()
+            },
+        )?;
+        Ok(entry.pid)
+    }
+
     fn fetch_process(&self, project: ProjectId, id: u64) -> Result<Process, CoreError> {
         self.conn
             .query_row(
                 "SELECT kind, name, display_name, command, cwd, position,
-                        agent_tool_id, pid, status, agent_state, last_seen, created_at
+                        agent_tool_id, pid, pane_id, status, agent_state, last_seen, created_at
                    FROM processes
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
@@ -1164,10 +1290,11 @@ impl Store {
                         position: r.get(5)?,
                         agent_tool_id: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
                         pid: r.get(7)?,
-                        status: r.get(8)?,
-                        agent_state: r.get(9)?,
-                        last_seen: r.get(10)?,
-                        created_at: r.get(11)?,
+                        pane_id: r.get(8)?,
+                        status: r.get(9)?,
+                        agent_state: r.get(10)?,
+                        last_seen: r.get(11)?,
+                        created_at: r.get(12)?,
                     })
                 },
             )
@@ -1844,6 +1971,14 @@ fn next_id(conn: &Connection, pid: i64) -> Result<i64, CoreError> {
     })
     .optional()?
     .ok_or(CoreError::ProjectNotFound(pid))
+}
+
+/// SQLite's `datetime('now')` as a string. Used when a timestamp must be bound
+/// as a parameter (e.g. a [`ProcessPatch`] field) rather than written inline in
+/// the SQL, so it matches the `YYYY-MM-DD HH:MM:SS` UTC format every other
+/// `created_at`/`updated_at` column already stores.
+fn now_text(conn: &Connection) -> Result<String, CoreError> {
+    Ok(conn.query_row("SELECT datetime('now')", [], |r| r.get(0))?)
 }
 
 #[cfg(test)]
@@ -3204,6 +3339,90 @@ mod tests {
         assert!(matches!(
             fx.store.process_delete(p, id),
             Err(CoreError::ProcessNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn process_start_report_stop_lifecycle() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                true,
+            )
+            .unwrap();
+
+        // start writes a copy-on-spawn `starting` row.
+        let started = fx.store.process_start(p, config).unwrap();
+        assert_eq!(started.kind, ProcessKind::Agent);
+        assert_eq!(started.agent_tool_id, Some(config));
+        assert_eq!(started.command, "claude");
+        assert_eq!(started.cwd, "/work");
+        assert_eq!(started.display_name, "Mediator");
+        assert_eq!(started.status.as_deref(), Some(process_status::STARTING));
+
+        let md = std::fs::read_to_string(root.join(".panopt/processes.md")).unwrap();
+        assert!(md.contains("· starting"), "{md}");
+
+        // 1:1 policy: starting again returns the same live row, no second spawn.
+        let again = fx.store.process_start(p, config).unwrap();
+        assert_eq!(again.id, started.id);
+        assert_eq!(fx.store.process_list(p).unwrap().len(), 1);
+
+        // pid report flips to running and anchors liveness.
+        fx.store
+            .process_report(p, started.id, Some(4242), None, None)
+            .unwrap();
+        let row = fx.store.process_get(p, started.id).unwrap();
+        assert_eq!(row.pid, Some(4242));
+        assert_eq!(row.status.as_deref(), Some(process_status::RUNNING));
+        assert!(row.last_seen.is_some());
+
+        // pane-id report is independent and idempotent.
+        fx.store
+            .process_report(p, started.id, None, Some("17".into()), None)
+            .unwrap();
+        let row = fx.store.process_get(p, started.id).unwrap();
+        assert_eq!(row.pane_id.as_deref(), Some("17"));
+        assert_eq!(row.pid, Some(4242), "pane report must not clear the pid");
+
+        // stop returns the pid to signal and leaves the row stopped.
+        let killed = fx.store.process_stop(p, started.id).unwrap();
+        assert_eq!(killed, Some(4242));
+        let row = fx.store.process_get(p, started.id).unwrap();
+        assert_eq!(row.status.as_deref(), Some(process_status::STOPPED));
+
+        // a spent (stopped) row no longer blocks a fresh start.
+        let restarted = fx.store.process_start(p, config).unwrap();
+        assert_ne!(restarted.id, started.id);
+    }
+
+    #[test]
+    fn process_start_rejects_disabled_config() {
+        let mut fx = Fixture::new();
+        let (p, _) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                String::new(),
+                "claude".into(),
+                String::new(),
+                "claude-code".into(),
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            fx.store.process_start(p, config),
+            Err(CoreError::BadRequest(_))
         ));
     }
 
