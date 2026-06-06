@@ -3,7 +3,7 @@
   "checkpoint_id": "2d547905dbd7",
   "strategy": "manual-commit",
   "branch": "agent-model",
-  "checkpoints_count": 6,
+  "checkpoints_count": 10,
   "files_touched": [
     "Cargo.lock",
     "crates/panopt-core/src/db.rs",
@@ -33,13 +33,19 @@
       "transcript": "/2d/547905dbd7/1/full.jsonl",
       "content_hash": "/2d/547905dbd7/1/content_hash.txt",
       "prompt": "/2d/547905dbd7/1/prompt.txt"
+    },
+    {
+      "metadata": "/2d/547905dbd7/2/metadata.json",
+      "transcript": "/2d/547905dbd7/2/full.jsonl",
+      "content_hash": "/2d/547905dbd7/2/content_hash.txt",
+      "prompt": "/2d/547905dbd7/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 31894,
-    "cache_creation_tokens": 585811,
-    "cache_read_tokens": 26687106,
-    "output_tokens": 127211,
-    "api_call_count": 191
+    "input_tokens": 35081,
+    "cache_creation_tokens": 662655,
+    "cache_read_tokens": 27351396,
+    "output_tokens": 142499,
+    "api_call_count": 212
   }
 }

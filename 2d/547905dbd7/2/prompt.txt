@@ -1,0 +1,21 @@
+can yu make a new agent?
+
+---
+
+how do panopt agents work?
+
+---
+
+try to figure it out from the mcp instructions
+
+---
+
+yes, see what's available
+
+---
+
+i want a new agent, so you tell me how to get one running.
+
+---
+
+ultimately there needs to be a way for *you* to start new agents within this session.  we just finished #141 and I am tryig to test it's result.
