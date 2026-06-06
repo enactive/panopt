@@ -1,0 +1,36 @@
+start a new agent
+
+---
+
+there's no way to start an agent using mcp?
+
+---
+
+C&C to solo's approach:
+
+❯ how does solo start new agents?
+
+  Called solo (ctrl+o to expand)
+
+⏺ Solo spawns new agents through a three-step MCP flow:
+
+  1. list_agent_tools - lists the configured agent runtimes. Each returns an id you use as the
+  agent_tool_id.
+  2. spawn_agent(agent_tool_id=N) - the preferred spawn tool. It creates the agent and returns:
+    - process_id - the handle for the new agent
+    - name - auto-generated unless you pass name="..."
+    - agent_instructions - bootstrap orchestration context (process ID, MCP hints) that you prepend to the   agent's first prompt
+  3. send_input(process_id=<returned id>, input=<prompt>) - sends the first prompt (with the
+  agent_instructions prepended) to actually get it working.
+
+  Useful variations:
+  - spawn_agent(agent_tool_id=N, name="MyAgent") - custom name
+  - spawn_agent(agent_tool_id=N, extra_args=["--flag"]) - per-launch args without mutating the saved tool   defaults
+  - spawn_agent(agent_tool_id=N, project_id=...) - spawn into a different project without changing your   session's selected project
+  - spawn_process(kind="agent", agent_tool_id=N) - the generic equivalent; spawn_agent is just an alias for  it
+
+  Notes worth knowing: spawning does not change the caller's identity, and you remove spawned agents with   close_process (terminals and agents, but not commands).
+
+---
+
+these solos caps will be necessary for agent orchestration.  plan how to incorporate them into #135 and its children.  update todos as necessary (once plan is approved)
