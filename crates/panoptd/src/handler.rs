@@ -1764,6 +1764,16 @@ impl ServerHandler for Handler {
                  tool: it ignores the connection's scope and returns one row per \
                  project (identity, root, name, and live agent/todo/lock badges) \
                  for the switcher board.\n\
+                 - Working a `#N` reference: ids are shared across todos, notes, agent \
+                 tools, and processes, so a `#N` is not necessarily a todo. Call id_kind \
+                 first to learn the kind, then dispatch on the user's verb. `do #N` / \
+                 `start #N` / `work on #N` on a todo: call todo_start as the first action \
+                 (it claims the `todo:<id>` lock and flips status to in_progress, returns \
+                 the same detail as todo_get) instead of todo_get, and todo_complete when \
+                 finished; if it returns {started: false, held_by}, stop - another agent \
+                 owns it. `plan #N`: use todo_get (a read - no lock, no status change). \
+                 Reading or rendering #N: use the kind-appropriate getter (todo_get, \
+                 note_get, agent_tool_get, or process_get).\n\
                  State is persisted, shared live across every agent on the same project, \
                  and mirrored into .panopt/*.md under the project root."
                     .to_string(),
