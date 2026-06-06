@@ -1,0 +1,50 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "f68d6ea96a43",
+  "session_id": "cc00d6c5-3e76-423b-946a-f4ce65a58746",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-06T05:55:53.730932013Z",
+  "branch": "agent-model",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "bc85f6863503",
+  "token_usage": {
+    "input_tokens": 1133,
+    "cache_creation_tokens": 47217,
+    "cache_read_tokens": 393477,
+    "output_tokens": 8179,
+    "api_call_count": 14
+  },
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-06T05:55:53.715311228Z",
+    "agent_lines": 10,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 10,
+    "total_lines_changed": 10,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 543,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1,
+        "docs/observe-design.md": 542
+      }
+    }
+  ]
+}
