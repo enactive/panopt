@@ -1,0 +1,87 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "bfebd6290502",
+  "session_id": "0c4cf17e-ca28-4c8e-ba7c-544d964fff48",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-06T05:55:10.127864918Z",
+  "branch": "agent-model",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-zellij-logic/src/lib.rs",
+    "crates/panopt/src/viewer.rs",
+    "crates/panopt/src/viewstate.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "55bebb5946b0",
+  "token_usage": {
+    "input_tokens": 3310,
+    "cache_creation_tokens": 43452,
+    "cache_read_tokens": 1550659,
+    "output_tokens": 13973,
+    "api_call_count": 37
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_01KTjzHGWCURzqLDJjtD1HKi",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "55bebb5946b0",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 113,
+        "end": 114,
+        "entry_ids": [
+          "6d457b98-163b-4b9e-aca3-91606d262aba"
+        ],
+        "tool_use_id": "toolu_01KTjzHGWCURzqLDJjtD1HKi"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01KTjzHGWCURzqLDJjtD1HKi"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-06T05:55:10.108086819Z",
+    "agent_lines": 43,
+    "agent_removed": 51,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 43,
+    "total_lines_changed": 94,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 553,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1,
+        "crates/panoptd/src/handler.rs": 10,
+        "docs/observe-design.md": 542
+      }
+    }
+  ]
+}

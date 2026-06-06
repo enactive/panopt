@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "bfebd6290502",
+  "strategy": "manual-commit",
+  "branch": "agent-model",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-zellij-logic/src/lib.rs",
+    "crates/panopt/src/viewer.rs",
+    "crates/panopt/src/viewstate.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/bf/ebd6290502/0/metadata.json",
+      "transcript": "/bf/ebd6290502/0/full.jsonl",
+      "content_hash": "/bf/ebd6290502/0/content_hash.txt",
+      "prompt": "/bf/ebd6290502/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 3310,
+    "cache_creation_tokens": 43452,
+    "cache_read_tokens": 1550659,
+    "output_tokens": 13973,
+    "api_call_count": 37
+  }
+}
