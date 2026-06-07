@@ -2867,17 +2867,6 @@ fn read_configs(path: &str) -> Vec<ConfigRow> {
     }
 }
 
-/// The Agents-pane row label for a config: its name, plus a ` · <status>`
-/// suffix drawn from its live instance when one exists - the agent's classified
-/// activity (`thinking`/`waiting`/...) if observed, else the lifecycle status
-/// (`starting`/`running`). A config with no live instance shows just its name.
-fn agent_config_label(c: &ConfigRow, inst: Option<&ProcessRow>) -> String {
-    match inst.and_then(|r| r.agent_state.as_deref().or(r.status.as_deref())) {
-        Some(s) if !s.is_empty() => format!("{} · {}", c.label, s),
-        _ => c.label.clone(),
-    }
-}
-
 /// The ANSI styling a printed row carries.
 #[derive(Clone, Copy)]
 enum Style {

@@ -399,6 +399,13 @@ pub struct ProcessRow {
     /// instance (the 1:1 policy). `None` for command/terminal rows and any
     /// instance with no backing config.
     pub agent_tool_id: Option<u64>,
+    /// The "sitting idle for N" age (`idle:<age>` segment, bug #163), present
+    /// only while the agent is in the `idle` state - the daemon computes it as
+    /// `now - state_since` and projects the formatted age. The Agents pane
+    /// appends it to the row's status so a parked agent shows how long it has
+    /// been waiting (#143), consistent with the roster's `(idle X)`. `None`
+    /// whenever the agent is not idle.
+    pub idle: Option<String>,
 }
 
 /// A parsed `.panopt/agent_tools.md` line: one durable agent config (the
@@ -428,6 +435,38 @@ pub fn parse_config_line(line: &str) -> Option<ConfigRow> {
     let close = flag_rest.find(']')?;
     let enabled = &flag_rest[..close] == "enabled";
     Some(ConfigRow { id, label, enabled })
+}
+
+/// The Agents-pane row label for a config: its name, plus a ` · <status>`
+/// suffix drawn from its live instance when one exists - the agent's classified
+/// activity (`thinking`/`waiting`/...) if observed, else the lifecycle status
+/// (`starting`/`running`). A config with no live instance shows just its name.
+///
+/// While the agent sits `idle`, the daemon's "idle for N" age rides along as
+/// ` · idle <age>` (#143) - the same presence cue the roster shows as
+/// `(idle X)` (#83), so a parked agent reads how long it has been waiting, not
+/// merely that it is waiting. The age only rides the `idle` state because that
+/// is the only state the daemon projects it for.
+pub fn agent_config_label(config: &ConfigRow, inst: Option<&ProcessRow>) -> String {
+    let Some(inst) = inst else {
+        return config.label.clone();
+    };
+    let Some(state) = inst
+        .agent_state
+        .as_deref()
+        .or(inst.status.as_deref())
+        .filter(|s| !s.is_empty())
+    else {
+        return config.label.clone();
+    };
+    match inst
+        .idle
+        .as_deref()
+        .filter(|_| inst.agent_state.as_deref() == Some("idle"))
+    {
+        Some(age) => format!("{} · {state} {age}", config.label),
+        None => format!("{} · {state}", config.label),
+    }
 }
 
 /// What a content pane is, derived from the command it was launched with.
@@ -757,6 +796,7 @@ pub fn parse_process_line(line: &str) -> Option<ProcessRow> {
     let mut tool_type = None;
     let mut agent_state = None;
     let mut agent_id = None;
+    let mut idle = None;
     for seg in segments {
         let seg = seg.trim();
         if let Some(v) = seg.strip_prefix("type:") {
@@ -765,10 +805,11 @@ pub fn parse_process_line(line: &str) -> Option<ProcessRow> {
             agent_state = Some(v.trim().to_string());
         } else if let Some(v) = seg.strip_prefix("agent:") {
             agent_id = Some(v.trim().to_string());
-        } else if seg.starts_with("idle:") {
-            // `idle:` is a human-facing presence annotation sourced from the
-            // registry (todo #142); the plugin derives liveness from the row's
-            // status + its own registry view, so it is parsed past, not kept.
+        } else if let Some(v) = seg.strip_prefix("idle:") {
+            // The "sitting idle for N" age (#143): kept so the Agents pane can
+            // show how long a parked agent has been waiting. Only present while
+            // the agent is `idle` (see `render_processes_md`).
+            idle = Some(v.trim().to_string());
         } else if !seg.is_empty() {
             // The lone bare segment is the lifecycle status.
             status = Some(seg.to_string());
@@ -791,6 +832,7 @@ pub fn parse_process_line(line: &str) -> Option<ProcessRow> {
         agent_state,
         agent_id,
         agent_tool_id,
+        idle,
     })
 }
 
@@ -1162,16 +1204,62 @@ mod tests {
     }
 
     #[test]
-    fn parses_type_state_agent_segments_and_drops_idle() {
+    fn parses_type_state_agent_and_idle_segments() {
         let row = parse_process_line(
-            "- [agent] #5 Mediator (from #3) · running · type:claude-code · agent:mediator-1a · state:thinking · idle:2m",
+            "- [agent] #5 Mediator (from #3) · running · type:claude-code · agent:mediator-1a · state:idle · idle:2m",
         )
         .unwrap();
         assert_eq!(row.label, "Mediator");
         assert_eq!(row.status.as_deref(), Some("running"));
         assert_eq!(row.tool_type.as_deref(), Some("claude-code"));
         assert_eq!(row.agent_id.as_deref(), Some("mediator-1a"));
-        assert_eq!(row.agent_state.as_deref(), Some("thinking"));
+        assert_eq!(row.agent_state.as_deref(), Some("idle"));
+        assert_eq!(row.idle.as_deref(), Some("2m"));
+    }
+
+    fn config(label: &str) -> ConfigRow {
+        ConfigRow {
+            id: 7,
+            label: label.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn label_for_config_with_no_instance_is_just_its_name() {
+        assert_eq!(agent_config_label(&config("Mediator"), None), "Mediator");
+    }
+
+    #[test]
+    fn label_shows_classified_state_when_not_idle() {
+        let inst = parse_process_line("- [agent] #5 Mediator (from #7) · running · state:thinking")
+            .unwrap();
+        assert_eq!(
+            agent_config_label(&config("Mediator"), Some(&inst)),
+            "Mediator · thinking"
+        );
+    }
+
+    #[test]
+    fn label_appends_idle_age_while_idle() {
+        let inst =
+            parse_process_line("- [agent] #5 Mediator (from #7) · running · state:idle · idle:3m")
+                .unwrap();
+        assert_eq!(
+            agent_config_label(&config("Mediator"), Some(&inst)),
+            "Mediator · idle 3m"
+        );
+    }
+
+    #[test]
+    fn label_falls_back_to_lifecycle_status_before_first_observation() {
+        // A freshly-started instance has a lifecycle status but no classified
+        // `state:` yet, so the row shows `starting` and carries no idle age.
+        let inst = parse_process_line("- [agent] #5 Mediator (from #7) · starting").unwrap();
+        assert_eq!(
+            agent_config_label(&config("Mediator"), Some(&inst)),
+            "Mediator · starting"
+        );
     }
 
     #[test]
