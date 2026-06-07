@@ -1,0 +1,110 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "da982f2bae37",
+  "session_id": "f1bd017b-0e38-4833-863c-e8854f968bfb",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-07T23:26:44.614441147Z",
+  "branch": "agent-model",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt-core/src/model.rs",
+    "crates/panopt-core/src/db.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt/src/process.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "650ee5fac29d",
+  "checkpoint_transcript_start": 1834,
+  "transcript_lines_at_start": 1834,
+  "token_usage": {
+    "input_tokens": 8361,
+    "cache_creation_tokens": 354466,
+    "cache_read_tokens": 7907935,
+    "output_tokens": 32514,
+    "api_call_count": 23
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_0163xQqHe7KJe8Wde5RyJpRU",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "650ee5fac29d",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 600,
+        "end": 601,
+        "entry_ids": [
+          "49a5de98-f040-4443-94ab-80c329190ada"
+        ],
+        "tool_use_id": "toolu_0163xQqHe7KJe8Wde5RyJpRU"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_0163xQqHe7KJe8Wde5RyJpRU"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01SzKcBhoduoq91rdeq2xW8r",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "650ee5fac29d",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 1363,
+        "end": 1364,
+        "entry_ids": [
+          "ab58b583-08a4-4046-9a9d-885aa7802031"
+        ],
+        "tool_use_id": "toolu_01SzKcBhoduoq91rdeq2xW8r"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01SzKcBhoduoq91rdeq2xW8r"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 11
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-07T23:26:44.444212869Z",
+    "agent_lines": 20,
+    "agent_removed": 436,
+    "human_added": 174,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 194,
+    "total_lines_changed": 638,
+    "agent_percentage": 71.47335423197492,
+    "metric_version": 2
+  }
+}
