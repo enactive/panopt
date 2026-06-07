@@ -276,6 +276,9 @@ pub struct AgentTool {
     /// Free-form tag for future categorization (Solo carries one per tool).
     /// Defaults to `"agent"`.
     pub tool_type: String,
+    /// A per-config system prompt the spawn-spec template can land into a
+    /// launch flag or file (todo #140). Empty means "use the agent's default".
+    pub system_prompt: String,
     /// Whether the tool is offered in spawn UIs. Stored but not yet enforced
     /// (no spawn UI exists in PANopt yet).
     pub enabled: bool,
@@ -294,6 +297,7 @@ pub struct AgentToolPatch {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub tool_type: Option<String>,
+    pub system_prompt: Option<String>,
     pub enabled: Option<bool>,
     pub position: Option<i64>,
 }

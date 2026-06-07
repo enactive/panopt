@@ -31,11 +31,13 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
+use crate::agent_config_form::AgentConfigForm;
 use crate::mcpclient::Client;
 use crate::note_form::NoteForm;
 use crate::todo::observer_url;
 use crate::todo_form::TodoForm;
 use crate::viewstate::{self, ViewState};
+use panopt_core::agent_profiles::{ProfileSet, DEFAULT_PROFILE_KEY};
 
 /// File the cockpit's Todos gatekeeper publishes the live right-side pane
 /// count to (under the project's `.panopt/.cockpit/`). A `_viewer` reads it to
@@ -65,6 +67,12 @@ enum Target {
     /// `note_create` on the first autosave with a non-empty title; from
     /// then on it behaves like a `Note(id)`.
     NewNote,
+    /// An existing agent config (slot), edited through the agent-config form.
+    AgentConfig(u64),
+    /// A brand-new agent config, not yet persisted. The form sends
+    /// `agent_tool_create` on the first autosave with a non-empty name; from
+    /// then on it behaves like an `AgentConfig(id)`.
+    NewAgentConfig,
     TodoList,
     NoteList,
     Empty,
@@ -80,6 +88,8 @@ impl Target {
             ("new-todo", _) => Some(Target::NewTodo),
             ("note", Some(id)) => Some(Target::Note(id)),
             ("new-note", _) => Some(Target::NewNote),
+            ("agent-config", Some(id)) => Some(Target::AgentConfig(id)),
+            ("new-agent-config", _) => Some(Target::NewAgentConfig),
             ("todo-list", _) => Some(Target::TodoList),
             ("note-list", _) => Some(Target::NoteList),
             ("empty", _) => Some(Target::Empty),
@@ -96,6 +106,8 @@ impl Target {
             Target::NewTodo => "todo:new".to_string(),
             Target::Note(id) => format!("note:{id}"),
             Target::NewNote => "note:new".to_string(),
+            Target::AgentConfig(id) => format!("agent-config:{id}"),
+            Target::NewAgentConfig => "agent-config:new".to_string(),
             Target::TodoList => "list:todos".to_string(),
             Target::NoteList => "list:notes".to_string(),
             Target::Empty => "empty".to_string(),
@@ -109,7 +121,12 @@ impl Target {
     fn is_form(&self) -> bool {
         matches!(
             self,
-            Target::Todo(_) | Target::NewTodo | Target::Note(_) | Target::NewNote,
+            Target::Todo(_)
+                | Target::NewTodo
+                | Target::Note(_)
+                | Target::NewNote
+                | Target::AgentConfig(_)
+                | Target::NewAgentConfig,
         )
     }
 
@@ -119,7 +136,12 @@ impl Target {
     fn content_path(&self, ws: &Path) -> Option<PathBuf> {
         let panopt = ws.join(".panopt");
         match self {
-            Target::Todo(_) | Target::NewTodo | Target::Note(_) | Target::NewNote => None,
+            Target::Todo(_)
+            | Target::NewTodo
+            | Target::Note(_)
+            | Target::NewNote
+            | Target::AgentConfig(_)
+            | Target::NewAgentConfig => None,
             Target::TodoList => Some(panopt.join("todos.md")),
             Target::NoteList => Some(panopt.join("notes.md")),
             Target::Empty => None,
@@ -146,6 +168,9 @@ enum Content {
     /// The editable note form. Sibling of [`Content::TodoForm`]; see
     /// [`crate::note_form`]. Boxed for the same reason.
     NoteForm(Box<NoteForm>),
+    /// The editable agent-config form. Sibling of the todo/note forms; see
+    /// [`crate::agent_config_form`]. Boxed for the same reason.
+    AgentConfigForm(Box<AgentConfigForm>),
 }
 
 /// One row of a list view: where selecting it routes, its display label, and
@@ -402,6 +427,7 @@ pub fn run(
     slot: String,
     kind: Option<String>,
     id: Option<u64>,
+    transient: bool,
 ) -> Result<()> {
     let ws = crate::todo::resolve_ws(ws)?;
     // Build the observer URL up front; every form load reuses it. An observer
@@ -414,7 +440,7 @@ pub fn run(
         .and_then(|k| Target::parse(k, id))
         .unwrap_or(Target::Empty);
 
-    let mut viewer = Viewer::new(ws, url, &slot, target);
+    let mut viewer = Viewer::new(ws, url, &slot, target, transient);
     let mut terminal = ratatui::init();
     // Bracketed paste turns a clipboard paste into a single `Event::Paste(s)`
     // instead of a stream of synthetic key events. Without this, multi-line
@@ -482,10 +508,15 @@ struct Viewer {
     /// [`Viewer::close_gesture`] so the last pane cannot be closed out from
     /// under the sidebar. Always false outside the cockpit.
     sole_content_pane: bool,
+    /// A transient (floating) viewer: a one-off editor overlay rather than a
+    /// tiled content pane. Floating panes are never the tiled content the
+    /// sole-content-pane refusal protects, so a transient viewer keeps
+    /// [`Viewer::sole_content_pane`] forced false and always closes on Ctrl-C.
+    transient: bool,
 }
 
 impl Viewer {
-    fn new(ws: PathBuf, url: String, slot: &str, target: Target) -> Viewer {
+    fn new(ws: PathBuf, url: String, slot: &str, target: Target, transient: bool) -> Viewer {
         let routing_path = ws
             .join(".panopt")
             .join(".cockpit")
@@ -527,6 +558,7 @@ impl Viewer {
             last_refresh: Instant::now(),
             needs_draw: true,
             sole_content_pane: false,
+            transient,
         };
         viewer.reload_content();
         viewer
@@ -563,7 +595,10 @@ impl Viewer {
     /// the cockpit: a stand-alone `panopt _viewer` runs outside Zellij with no
     /// gatekeeper publishing the count, so it must always stay closable.
     fn refresh_sole_content(&mut self) {
-        self.sole_content_pane = std::env::var_os("ZELLIJ").is_some()
+        // A transient floating viewer is never the tiled content the refusal
+        // protects, so it stays closable regardless of the content count.
+        self.sole_content_pane = !self.transient
+            && std::env::var_os("ZELLIJ").is_some()
             && read_content_count(&self.ws).is_some_and(|n| n <= 1);
     }
 
@@ -607,6 +642,24 @@ impl Viewer {
                         }
                         crate::note_form::NoteFormAction::Dirty
                         | crate::note_form::NoteFormAction::Idle => {
+                            self.needs_draw = true;
+                            false
+                        }
+                    }
+                }
+            }
+            Content::AgentConfigForm(form) => {
+                if ctrl && matches!(key.code, KeyCode::Char('c')) {
+                    let _ = form.flush();
+                    true
+                } else {
+                    match form.handle_key(key) {
+                        crate::agent_config_form::AgentConfigFormAction::Close => {
+                            let _ = form.flush();
+                            true
+                        }
+                        crate::agent_config_form::AgentConfigFormAction::Dirty
+                        | crate::agent_config_form::AgentConfigFormAction::Idle => {
                             self.needs_draw = true;
                             false
                         }
@@ -681,6 +734,10 @@ impl Viewer {
                 let _ = form.handle_paste(s);
                 self.needs_draw = true;
             }
+            Content::AgentConfigForm(form) => {
+                let _ = form.handle_paste(s);
+                self.needs_draw = true;
+            }
             _ => {}
         }
     }
@@ -698,6 +755,10 @@ impl Viewer {
                 self.needs_draw = true;
             }
             Content::NoteForm(form) => {
+                let _ = form.handle_mouse(m);
+                self.needs_draw = true;
+            }
+            Content::AgentConfigForm(form) => {
                 let _ = form.handle_mouse(m);
                 self.needs_draw = true;
             }
@@ -757,7 +818,10 @@ impl Viewer {
                 let max = (lines.len() as i64 - self.viewport as i64).max(0);
                 self.scroll = (self.scroll as i64 + delta).clamp(0, max) as u16;
             }
-            Content::Message(_) | Content::TodoForm(_) | Content::NoteForm(_) => {}
+            Content::Message(_)
+            | Content::TodoForm(_)
+            | Content::NoteForm(_)
+            | Content::AgentConfigForm(_) => {}
         }
     }
 
@@ -977,6 +1041,14 @@ impl Viewer {
                     self.needs_draw = true;
                 }
             },
+            Content::AgentConfigForm(form) => match form.refresh_from_daemon() {
+                Ok(true) => self.needs_draw = true,
+                Ok(false) => {}
+                Err(e) => {
+                    form.message = format!("refresh failed: {e:#}");
+                    self.needs_draw = true;
+                }
+            },
             _ => {}
         }
     }
@@ -1003,6 +1075,15 @@ impl Viewer {
                 self.needs_draw = true;
                 promotion_target(&self.target, form.id)
             }
+            Content::AgentConfigForm(form)
+                if form.dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE) =>
+            {
+                if let Err(e) = form.flush() {
+                    form.message = format!("autosave failed: {e:#}");
+                }
+                self.needs_draw = true;
+                promotion_target(&self.target, form.id)
+            }
             _ => None,
         };
         if let Some(target) = promote {
@@ -1019,6 +1100,7 @@ impl Viewer {
         let (kind, id) = match &target {
             Target::Todo(id) => ("todo", *id),
             Target::Note(id) => ("note", *id),
+            Target::AgentConfig(id) => ("agent-config", *id),
             _ => return,
         };
         write_routing_to(&self.routing_path, kind, Some(id));
@@ -1071,6 +1153,27 @@ impl Viewer {
                 }
                 Err(e) => Content::Message(format!("could not load note #{id}: {e:#}")),
             },
+            Target::NewAgentConfig => Content::AgentConfigForm(Box::new(AgentConfigForm::blank(
+                &self.url,
+                profile_keys(),
+                DEFAULT_PROFILE_KEY,
+            ))),
+            Target::AgentConfig(id) => match load_agent_config(&self.url, *id) {
+                Ok(tool) => Content::AgentConfigForm(Box::new(AgentConfigForm::from_parts(
+                    &self.url,
+                    *id,
+                    tool["name"].as_str().unwrap_or(""),
+                    tool["display_name"].as_str().unwrap_or(""),
+                    tool["command"].as_str().unwrap_or(""),
+                    tool["cwd"].as_str().unwrap_or(""),
+                    tool["tool_type"].as_str().unwrap_or(DEFAULT_PROFILE_KEY),
+                    tool["system_prompt"].as_str().unwrap_or(""),
+                    tool["enabled"].as_bool().unwrap_or(true),
+                    tool["created_at"].as_str().unwrap_or(""),
+                    profile_keys(),
+                ))),
+                Err(e) => Content::Message(format!("could not load agent config #{id}: {e:#}")),
+            },
             Target::TodoList => match load_todo_list(&self.url) {
                 Ok(entries) => Content::List(entries),
                 // Fall back to the projection: it carries less detail (no
@@ -1101,7 +1204,10 @@ impl Viewer {
                     self.scroll = max;
                 }
             }
-            Content::Message(_) | Content::TodoForm(_) | Content::NoteForm(_) => {}
+            Content::Message(_)
+            | Content::TodoForm(_)
+            | Content::NoteForm(_)
+            | Content::AgentConfigForm(_) => {}
         }
     }
 
@@ -1114,6 +1220,10 @@ impl Viewer {
             return;
         }
         if let Content::NoteForm(form) = &mut self.content {
+            form.draw(frame, frame.area());
+            return;
+        }
+        if let Content::AgentConfigForm(form) = &mut self.content {
             form.draw(frame, frame.area());
             return;
         }
@@ -1187,7 +1297,7 @@ impl Viewer {
                     area,
                 );
             }
-            Content::TodoForm(_) | Content::NoteForm(_) => {
+            Content::TodoForm(_) | Content::NoteForm(_) | Content::AgentConfigForm(_) => {
                 unreachable!("form modes short-circuit draw")
             }
         }
@@ -1199,6 +1309,8 @@ impl Viewer {
             Target::NewTodo => " New todo".to_string(),
             Target::Note(id) => format!(" Note #{id}"),
             Target::NewNote => " New note".to_string(),
+            Target::AgentConfig(id) => format!(" Agent config #{id}"),
+            Target::NewAgentConfig => " New agent config".to_string(),
             Target::TodoList => {
                 let (visible, total) = self.list_counts();
                 format!(
@@ -1252,6 +1364,26 @@ fn load_note(url: &str, id: u64) -> Result<Value> {
     let outcome = client.call("note_get", json!({ "note_id": id }));
     client.close();
     outcome
+}
+
+/// One-shot `agent_tool_get` against the daemon. Returns the JSON object the
+/// agent-config form reads its fields from.
+fn load_agent_config(url: &str, id: u64) -> Result<Value> {
+    let client = Client::connect(url)?;
+    let outcome = client.call("agent_tool_get", json!({ "agent_tool_id": id }));
+    client.close();
+    outcome
+}
+
+/// The known agent-type profile keys, sorted, for the config form's `Type`
+/// dropdown. Falls back to just the default key if the registry fails to load
+/// (the shipped defaults are embedded, so this is effectively unreachable) so
+/// the field always has at least one valid option.
+fn profile_keys() -> Vec<String> {
+    match ProfileSet::load() {
+        Ok(set) => set.keys().map(str::to_string).collect(),
+        Err(_) => vec![DEFAULT_PROFILE_KEY.to_string()],
+    }
 }
 
 /// Resolve a blocker id's display title via a one-shot `todo_get`. Failure
@@ -1414,6 +1546,7 @@ fn promotion_target(target: &Target, form_id: Option<u64>) -> Option<Target> {
     match (target, form_id) {
         (Target::NewTodo, Some(id)) => Some(Target::Todo(id)),
         (Target::NewNote, Some(id)) => Some(Target::Note(id)),
+        (Target::NewAgentConfig, Some(id)) => Some(Target::AgentConfig(id)),
         _ => None,
     }
 }
@@ -1561,6 +1694,7 @@ mod tests {
             last_refresh: Instant::now(),
             needs_draw: false,
             sole_content_pane: false,
+            transient: false,
         }
     }
 
@@ -1677,6 +1811,7 @@ mod tests {
             last_refresh: Instant::now(),
             needs_draw: false,
             sole_content_pane: false,
+            transient: false,
         }
     }
 
@@ -1817,6 +1952,7 @@ mod tests {
             last_refresh: Instant::now(),
             needs_draw: false,
             sole_content_pane: false,
+            transient: false,
         };
         viewer.promote_form_target(Target::Note(42));
         assert_eq!(viewer.target, Target::Note(42));

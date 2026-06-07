@@ -233,6 +233,7 @@ struct AgentToolDto {
     command: String,
     cwd: String,
     tool_type: String,
+    system_prompt: String,
     enabled: bool,
     position: i64,
     created_at: String,
@@ -247,6 +248,7 @@ impl AgentToolDto {
             command: t.command,
             cwd: t.cwd,
             tool_type: t.tool_type,
+            system_prompt: t.system_prompt,
             enabled: t.enabled,
             position: t.position,
             created_at: t.created_at,
@@ -1246,6 +1248,7 @@ impl Handler {
                 args.cwd.unwrap_or_default(),
                 args.tool_type
                     .unwrap_or_else(|| panopt_core::agent_profiles::DEFAULT_PROFILE_KEY.to_string()),
+                args.system_prompt.unwrap_or_default(),
                 args.enabled.unwrap_or(true),
             )
             .map_err(map_core_err)?
@@ -1293,6 +1296,7 @@ impl Handler {
             command: args.command,
             cwd: args.cwd,
             tool_type: args.tool_type,
+            system_prompt: args.system_prompt,
             enabled: args.enabled,
             position: args.position,
         };

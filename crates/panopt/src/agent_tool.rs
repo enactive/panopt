@@ -43,6 +43,10 @@ pub enum AgentToolCmd {
         /// profile; defaults to claude-code when omitted.
         #[arg(long = "tool-type")]
         tool_type: Option<String>,
+        /// Per-config system prompt the spawn template can land into a launch
+        /// flag or file.
+        #[arg(long = "system-prompt")]
+        system_prompt: Option<String>,
     },
     /// Edit an agent tool. Omitted options are left unchanged.
     Set {
@@ -58,6 +62,8 @@ pub enum AgentToolCmd {
         cwd: Option<String>,
         #[arg(long = "tool-type")]
         tool_type: Option<String>,
+        #[arg(long = "system-prompt")]
+        system_prompt: Option<String>,
     },
     /// Mark a tool as offered in spawn UIs.
     Enable {
@@ -99,6 +105,7 @@ fn dispatch(client: &Client, cmd: AgentToolCmd) -> Result<()> {
             command,
             cwd,
             tool_type,
+            system_prompt,
         } => {
             let mut args = Map::new();
             args.insert("name".into(), json!(name));
@@ -106,6 +113,7 @@ fn dispatch(client: &Client, cmd: AgentToolCmd) -> Result<()> {
             insert_opt(&mut args, "command", command);
             insert_opt(&mut args, "cwd", cwd);
             insert_opt(&mut args, "tool_type", tool_type);
+            insert_opt(&mut args, "system_prompt", system_prompt);
             let id = client.call("agent_tool_create", Value::Object(args))?;
             println!("created agent tool #{}", render_scalar(&id));
         }
@@ -116,6 +124,7 @@ fn dispatch(client: &Client, cmd: AgentToolCmd) -> Result<()> {
             command,
             cwd,
             tool_type,
+            system_prompt,
         } => {
             let mut args = Map::new();
             args.insert("agent_tool_id".into(), json!(id));
@@ -124,6 +133,7 @@ fn dispatch(client: &Client, cmd: AgentToolCmd) -> Result<()> {
             insert_opt(&mut args, "command", command);
             insert_opt(&mut args, "cwd", cwd);
             insert_opt(&mut args, "tool_type", tool_type);
+            insert_opt(&mut args, "system_prompt", system_prompt);
             client.call("agent_tool_update", Value::Object(args))?;
             println!("updated agent tool #{id}");
         }
@@ -190,6 +200,9 @@ fn print_entry(e: &Value) {
         "  tool_type:  {}",
         e["tool_type"].as_str().unwrap_or("agent")
     );
+    if let Some(p) = e["system_prompt"].as_str().filter(|s| !s.is_empty()) {
+        println!("  prompt:     {p}");
+    }
     println!("  enabled:    {}", e["enabled"].as_bool().unwrap_or(true));
     println!("  created:    {}", e["created_at"].as_str().unwrap_or("?"));
 }

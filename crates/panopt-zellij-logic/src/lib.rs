@@ -667,6 +667,10 @@ pub fn viewer_title_for(
         (Some("note-list"), _) => "Notes".to_string(),
         (Some("new-todo"), _) => "New todo".to_string(),
         (Some("new-note"), _) => "New note".to_string(),
+        // The agent-config form carries the config's name in its own fields, so
+        // the pane title stays id-only (the config index isn't in scope here).
+        (Some("agent-config"), Some(id)) => format!("Agent config #{id}"),
+        (Some("new-agent-config"), _) => "New agent config".to_string(),
         _ => "Viewer".to_string(),
     }
 }

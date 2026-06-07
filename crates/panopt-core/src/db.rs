@@ -15,7 +15,7 @@ use crate::agent_profiles::DEFAULT_PROFILE_KEY;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -309,6 +309,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 13 {
         apply_v13(conn)?;
     }
+    if version < 14 {
+        apply_v14(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -483,6 +486,21 @@ fn apply_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column_if_missing(conn, "processes", "state_since", "INTEGER")
 }
 
+/// Version 14: `system_prompt` on agent_tools (todo #140).
+///
+/// A per-config system prompt the cockpit's agent-config form edits and a
+/// spawn-spec template can land into a launch flag or file. Stored on the
+/// durable config (the slot), not the instance, so it persists across runs.
+/// `NOT NULL DEFAULT ''` keeps every existing row valid with an empty prompt.
+fn apply_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "agent_tools",
+        "system_prompt",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+}
+
 /// True if a table named `table` exists. Used by migrations that must stay
 /// idempotent against a transitional dev-database that already applied a
 /// rename or create before its `user_version` bump landed.
@@ -578,6 +596,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn fresh_database_has_the_v14_agent_tools_system_prompt() {
+        // A row inserted without naming system_prompt picks up the NOT NULL
+        // DEFAULT '' the V14 ALTER established, so every pre-V14 config reads
+        // back as an empty prompt rather than NULL.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO agent_tools (project_id, id, name, tool_type, created_at)
+                 VALUES (1, 1, 'Claude', 'claude-code', '');",
+        )
+        .unwrap();
+        let prompt: String = conn
+            .query_row(
+                "SELECT system_prompt FROM agent_tools WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt, "");
     }
 
     #[test]

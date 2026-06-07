@@ -258,6 +258,10 @@ pub struct AgentToolCreateArgs {
     /// Free-form tag for future categorization. Defaults to "agent".
     #[serde(default)]
     pub tool_type: Option<String>,
+    /// Per-config system prompt the spawn template can land into a launch flag
+    /// or file. Omit for an empty prompt (the agent's own default).
+    #[serde(default)]
+    pub system_prompt: Option<String>,
     /// Whether the tool is offered in spawn UIs. Defaults to true.
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -288,6 +292,9 @@ pub struct AgentToolUpdateArgs {
     /// New tool_type tag. Omit to leave unchanged.
     #[serde(default)]
     pub tool_type: Option<String>,
+    /// New system prompt. Omit to leave unchanged.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
     /// New enabled flag. Omit to leave unchanged.
     #[serde(default)]
     pub enabled: Option<bool>,

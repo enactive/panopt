@@ -892,6 +892,7 @@ impl Store {
         command: String,
         cwd: String,
         tool_type: String,
+        system_prompt: String,
         enabled: bool,
     ) -> Result<u64, CoreError> {
         self.validate_tool_type(&tool_type)?;
@@ -902,8 +903,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO agent_tools
                     (project_id, id, name, display_name, command, cwd,
-                     tool_type, enabled, position, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))",
+                     tool_type, system_prompt, enabled, position, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
                 params![
                     pid,
                     next,
@@ -912,6 +913,7 @@ impl Store {
                     command,
                     cwd,
                     tool_type,
+                    system_prompt,
                     enabled as i64,
                     next,
                 ],
@@ -930,7 +932,7 @@ impl Store {
     /// List a project's agent tools, ordered by `position` then `id`.
     pub fn agent_tool_list(&self, project: ProjectId) -> Result<Vec<AgentTool>, CoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, display_name, command, cwd, tool_type, enabled, position, created_at
+            "SELECT id, name, display_name, command, cwd, tool_type, system_prompt, enabled, position, created_at
                FROM agent_tools
               WHERE project_id = ?1 AND deleted_at IS NULL
               ORDER BY position, id",
@@ -943,9 +945,10 @@ impl Store {
                 command: r.get(3)?,
                 cwd: r.get(4)?,
                 tool_type: Self::normalize_tool_type(r.get(5)?),
-                enabled: r.get::<_, i64>(6)? != 0,
-                position: r.get(7)?,
-                created_at: r.get(8)?,
+                system_prompt: r.get(6)?,
+                enabled: r.get::<_, i64>(7)? != 0,
+                position: r.get(8)?,
+                created_at: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -981,6 +984,9 @@ impl Store {
             self.validate_tool_type(&v)?;
             entry.tool_type = v;
         }
+        if let Some(v) = patch.system_prompt {
+            entry.system_prompt = v;
+        }
         if let Some(v) = patch.enabled {
             entry.enabled = v;
         }
@@ -990,14 +996,15 @@ impl Store {
         self.conn.execute(
             "UPDATE agent_tools
                 SET name = ?1, display_name = ?2, command = ?3, cwd = ?4,
-                    tool_type = ?5, enabled = ?6, position = ?7
-              WHERE project_id = ?8 AND id = ?9",
+                    tool_type = ?5, system_prompt = ?6, enabled = ?7, position = ?8
+              WHERE project_id = ?9 AND id = ?10",
             params![
                 entry.name,
                 entry.display_name,
                 entry.command,
                 entry.cwd,
                 entry.tool_type,
+                entry.system_prompt,
                 entry.enabled as i64,
                 entry.position,
                 project.0,
@@ -1027,7 +1034,7 @@ impl Store {
     fn fetch_agent_tool(&self, project: ProjectId, id: u64) -> Result<AgentTool, CoreError> {
         self.conn
             .query_row(
-                "SELECT name, display_name, command, cwd, tool_type, enabled, position, created_at
+                "SELECT name, display_name, command, cwd, tool_type, system_prompt, enabled, position, created_at
                    FROM agent_tools
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
@@ -1039,9 +1046,10 @@ impl Store {
                         command: r.get(2)?,
                         cwd: r.get(3)?,
                         tool_type: Self::normalize_tool_type(r.get(4)?),
-                        enabled: r.get::<_, i64>(5)? != 0,
-                        position: r.get(6)?,
-                        created_at: r.get(7)?,
+                        system_prompt: r.get(5)?,
+                        enabled: r.get::<_, i64>(6)? != 0,
+                        position: r.get(7)?,
+                        created_at: r.get(8)?,
                     })
                 },
             )
@@ -2320,6 +2328,7 @@ mod tests {
                     String::new(),
                     String::new(),
                     "claude-code".into(),
+                    String::new(),
                     true,
                 )
                 .unwrap(),
@@ -2375,6 +2384,7 @@ mod tests {
                 "claude".into(),
                 String::new(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -2407,6 +2417,7 @@ mod tests {
                 "claude".into(),
                 String::new(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -3306,6 +3317,7 @@ mod tests {
                 "claude --model sonnet".into(),
                 String::new(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -3359,6 +3371,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .is_ok());
@@ -3373,6 +3386,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 "no-such-type".into(),
+                String::new(),
                 true,
             )
             .unwrap_err();
@@ -3392,6 +3406,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -3500,6 +3515,7 @@ mod tests {
                 "claude".into(),
                 "/work".into(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -3562,6 +3578,7 @@ mod tests {
                 "claude".into(),
                 "/work".into(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -3581,6 +3598,7 @@ mod tests {
                 "claude".into(),
                 "/work".into(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -3636,6 +3654,7 @@ mod tests {
                 "claude".into(),
                 "/work".into(),
                 "claude-code".into(),
+                String::new(),
                 true,
             )
             .unwrap();
@@ -3686,6 +3705,7 @@ mod tests {
                 "claude".into(),
                 String::new(),
                 "claude-code".into(),
+                String::new(),
                 false,
             )
             .unwrap();

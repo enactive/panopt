@@ -1783,7 +1783,7 @@ pub(crate) fn text_area(initial: &str) -> TextArea<'static> {
 }
 
 /// Render a cyclable enum field as a one-line `Label: < value >`.
-fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
+pub(crate) fn enum_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
     Paragraph::new(format!(" {label}: < {value} >")).style(label_style(focused))
 }
 
@@ -1803,7 +1803,7 @@ pub(crate) fn field_border_color(focused: bool) -> Color {
 
 /// Style for an inline field's leading label. Matches `enum_line`'s palette so
 /// Status, Priority, Assignee, and Tags read as one band of inline fields.
-fn label_style(focused: bool) -> Style {
+pub(crate) fn label_style(focused: bool) -> Style {
     if focused {
         Style::default()
             .fg(Color::Yellow)

@@ -771,10 +771,11 @@ impl PanoptPane {
                 lines.push("  x             delete note".to_string());
             }
             Mode::Agents => {
-                lines.push("  n             new agent".to_string());
-                lines.push("  u             start / focus".to_string());
-                lines.push("  d             stop (close pane)".to_string());
-                lines.push("  x             delete agent".to_string());
+                lines.push("  Enter / u     start / focus instance".to_string());
+                lines.push("  n             new config (form)".to_string());
+                lines.push("  e             edit config (form)".to_string());
+                lines.push("  d             stop instance (close pane)".to_string());
+                lines.push("  x             delete config".to_string());
             }
             Mode::Commands => {
                 lines.push("  u             start / focus".to_string());
@@ -1496,6 +1497,7 @@ impl PanoptPane {
             }
             BareKey::Enter => self.activate_cursor(),
             BareKey::Char('e') if self.mode == Mode::Todos => self.edit_focused_todo(),
+            BareKey::Char('e') if self.mode == Mode::Agents => self.edit_focused_config(),
             // `n` creates a new item of the current pane type. The kind
             // tracks the mode so a single binding gives the user "new"
             // semantics everywhere it makes sense.
@@ -1505,7 +1507,9 @@ impl PanoptPane {
             BareKey::Char('n') if self.mode == Mode::Notes => {
                 self.open_document("new-note", None, true)
             }
-            BareKey::Char('n') if self.mode == Mode::Agents => self.create_agent_config(),
+            BareKey::Char('n') if self.mode == Mode::Agents => {
+                self.spawn_config_form("new-agent-config", None)
+            }
             BareKey::Char('L') => self.open_mode_list(true),
             // `Alt-<1..5>` jumps focus to a sibling sidebar pane, lazygit-style
             // (todo #110). Guarded on the Alt modifier so it takes precedence
@@ -1874,9 +1878,17 @@ impl PanoptPane {
                     cwd,
                 );
             }
-            // `agent-tool` is not yet reachable through the sidebar's delete
-            // keybind, so a stray pipe for it is ignored rather than executed
-            // against a missing CLI.
+            // Deleting an agent config removes its durable slot. Stop any live
+            // instance first (kill the process, close its pane) so we don't
+            // leave an agent running with no config row backing it, then
+            // soft-delete the config via the CLI.
+            "agent-tool" => {
+                self.stop_config(id);
+                self.run_panopt(
+                    &["agent-tool", "rm", &id.to_string(), "--port", &self.port],
+                    cwd,
+                );
+            }
             _ => {}
         }
     }
@@ -1987,28 +1999,52 @@ impl PanoptPane {
         }
     }
 
-    /// Create a new agent config via `panopt agent-tool add` (#27): the
-    /// config-centric replacement for the old ad-hoc `_agent` spawn on `n`. The
-    /// config defaults to the `claude-code` profile and an auto-minted name the
-    /// user can rename; it appears in the Agents pane on the next reload, ready
-    /// to start with `u`/Enter.
-    fn create_agent_config(&mut self) {
+    /// Open the agent-config form for the focused config, if one is focused.
+    /// Enter in the Agents pane starts/focuses the *instance* (lifecycle, #143)
+    /// and the content slot holds that live agent pane, so editing the durable
+    /// config gets its own `e` gesture - mirroring `e` on a todo.
+    fn edit_focused_config(&mut self) {
+        if let Some(ItemTarget::Config(id)) = self.focused_target() {
+            self.spawn_config_form("agent-config", Some(id));
+        }
+    }
+
+    /// Float the agent-config editor (`panopt _viewer --transient`). Unlike the
+    /// todo/note forms, this is a floating overlay rather than a tiled content
+    /// pane: the Agents content slot is occupied by the live agent pane, and
+    /// swapping a viewer into it (then closing it) would suppress the agent and
+    /// trip the content-slot floor into spawning replacement panes. A floating
+    /// pane is excluded from the content-slot accounting (`!p.floating`), so it
+    /// never disturbs the agent and closes cleanly. The viewer still autosaves
+    /// and refreshes while open - it is the same `_viewer` process.
+    fn spawn_config_form(&mut self, kind: &str, id: Option<u64>) {
         let Some(cwd) = self.launch_cwd() else {
             return;
         };
-        self.next_agent += 1;
-        let name = format!("agent-{}", self.next_agent);
-        self.run_panopt(
-            &[
-                "agent-tool",
-                "add",
-                name.as_str(),
-                "--tool-type",
-                "claude-code",
-                "--port",
-                &self.port,
-            ],
-            cwd,
+        let slot_name = self.allocate_viewer_slot();
+        write_routing(kind, id, &slot_name);
+        let mut args = vec![
+            "_viewer".to_string(),
+            "--slot".to_string(),
+            slot_name,
+            "--port".to_string(),
+            self.port.clone(),
+            "--kind".to_string(),
+            kind.to_string(),
+            "--transient".to_string(),
+        ];
+        if let Some(id) = id {
+            args.push("--id".to_string());
+            args.push(id.to_string());
+        }
+        open_command_pane_floating(
+            CommandToRun {
+                path: PathBuf::from(&self.panopt_bin),
+                args,
+                cwd: Some(cwd),
+            },
+            None,
+            BTreeMap::new(),
         );
     }
 

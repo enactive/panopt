@@ -5,6 +5,7 @@
 
 mod agent;
 mod agent_config;
+mod agent_config_form;
 mod agent_tool;
 mod clip;
 mod close_gate;
@@ -249,6 +250,12 @@ enum Cmd {
         /// Initial item id, for the todo and note kinds.
         #[arg(long)]
         id: Option<u64>,
+        /// Transient (floating) viewer: a one-off editor overlay, not a tiled
+        /// content pane. Suppresses the sole-content-pane close refusal so
+        /// Ctrl-C always closes it - a floating pane is never the tiled content
+        /// the refusal exists to protect.
+        #[arg(long)]
+        transient: bool,
     },
     /// Internal: the floating close-gate dialog the sidebar plugin spawns
     /// when a destructive action would lose active items.
@@ -323,7 +330,13 @@ fn main() -> anyhow::Result<()> {
             pane_id,
             agent_state,
         } => process::exec_report(ws, id, pane_id, agent_state, cli.port),
-        Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
+        Cmd::ViewerExec {
+            ws,
+            slot,
+            kind,
+            id,
+            transient,
+        } => viewer::run(ws, cli.port, slot, kind, id, transient),
         Cmd::CloseGateExec {
             scope,
             items,
