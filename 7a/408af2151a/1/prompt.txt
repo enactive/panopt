@@ -1,0 +1,17 @@
+read #135 and figure  out what's next
+
+---
+
+read #163.  processes.md still isn't changing ad you work.
+
+---
+
+it did update to 'thinking' at some point, but now that I've stopped you, it's still 'thinking'..  erratic.
+
+---
+
+this needs to work both with agents started from the cockpit and from outside as in `just devagent`.   do it the 'proper' way. i don't care about restarts.
+
+---
+
+keep in mind that 'devagent' is just a convenience.  we can formalize the creation of external agents (not always claude; give a better identifier; whatever) as necessary.  IOW: don't design around devagant.
