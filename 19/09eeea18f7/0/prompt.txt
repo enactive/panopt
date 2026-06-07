@@ -1,0 +1,13 @@
+what's next on #135?
+
+---
+
+let's do #140 first.
+
+---
+
+if I start an agent, then goto the agents pane and press 'n', then ctrl-c it  completely screws up the pane layout - tons of new empty panes all over
+
+---
+
+update the help '?' menu for agents.  is there a way to delete configs?
