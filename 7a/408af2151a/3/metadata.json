@@ -1,0 +1,109 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "7a408af2151a",
+  "session_id": "63f3def6-1bcb-420e-8130-00af9daebfaa",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-07T05:45:56.774103844Z",
+  "branch": "agent-model",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "Cargo.lock",
+    "crates/panopt-core/src/agent_profiles/mod.rs",
+    "crates/panopt-core/src/projection.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-zellij-logic/Cargo.toml",
+    "crates/panopt-zellij-logic/src/lib.rs",
+    "crates/panopt-zellij/Cargo.lock",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/main.rs",
+    "crates/panopt/src/process.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "c8d92d8973b5",
+  "checkpoint_transcript_start": 237,
+  "transcript_lines_at_start": 237,
+  "token_usage": {
+    "input_tokens": 2280,
+    "cache_creation_tokens": 340824,
+    "cache_read_tokens": 18669667,
+    "output_tokens": 87903,
+    "api_call_count": 108
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_013SbZzwVyy2PQRrDdayf1vC",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "c8d92d8973b5",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 206,
+        "end": 207,
+        "entry_ids": [
+          "5cd36122-6394-4343-9b0f-0af34a486c86"
+        ],
+        "tool_use_id": "toolu_013SbZzwVyy2PQRrDdayf1vC"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_013SbZzwVyy2PQRrDdayf1vC"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 9
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-07T05:45:56.723381124Z",
+    "agent_lines": 1369,
+    "agent_removed": 81,
+    "human_added": 114,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1483,
+    "total_lines_changed": 1581,
+    "agent_percentage": 91.71410499683745,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 543,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/scheduled_tasks.lock": 1,
+        "docs/observe-design.md": 542
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1146,
+      "agent_lines_removed": 52
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 1146,
+      "agent_lines_removed": 52
+    }
+  ]
+}
