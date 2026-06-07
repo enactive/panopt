@@ -1,0 +1,15 @@
+do #159
+
+---
+
+i told the "good" agent: "spawn an agent to check the weather in portlad, oregon".  
+
+it called it's own sub-agent rather than using panopt. 
+
+I did the same test in soloterm and it used the solo mcp. 
+
+investigate the difference is tool / mcp instructions or whatever might have caused this discrepancy (we want the latter behavior).
+
+---
+
+do all 3.
