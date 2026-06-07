@@ -1,0 +1,65 @@
+testing per #163.  again.  processes.md is updated when this agent was created.  I quit the agent and the files was *not* updated.  still  had the line for #158.
+
+---
+
+testing per #163.  again.  processes.md is updated when this agent was created.  I quit the agent and the files was *not* updated.  still  had the line for #158.  BTW: the initial state was: thinking evan though the agent was idle...
+
+---
+
+heavy sigh.  now you've removed the agent config.  and when I create agents, NOTHING is written to processes.md at all.  ever.
+
+---
+
+ew
+
+---
+
+does this address why 'open' wasnt in the agents pane?
+
+---
+
+the agents pane should hold configs. those map 1:1 with actual agents.
+
+---
+
+go
+
+---
+
+how can I test this?
+
+---
+
+how can I test this?  what different states should show up in processes.md?
+
+---
+
+it doesn't change from running.  no 'state:thinking' at all
+
+---
+
+done
+
+---
+
+there's an 'idle' notation in processes.md . what is it used for.  I ask, 'cause it's never updated.  just sitting at "0m"
+
+---
+
+if it's too costly to reproject periodically, then remove it.   is it, tho?
+
+---
+
+wait.  how is idle detected???
+
+---
+
+we will later need to alert on idle, so refining this will be an ongoing process.  let's accept the current imprecision and implement a 10s reprojet.
+
+---
+
+wtf?  i asked you how idle is detected and you said it's based on pane contents.  how can a call to the mcp serve indicate *idle* FFS?
+
+---
+
+do that
