@@ -1378,6 +1378,7 @@ name = "panopt-zellij-logic"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "serde_json",
 ]
 
 [[package]]

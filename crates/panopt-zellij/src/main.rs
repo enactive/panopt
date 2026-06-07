@@ -62,6 +62,12 @@ const AGENT_LABELS_PATH: &str = "/host/.panopt/.cockpit/agent-labels.json";
 /// in-pane Ctrl-c/`q`, which never routes through the plugin.
 const CONTENT_COUNT_PATH: &str = "/host/.panopt/.cockpit/content-count";
 
+/// The daemon's input queue (todo #160): one JSON object per line, bound for a
+/// running instance's pane. The Todos gatekeeper reads this each poll, writes
+/// each `content` into the addressed agent's pane, and acks the `seq` so the
+/// daemon drops it. See `panopt_core::projection::project_inputs`.
+const INPUTS_PATH: &str = "/host/.panopt/.cockpit/inputs.jsonl";
+
 #[derive(Default)]
 struct PanoptPane {
     /// Which resource kind this plugin instance renders. Set in
@@ -196,6 +202,12 @@ struct PanoptPane {
     /// observer reports only on a *change*, so a steady-state agent does not
     /// spawn a `_process-report` subprocess every poll. Pruned to the live set.
     reported_states: BTreeMap<u64, String>,
+
+    /// Queue ids of inputs already written into a pane (todo #160). The daemon
+    /// drops an input from `inputs.jsonl` once we ack it, but the projection
+    /// lags our write by a poll or two; tracking delivered seqs here stops us
+    /// from typing the same input twice in that window.
+    delivered_inputs: std::collections::HashSet<i64>,
 
     /// Whether any plugin pane is currently the focused pane in its tab.
     /// Updated by [`PanoptPane::ingest_panes`] but only from a non-transient
@@ -381,6 +393,10 @@ impl ZellijPlugin for PanoptPane {
             // `get_pane_scrollback` (#142/#163); without this the host silently
             // drops the call (an EOF on stdin) and no `state:` is ever derived.
             PermissionType::ReadPaneContents,
+            // The input deliverer (#160) types queued input into agent panes via
+            // `write_chars_to_pane_id`; without this the host silently drops the
+            // write and a spawned agent never receives its task.
+            PermissionType::WriteToStdin,
         ]);
         subscribe(&[
             EventType::PaneUpdate,
@@ -457,6 +473,10 @@ impl ZellijPlugin for PanoptPane {
                 // changes back to the daemon (todo #142). Same poll, same
                 // gatekeeper gating - the observer mirrors the reconciler.
                 self.observe_agent_states();
+                // Type any queued input into agent panes (todo #160): the
+                // cockpit half of send_input and of a spawn's opening prompt.
+                // Same poll and gatekeeper gating as the observer above.
+                self.deliver_pending_inputs();
                 // PaneUpdate-driven `sync_pane_titles` only fires when Zellij
                 // sends a pane manifest - typing into the form does not. Without
                 // this call, every right-pane title (most visibly a freshly
@@ -2201,6 +2221,62 @@ impl PanoptPane {
                 cwd.clone(),
             );
             self.reported_states.insert(id, state.to_string());
+        }
+    }
+
+    /// Deliver queued input into agent panes (todo #160): the cockpit half of
+    /// `send_input` and of an ad-hoc spawn's opening prompt. Reads the daemon's
+    /// `inputs.jsonl`, writes each `content` into the addressed instance's pane
+    /// via the Zellij host API, and acks the `seq` so the daemon drops it.
+    ///
+    /// Gated to the Todos gatekeeper (one of the five sidebar instances) and to
+    /// `running` instances - typing into a `starting` pane before the agent has
+    /// booted would be lost. A `delivered_inputs` set guards the window between
+    /// our write and the projection catching up, so an input is typed once.
+    fn deliver_pending_inputs(&mut self) {
+        if self.mode != Mode::Todos || !self.permitted {
+            return;
+        }
+        let Ok(body) = fs::read_to_string(INPUTS_PATH) else {
+            return;
+        };
+        // Snapshot (seq, pane, content) for delivered-now rows so the borrow of
+        // `self.processes` is released before we ack via a subprocess. Only
+        // running instances whose pane we can resolve are eligible.
+        let mut to_write: Vec<(i64, PaneId, String)> = Vec::new();
+        for row in body.lines().filter_map(parse_input_line) {
+            if self.delivered_inputs.contains(&row.seq) {
+                continue;
+            }
+            let Some(proc) = self
+                .processes
+                .iter()
+                .find(|r| r.id == row.process_id && r.status.as_deref() == Some("running"))
+            else {
+                continue;
+            };
+            let Some(pane) = self.agent_pane(row.process_id, proc.agent_id.as_deref()) else {
+                continue;
+            };
+            to_write.push((row.seq, pane, row.content));
+        }
+        let Some(cwd) = self.launch_cwd() else {
+            return;
+        };
+        for (seq, pane, content) in to_write {
+            write_chars_to_pane_id(&content, pane);
+            self.delivered_inputs.insert(seq);
+            let seq_str = seq.to_string();
+            self.run_panopt(
+                &[
+                    "_input-ack",
+                    "--port",
+                    self.port.as_str(),
+                    "--seq",
+                    seq_str.as_str(),
+                ],
+                cwd.clone(),
+            );
         }
     }
 

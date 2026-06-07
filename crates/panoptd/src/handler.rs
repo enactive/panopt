@@ -24,11 +24,12 @@ use panopt_core::{
 };
 use panopt_tool_surface::params::{
     AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
-    IdentifyArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs, ProcessDeleteArgs,
-    ProcessGetArgs, ProcessReportArgs, ProcessStartArgs, ProcessStopArgs, ProcessUpdateArgs,
-    NoteAppendArgs, NoteCreateArgs,
+    IdentifyArgs, InputAckArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs,
+    ProcessDeleteArgs, ProcessGetArgs, ProcessReportArgs, ProcessStartArgs, ProcessStopArgs,
+    ProcessUpdateArgs, NoteAppendArgs, NoteCreateArgs,
     NoteDeleteArgs, NoteGetArgs, NoteReadArgs, NoteSearchArgs,
-    NoteUpdateArgs, TodoBlockerArgs, TodoCommentAddArgs, TodoCommentDeleteArgs,
+    NoteUpdateArgs, SendInputArgs, SpawnAgentArgs, TodoBlockerArgs, TodoCommentAddArgs,
+    TodoCommentDeleteArgs,
     TodoCommentUpdateArgs, TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs,
     TodoLockArgs, TodoSearchArgs, TodoSetBlockersArgs, TodoStartArgs, TodoUnlockArgs,
     TodoUpdateArgs,
@@ -1481,6 +1482,131 @@ impl Handler {
         json_result(&dto)
     }
 
+    /// `spawn_agent` (#159/#160): the orchestration-facing spawn. With
+    /// `agent_tool_id` it starts that config (same path as `process_start`);
+    /// without, it creates an ad-hoc config from `tool_type` (default agent
+    /// type) and starts that, so an orchestrator can spawn an agent with no
+    /// pre-made slot. An opening `prompt` is queued as the instance's first
+    /// input, delivered into its pane by the cockpit once it is live.
+    async fn spawn_agent(
+        &self,
+        parts: Parts,
+        args: SpawnAgentArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let dto = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+
+            // Resolve the backing config: an existing one, or a fresh ad-hoc
+            // slot. Auto-creating a config keeps ad-hoc spawns inside the
+            // two-layer model - the agent shows up in the cockpit and reuses the
+            // whole config -> instance -> profile-render pipeline.
+            let tool_id = match args.agent_tool_id {
+                Some(id) => id,
+                None => {
+                    let tool_type = args
+                        .tool_type
+                        .clone()
+                        .unwrap_or_else(|| panopt_core::agent_profiles::DEFAULT_PROFILE_KEY.to_string());
+                    let label = args.name.clone().unwrap_or_default();
+                    let created = st
+                        .agent_tool_create(
+                            project,
+                            label.clone(),
+                            label.clone(),
+                            String::new(),
+                            String::new(),
+                            tool_type,
+                            String::new(),
+                            true,
+                        )
+                        .map_err(map_core_err)?;
+                    // With no name given, stamp a unique one so the registry
+                    // agent id (derived from the config name) can't collide with
+                    // another nameless ad-hoc spawn.
+                    if label.trim().is_empty() {
+                        let nm = format!("agent-{created}");
+                        st.agent_tool_update(
+                            project,
+                            created,
+                            AgentToolPatch {
+                                name: Some(nm.clone()),
+                                display_name: Some(nm),
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(map_core_err)?;
+                    }
+                    created
+                }
+            };
+
+            let process = st
+                .process_start_with(
+                    project,
+                    tool_id,
+                    args.name.clone(),
+                    args.extra_args.unwrap_or_default(),
+                )
+                .map_err(map_core_err)?;
+
+            // The opening task rides the same input queue as send_input: queued
+            // now, typed into the pane by the cockpit once the instance is live.
+            // Ensure a trailing newline so it submits like a human's Enter.
+            if let Some(prompt) = args.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                let line = format!("{prompt}\n");
+                st.send_input(project, process.id, &line).map_err(map_core_err)?;
+            }
+
+            let instructions = st
+                .render_agent_instructions(
+                    project,
+                    &process,
+                    &self.host,
+                    self.port,
+                    &self.token,
+                    &self.panopt_bin,
+                )
+                .map_err(map_core_err)?;
+            let mut dto = ProcessDto::from_entry(process);
+            dto.agent_instructions = instructions;
+            dto
+        };
+        json_result(&dto)
+    }
+
+    /// `send_input` (#160): queue a line of input for a running instance. The
+    /// cockpit writes it into the agent's pane and acks it; the daemon performs
+    /// no host effect itself.
+    async fn send_input(
+        &self,
+        parts: Parts,
+        args: SendInputArgs,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.send_input(project, args.process_id, &args.input)
+                .map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    /// `input_ack` (#160): cockpit-internal. Mark a queued input delivered so
+    /// the daemon drops it from the projection.
+    async fn input_ack(
+        &self,
+        parts: Parts,
+        args: InputAckArgs,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.ack_input(project, args.seq).map_err(map_core_err)?;
+        }
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
     async fn process_report(
         &self,
         parts: Parts,
@@ -1602,6 +1728,8 @@ enum Tool {
     ProcessDelete,
     ProcessStart,
     SpawnAgent,
+    SendInput,
+    InputAck,
     ProcessStop,
     ProcessReport,
     IdKind,
@@ -1656,6 +1784,8 @@ impl Tool {
             "process_delete" => Tool::ProcessDelete,
             "process_start" => Tool::ProcessStart,
             "spawn_agent" => Tool::SpawnAgent,
+            "send_input" => Tool::SendInput,
+            "input_ack" => Tool::InputAck,
             "process_stop" => Tool::ProcessStop,
             "process_report" => Tool::ProcessReport,
             "id_kind" => Tool::IdKind,
@@ -1861,12 +1991,17 @@ async fn dispatch_local<'a>(
             let args: ProcessStartArgs = parse_json_object(raw_args)?;
             handler.process_start(parts, args).await
         }
-        // `spawn_agent` is a thin alias: same args, same handler, same one-live-
-        // instance policy and `agent_instructions` return as `process_start`
-        // (todo #159). One dispatch path keeps the two from drifting.
         Tool::SpawnAgent => {
-            let args: ProcessStartArgs = parse_json_object(raw_args)?;
-            handler.process_start(parts, args).await
+            let args: SpawnAgentArgs = parse_json_object(raw_args)?;
+            handler.spawn_agent(parts, args).await
+        }
+        Tool::SendInput => {
+            let args: SendInputArgs = parse_json_object(raw_args)?;
+            handler.send_input(parts, args).await
+        }
+        Tool::InputAck => {
+            let args: InputAckArgs = parse_json_object(raw_args)?;
+            handler.input_ack(parts, args).await
         }
         Tool::ProcessStop => {
             let args: ProcessStopArgs = parse_json_object(raw_args)?;
@@ -1932,6 +2067,18 @@ impl ServerHandler for Handler {
                  launchable agents, commands, and terminals the cockpit tracks. Deleting an \
                  agent tool nulls the agent_tool_id back-reference of any processes that \
                  referenced it. Projected to .panopt/processes.md.\n\
+                 - Spawning and tasking agents (orchestration): when the user asks you to \
+                 spawn, launch, run, or delegate to an agent in THIS project, use \
+                 spawn_agent - do NOT use your own built-in sub-agent/Task tool. Only \
+                 spawn_agent makes the agent a first-class cockpit pane that joins this \
+                 shared coordination plane (registry, todos, notes, locks); a built-in \
+                 sub-agent is invisible to everyone else and cannot coordinate. \
+                 spawn_agent(prompt, optional tool_type, optional name) spawns an ad-hoc \
+                 agent and hands it the prompt as its opening task; spawn_agent(agent_tool_id) \
+                 starts a configured slot. It returns the new process_id plus rendered \
+                 agent_instructions. After it is running, send_input(process_id, input) types \
+                 a follow-up into the agent's pane, and process_stop(process_id) ends it (the \
+                 pane stands). One live instance per config.\n\
                  - Utilities: id_kind resolves a numeric id to its resource kind \
                  (todo / note / agent-tool / process) plus a short label. \
                  Useful since ids are unified per project and a `#N` reference \

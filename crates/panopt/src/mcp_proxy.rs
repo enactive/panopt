@@ -201,18 +201,27 @@ fn handle_tools_list(id: Option<Value>) -> Value {
 /// Respond to Claude Code's `initialize` without forwarding. The proxy is
 /// its own MCP server from Claude Code's perspective; the panoptd session
 /// is independent and was (or will be) initialized via [`Backend::connect`].
-fn handle_initialize(_backend: &mut Backend, id: Option<Value>) -> Value {
+fn handle_initialize(backend: &mut Backend, id: Option<Value>) -> Value {
+    let mut result = json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": { "tools": {} },
+        "serverInfo": {
+            "name": "panopt-proxy",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    });
+    // Pass panoptd's server instructions through to Claude Code. The proxy
+    // answers initialize locally (the panoptd session is independent), so
+    // without this the agent would never see panopt's guidance. Captured on
+    // connect; if connect has not happened yet or returned none, the field is
+    // simply omitted.
+    if let Some(instructions) = &backend.instructions {
+        result["instructions"] = json!(instructions);
+    }
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "result": {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "panopt-proxy",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-        },
+        "result": result,
     })
 }
 
@@ -251,6 +260,13 @@ struct Backend {
     /// successful `initialize`, or after a forwarded call discovered the
     /// session was forgotten.
     session_id: Option<String>,
+    /// Panoptd's server `instructions`, captured from its `initialize` result so
+    /// the proxy can pass them through to Claude Code (otherwise the proxy's
+    /// local `initialize` reply would carry none, and the agent would never see
+    /// panopt's guidance - including that it should spawn agents *through*
+    /// panopt rather than with its own built-in sub-agent tool). `None` until a
+    /// successful connect.
+    instructions: Option<String>,
 }
 
 impl Backend {
@@ -260,6 +276,7 @@ impl Backend {
             agent_id,
             name,
             session_id: None,
+            instructions: None,
         }
     }
 
@@ -289,7 +306,18 @@ impl Backend {
             .header("mcp-session-id")
             .map(str::to_string)
             .ok_or_else(|| anyhow!("panoptd returned no mcp-session-id on initialize"))?;
-        let _ = resp.into_string(); // discard the JSON-RPC body; we only needed the header
+        // Capture panoptd's server `instructions` so the proxy's own local
+        // `initialize` reply (handle_initialize) can pass them through to Claude
+        // Code. Best-effort: a body we can't parse just leaves instructions
+        // unset, which is no worse than before this passthrough existed.
+        if let Ok(body) = resp.into_string() {
+            if let Ok(v) = parse_response(&body) {
+                self.instructions = v["result"]["instructions"]
+                    .as_str()
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty());
+            }
+        }
 
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         ureq::post(&self.url)
@@ -449,8 +477,30 @@ mod tests {
         let resp = dispatch(&mut backend, &req).unwrap();
         assert_eq!(resp["id"], json!(7));
         assert_eq!(resp["result"]["serverInfo"]["name"], "panopt-proxy");
-        // We did not connect to panoptd, so the session must still be empty.
+        // We did not connect to panoptd, so the session must still be empty and
+        // no instructions are available to pass through.
         assert!(backend.session_id.is_none());
+        assert!(resp["result"].get("instructions").is_none());
+    }
+
+    #[test]
+    fn initialize_passes_panoptd_instructions_through_to_claude() {
+        // Once connect has captured panoptd's server instructions, the proxy's
+        // local initialize reply must carry them - otherwise the agent never
+        // sees panopt's guidance (the discrepancy behind agents using their own
+        // built-in sub-agent tool instead of spawn_agent).
+        let mut backend = Backend::new(
+            "http://127.0.0.1:0/mcp".into(),
+            "alpha".into(),
+            "alpha".into(),
+        );
+        backend.instructions = Some("PANopt: spawn agents with spawn_agent.".into());
+        let req = json!({"jsonrpc": "2.0", "id": 7, "method": "initialize"});
+        let resp = dispatch(&mut backend, &req).unwrap();
+        assert_eq!(
+            resp["result"]["instructions"],
+            json!("PANopt: spawn agents with spawn_agent.")
+        );
     }
 
     #[test]

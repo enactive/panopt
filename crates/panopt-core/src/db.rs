@@ -15,7 +15,7 @@ use crate::agent_profiles::DEFAULT_PROFILE_KEY;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -315,6 +315,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 15 {
         apply_v15(conn)?;
     }
+    if version < 16 {
+        apply_v16(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -517,6 +520,31 @@ fn apply_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
         "processes",
         "extra_args",
         "TEXT NOT NULL DEFAULT '[]'",
+    )
+}
+
+/// Version 16: the `process_inputs` queue (todo #160).
+///
+/// A durable, ordered queue of input lines bound for a running instance's pane.
+/// `send_input` (and an ad-hoc spawn's opening prompt) inserts a row; the daemon
+/// projects undelivered rows to `.panopt/.cockpit/inputs.jsonl`; the cockpit
+/// plugin writes each into the owned pane and acks it (stamping `delivered_at`),
+/// after which it drops from the projection. The global `AUTOINCREMENT` id is
+/// both the delivery order and the ack key, and is deliberately *not* the unified
+/// per-project `next_id` - queued input is not a `#N`-addressable resource.
+fn apply_v16(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if table_exists(conn, "process_inputs")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE process_inputs (
+             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+             project_id   INTEGER NOT NULL REFERENCES projects(id),
+             process_id   INTEGER NOT NULL,
+             content      TEXT    NOT NULL,
+             created_at   TEXT    NOT NULL,
+             delivered_at TEXT
+         );",
     )
 }
 

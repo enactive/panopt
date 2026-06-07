@@ -236,6 +236,17 @@ enum Cmd {
         #[arg(long = "agent-state")]
         agent_state: Option<String>,
     },
+    /// Internal: ack a delivered queued input (todo #160). The sidebar shells
+    /// this after it writes an input into an agent's pane, so the daemon drops
+    /// it from `inputs.jsonl`.
+    #[command(name = "_input-ack", hide = true)]
+    InputAck {
+        #[arg(long)]
+        ws: Option<PathBuf>,
+        /// Queue id (`seq`) of the input that was written into the pane.
+        #[arg(long)]
+        seq: i64,
+    },
     /// Internal: a long-lived cockpit viewer pane.
     #[command(name = "_viewer", hide = true)]
     ViewerExec {
@@ -330,6 +341,7 @@ fn main() -> anyhow::Result<()> {
             pane_id,
             agent_state,
         } => process::exec_report(ws, id, pane_id, agent_state, cli.port),
+        Cmd::InputAck { ws, seq } => process::exec_input_ack(ws, seq, cli.port),
         Cmd::ViewerExec {
             ws,
             slot,

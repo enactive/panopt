@@ -18,3 +18,8 @@ edition = "2021"
 # `default-features = false` drops the unicode tables the status patterns do not
 # need, keeping the wasm module small.
 regex = { version = "1", default-features = false, features = ["std"] }
+# The input queue (#160) is projected as JSON lines under `.cockpit/`; the
+# plugin parses them to write into agent panes. `serde_json` compiles to
+# wasm32-wasip1 and correctly unescapes prompt content (newlines, quotes) that a
+# hand-rolled line parser would mishandle.
+serde_json = "1"

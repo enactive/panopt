@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::agent_profiles::ProfileSet;
 use crate::model::{
-    process_status, Agent, AgentTool, Lock, Note, Process, ProcessKind, Todo, TodoStatus,
+    process_status, Agent, AgentTool, Lock, Note, PendingInput, Process, ProcessKind, Todo,
+    TodoStatus,
 };
 
 /// Per-process counter giving each temp file a unique name, so two concurrent
@@ -65,6 +66,22 @@ fn agent_tools_path(ws: &Path) -> PathBuf {
 /// The processes projection: per-project process instances (instance layer).
 fn processes_path(ws: &Path) -> PathBuf {
     panopt_dir(ws).join("processes.md")
+}
+
+/// The cockpit-internal directory. Unlike the human-facing `.panopt/*.md`, this
+/// holds machine state the sidebar plugin reads (routing files, the input
+/// queue). The plugin creates it on startup; the daemon ensures it before
+/// writing the input queue so projection never races the plugin's first run.
+fn cockpit_dir(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join(".cockpit")
+}
+
+/// The input-queue projection (todo #160): one JSON object per line
+/// (`{"seq":N,"process_id":N,"content":"..."}`), oldest first. The cockpit
+/// plugin writes each `content` into process `process_id`'s pane and acks
+/// `seq`. Cockpit-internal, so it lives under `.cockpit/`, not as human markdown.
+fn inputs_path(ws: &Path) -> PathBuf {
+    cockpit_dir(ws).join("inputs.jsonl")
 }
 
 /// The agent-type status patterns projection (todo #142). Single-sourced from
@@ -571,6 +588,24 @@ pub(crate) fn project_processes(
 /// [`render_agent_types_md`].
 pub(crate) fn project_agent_types(ws: &Path, profiles: &ProfileSet) -> io::Result<()> {
     atomic_write(&agent_types_path(ws), &render_agent_types_md(profiles))
+}
+
+/// Rewrite `.panopt/.cockpit/inputs.jsonl` from the undelivered input queue
+/// (todo #160). Ensures the cockpit dir exists first (the daemon may project
+/// before the plugin's first run created it). See [`inputs_path`].
+pub(crate) fn project_inputs(ws: &Path, pending: &[PendingInput]) -> io::Result<()> {
+    fs::create_dir_all(cockpit_dir(ws))?;
+    let mut body = String::new();
+    for input in pending {
+        let line = serde_json::json!({
+            "seq": input.id,
+            "process_id": input.process_id,
+            "content": input.content,
+        });
+        body.push_str(&line.to_string());
+        body.push('\n');
+    }
+    atomic_write(&inputs_path(ws), &body)
 }
 
 /// Rewrite `.panopt/agents.md` from the current agent roster. `now` is taken

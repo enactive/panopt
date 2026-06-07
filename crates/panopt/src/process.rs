@@ -337,6 +337,20 @@ pub fn exec_report(
         .context("reporting process runtime facts")
 }
 
+/// `panopt _input-ack` - ack a delivered queued input (todo #160).
+///
+/// The cockpit plugin shells this after it writes a queued input into an agent's
+/// pane, so the daemon stamps the row delivered and drops it from
+/// `inputs.jsonl`. Best-effort, like [`exec_report`]: a failure just leaves the
+/// input in the queue, where the next poll re-attempts delivery.
+pub fn exec_input_ack(ws: Option<PathBuf>, seq: i64, port: u16) -> Result<()> {
+    daemon::ensure(None, port)?;
+    let client = Client::connect(&observer_url(ws, port)?)?;
+    let result = client.call("input_ack", json!({ "seq": seq }));
+    client.close();
+    result.map(|_| ()).context("acking delivered input")
+}
+
 fn print_list(v: &Value) {
     let entries = v.as_array().cloned().unwrap_or_default();
     if entries.is_empty() {

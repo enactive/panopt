@@ -365,13 +365,32 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
     },
     ToolDef {
         name: "spawn_agent",
-        description: "Spawn a sub-agent: the orchestration-friendly alias for \
-                      `process_start`, taking the same arguments and the same one-live-\
-                      instance-per-config policy. Returns the process row plus rendered \
-                      `agent_instructions` - the per-type bootstrap text to prepend to the \
-                      spawned child's first prompt. Use `extra_args`/`name` to vary a launch \
-                      without mutating the config.",
-        schema_fn: schema_for::<ProcessStartArgs>,
+        description: "Spawn a sub-agent in THIS project - use this, not your own built-in \
+                      sub-agent/Task tool, whenever the user asks to spawn, launch, run, or \
+                      delegate to an agent here, so the agent becomes a first-class cockpit \
+                      pane on the shared coordination plane. With `agent_tool_id` it starts \
+                      that config; without, it spawns ad-hoc from `tool_type` (default agent \
+                      type), creating a config named by `name`. `prompt` is the opening task, \
+                      typed into the agent once it is live. Returns the process row plus \
+                      rendered `agent_instructions`. One live instance per config; then \
+                      `send_input` to task it further and `process_stop` to end it.",
+        schema_fn: schema_for::<SpawnAgentArgs>,
+    },
+    ToolDef {
+        name: "send_input",
+        description: "Type input into a running agent's pane (process_id, input). The \
+                      orchestration tasking channel: the daemon queues the input and the \
+                      cockpit writes it into the agent's pane, as if a human typed it (a \
+                      trailing newline submits). Use it to give a spawned agent its next \
+                      instruction without a human keystroke.",
+        schema_fn: schema_for::<SendInputArgs>,
+    },
+    ToolDef {
+        name: "input_ack",
+        description: "Cockpit-internal: mark a queued input (by `seq`) delivered after the \
+                      sidebar has written it into the pane, so the daemon drops it from the \
+                      queue. Agents do not call this; it is the plugin's ack of send_input.",
+        schema_fn: schema_for::<InputAckArgs>,
     },
     ToolDef {
         name: "process_stop",

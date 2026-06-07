@@ -380,6 +380,48 @@ pub struct ProcessStartArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SpawnAgentArgs {
+    /// Id of an existing agent config to start an instance of. Omit for an
+    /// ad-hoc spawn, in which case a fresh config is created from `tool_type`.
+    #[serde(default)]
+    pub agent_tool_id: Option<u64>,
+    /// Agent type for an ad-hoc spawn (e.g. `claude-code`). Ignored when
+    /// `agent_tool_id` is given. Defaults to the standard agent type.
+    #[serde(default)]
+    pub tool_type: Option<String>,
+    /// Display name for the spawned agent. For an ad-hoc spawn this names the
+    /// created config; for a config-backed spawn it overrides the instance's
+    /// name for this run only.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Opening task to hand the spawned agent: queued as its first input and
+    /// typed into its pane once it is live. Omit to spawn an idle agent.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Per-launch extra arguments appended to the spawn command for this
+    /// instance only, never written back to the config.
+    #[serde(default)]
+    pub extra_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendInputArgs {
+    /// Numeric id of the running instance (process) to type input into.
+    pub process_id: u64,
+    /// The text to write into the agent's pane. A trailing newline submits it,
+    /// the same as if a human typed it.
+    pub input: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InputAckArgs {
+    /// Queue id (`seq`) of the delivered input, from the input projection.
+    /// Cockpit-internal: the sidebar plugin calls this after writing the input
+    /// into the pane, so the daemon drops it from the queue.
+    pub seq: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProcessStopArgs {
     /// Numeric id of the process (instance) to stop.
     pub process_id: u64,

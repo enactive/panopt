@@ -389,6 +389,20 @@ pub struct ProcessPatch {
     pub state_since: Option<Option<i64>>,
 }
 
+/// One undelivered entry of the `process_inputs` queue (todo #160): a line of
+/// input bound for a running instance's pane. The cockpit plugin reads these
+/// from the projection, writes `content` into process `process_id`'s pane, and
+/// acks `id` so the daemon drops it from the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInput {
+    /// Global queue id - both the delivery order and the ack key.
+    pub id: i64,
+    /// The instance the input is bound for.
+    pub process_id: u64,
+    /// The exact text to write into the pane.
+    pub content: String,
+}
+
 /// How the registry came to know about an agent.
 ///
 /// The two key sources have very different lifetimes, and we treat them

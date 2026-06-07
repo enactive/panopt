@@ -20,9 +20,9 @@ use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
 use crate::model::{
-    process_status, Agent, AgentTool, AgentToolPatch, KeySource, Lock, Note, NotePatch, Priority,
-    Process, ProcessKind, ProcessPatch, ProjectId, ProjectSummary, Todo, TodoComment, TodoPatch,
-    TodoStatus,
+    process_status, Agent, AgentTool, AgentToolPatch, KeySource, Lock, Note, NotePatch,
+    PendingInput, Priority, Process, ProcessKind, ProcessPatch, ProjectId, ProjectSummary, Todo,
+    TodoComment, TodoPatch, TodoStatus,
 };
 use crate::projection;
 use crate::registry::Registry;
@@ -1471,6 +1471,79 @@ impl Store {
             },
         )?;
         Ok(entry.pid)
+    }
+
+    /// Enqueue a line of input for instance `process_id` (todo #160): the daemon
+    /// half of `send_input`. The process must exist; the row is appended to the
+    /// `process_inputs` queue and the queue re-projected so the cockpit plugin
+    /// can pick it up, write it into the owned pane, and ack it. Core writes no
+    /// keystrokes itself - that host effect belongs to the plugin.
+    pub fn send_input(
+        &mut self,
+        project: ProjectId,
+        process_id: u64,
+        content: &str,
+    ) -> Result<(), CoreError> {
+        // The target must exist (not soft-deleted) and be live - `starting` or
+        // `running`. `starting` is allowed so an ad-hoc spawn's opening prompt
+        // can queue before the pane is up (the plugin delivers once running); a
+        // `stopped`/exited instance is rejected so input can't pile up for a
+        // process that will never receive it.
+        let process = self.fetch_process(project, process_id)?;
+        if !matches!(
+            process.status.as_deref(),
+            Some(process_status::STARTING) | Some(process_status::RUNNING)
+        ) {
+            return Err(CoreError::BadRequest(format!(
+                "process #{process_id} is not live (cannot receive input)"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO process_inputs (project_id, process_id, content, created_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            params![project.0, process_id as i64, content],
+        )?;
+        self.reproject_inputs(project)
+    }
+
+    /// The project's undelivered queued inputs, oldest first (todo #160). The
+    /// projection layer renders these to `.panopt/.cockpit/inputs.jsonl`.
+    pub fn pending_inputs(&self, project: ProjectId) -> Result<Vec<PendingInput>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, process_id, content
+               FROM process_inputs
+              WHERE project_id = ?1 AND delivered_at IS NULL
+              ORDER BY id",
+        )?;
+        let rows = stmt.query_map([project.0], |r| {
+            Ok(PendingInput {
+                id: r.get(0)?,
+                process_id: r.get::<_, i64>(1)? as u64,
+                content: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Mark queued input `seq` delivered (todo #160): the cockpit plugin calls
+    /// this after it has written the content into the pane, so the daemon drops
+    /// it from the projection. Idempotent - acking an already-delivered or
+    /// unknown id is a no-op (the keystrokes are not replayed).
+    pub fn ack_input(&mut self, project: ProjectId, seq: i64) -> Result<(), CoreError> {
+        self.conn.execute(
+            "UPDATE process_inputs SET delivered_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2 AND delivered_at IS NULL",
+            params![project.0, seq],
+        )?;
+        self.reproject_inputs(project)
+    }
+
+    /// Re-render `.panopt/.cockpit/inputs.jsonl` from the undelivered queue.
+    fn reproject_inputs(&mut self, project: ProjectId) -> Result<(), CoreError> {
+        let root = self.project_root(project)?;
+        let pending = self.pending_inputs(project)?;
+        projection::project_inputs(&root, &pending)?;
+        Ok(())
     }
 
     fn fetch_process(&self, project: ProjectId, id: u64) -> Result<Process, CoreError> {
@@ -3754,6 +3827,85 @@ mod tests {
         );
         assert!(rendered.contains("mediator-1"), "names the agent id");
         assert!(!rendered.contains("{{"), "no unrendered placeholder");
+    }
+
+    #[test]
+    fn send_input_queues_projects_and_acks() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        let started = fx.store.process_start(p, config).unwrap();
+
+        // Two inputs queue in order and project to the cockpit JSONL file.
+        fx.store.send_input(p, started.id, "first\n").unwrap();
+        fx.store.send_input(p, started.id, "second\n").unwrap();
+        let pending = fx.store.pending_inputs(p).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].content, "first\n");
+        assert_eq!(pending[1].content, "second\n");
+        assert!(pending[0].id < pending[1].id, "ordered by queue id");
+
+        let inputs_file = root.join(".panopt/.cockpit/inputs.jsonl");
+        let body = std::fs::read_to_string(&inputs_file).unwrap();
+        assert_eq!(body.lines().count(), 2, "both rows projected:\n{body}");
+        assert!(body.contains("\"content\":\"first\\n\""), "{body}");
+
+        // Acking the first drops it from the queue and the projection; the
+        // second remains.
+        fx.store.ack_input(p, pending[0].id).unwrap();
+        let remaining = fx.store.pending_inputs(p).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].content, "second\n");
+        let body = std::fs::read_to_string(&inputs_file).unwrap();
+        assert_eq!(body.lines().count(), 1, "acked row gone:\n{body}");
+
+        // Acking is idempotent - a repeat or unknown id is a no-op.
+        fx.store.ack_input(p, pending[0].id).unwrap();
+        assert_eq!(fx.store.pending_inputs(p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_input_rejects_unknown_and_stopped_processes() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        // Unknown id.
+        assert!(matches!(
+            fx.store.send_input(p, 999, "x\n"),
+            Err(CoreError::ProcessNotFound(_))
+        ));
+        // A stopped instance is not live, so input is refused rather than queued
+        // for a process that will never read it.
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        let started = fx.store.process_start(p, config).unwrap();
+        fx.store.process_stop(p, started.id).unwrap();
+        assert!(matches!(
+            fx.store.send_input(p, started.id, "x\n"),
+            Err(CoreError::BadRequest(_))
+        ));
     }
 
     #[test]

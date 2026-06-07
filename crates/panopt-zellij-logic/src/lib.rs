@@ -469,6 +469,32 @@ pub fn agent_config_label(config: &ConfigRow, inst: Option<&ProcessRow>) -> Stri
     }
 }
 
+/// One parsed line of `.panopt/.cockpit/inputs.jsonl` (todo #160): a queued
+/// input bound for a running instance's pane. The plugin writes `content` into
+/// process `process_id`'s pane and acks `seq`.
+pub struct PendingInputRow {
+    pub seq: i64,
+    pub process_id: u64,
+    pub content: String,
+}
+
+/// Parse one JSON line of the input-queue projection, or `None` for a blank or
+/// malformed line. The daemon writes `{"seq":N,"process_id":N,"content":"..."}`
+/// with `serde_json`, so it is parsed the same way - hand-splitting would
+/// mishandle a `content` that itself contains commas, quotes, or newlines.
+pub fn parse_input_line(line: &str) -> Option<PendingInputRow> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    Some(PendingInputRow {
+        seq: v.get("seq")?.as_i64()?,
+        process_id: v.get("process_id")?.as_u64()?,
+        content: v.get("content")?.as_str()?.to_string(),
+    })
+}
+
 /// What a content pane is, derived from the command it was launched with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaneRole {
@@ -1260,6 +1286,27 @@ mod tests {
             agent_config_label(&config("Mediator"), Some(&inst)),
             "Mediator · starting"
         );
+    }
+
+    #[test]
+    fn parse_input_line_reads_seq_process_and_unescaped_content() {
+        let row = parse_input_line(
+            r#"{"seq":3,"process_id":5,"content":"check the weather\nin Portland\n"}"#,
+        )
+        .unwrap();
+        assert_eq!(row.seq, 3);
+        assert_eq!(row.process_id, 5);
+        // The embedded escape is unescaped to a real newline - what a hand-rolled
+        // splitter would get wrong.
+        assert_eq!(row.content, "check the weather\nin Portland\n");
+    }
+
+    #[test]
+    fn parse_input_line_skips_blank_and_malformed() {
+        assert!(parse_input_line("").is_none());
+        assert!(parse_input_line("   ").is_none());
+        assert!(parse_input_line("not json").is_none());
+        assert!(parse_input_line(r#"{"seq":1}"#).is_none());
     }
 
     #[test]
