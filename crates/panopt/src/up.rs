@@ -687,11 +687,14 @@ fn ensure_clipboard_permission_granted(wasm: &Path) -> Result<()> {
 /// regular enough that finding `"<path>" {` plus brace balancing covers
 /// every shape Zellij writes itself.
 fn grant_clipboard_in_cache(existing: &str, wasm_path: &str) -> Option<String> {
-    const GRANT: &str = "WriteToClipboard";
+    // The capability grants we pre-approve beyond the base run-dialog trio
+    // (`ReadApplicationState`/`ChangeApplicationState`/`RunCommands`): clipboard
+    // copy and pane-content reads (the status observer's `get_pane_scrollback`,
+    // #142/#163). Splice in any that a pre-existing block is missing.
+    const GRANTS: [&str; 2] = ["WriteToClipboard", "ReadPaneContents"];
     let key = format!("\"{wasm_path}\"");
     if let Some(start) = existing.find(&key) {
-        // Found a block for our plugin; splice in WriteToClipboard if
-        // missing, else no-op.
+        // Found a block for our plugin; splice in any missing grant, else no-op.
         let rel_open = existing[start..].find('{')?;
         let open = start + rel_open;
         let mut depth: i32 = 0;
@@ -711,19 +714,22 @@ fn grant_clipboard_in_cache(existing: &str, wasm_path: &str) -> Option<String> {
         }
         let close = close?;
         let body = &existing[open + 1..close];
-        if body.contains(GRANT) {
+        let missing: Vec<&str> = GRANTS.into_iter().filter(|g| !body.contains(g)).collect();
+        if missing.is_empty() {
             return None;
         }
-        let mut out = String::with_capacity(existing.len() + GRANT.len() + 8);
+        let mut out = String::with_capacity(existing.len() + 32);
         out.push_str(&existing[..close]);
-        out.push_str("    ");
-        out.push_str(GRANT);
-        out.push('\n');
+        for g in missing {
+            out.push_str("    ");
+            out.push_str(g);
+            out.push('\n');
+        }
         out.push_str(&existing[close..]);
         return Some(out);
     }
-    // No block for this plugin yet; append a fresh one with the four
-    // permissions the plugin actually requests today.
+    // No block for this plugin yet; append a fresh one with every permission
+    // the plugin requests today (the base trio plus both capability grants).
     let mut out = String::from(existing);
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
@@ -733,7 +739,8 @@ fn grant_clipboard_in_cache(existing: &str, wasm_path: &str) -> Option<String> {
             ReadApplicationState\n    \
             ChangeApplicationState\n    \
             RunCommands\n    \
-            WriteToClipboard\n\
+            WriteToClipboard\n    \
+            ReadPaneContents\n\
          }}\n"
     ));
     Some(out)
@@ -1486,6 +1493,7 @@ mod tests {
             .expect("must change when block is absent");
         assert!(updated.contains(r#""/path/to/panopt-zellij.wasm""#));
         assert!(updated.contains("WriteToClipboard"));
+        assert!(updated.contains("ReadPaneContents"));
         assert!(updated.contains("ReadApplicationState"));
         assert!(updated.contains("ChangeApplicationState"));
         assert!(updated.contains("RunCommands"));
@@ -1505,8 +1513,9 @@ mod tests {
 ";
         let updated = grant_clipboard_in_cache(base, "/path/to/panopt-zellij.wasm")
             .expect("must change when grant is missing");
-        // The grant is in there exactly once.
+        // Both capability grants are spliced in, exactly once each.
         assert_eq!(updated.matches("WriteToClipboard").count(), 1);
+        assert_eq!(updated.matches("ReadPaneContents").count(), 1);
         // The existing entries survive.
         assert!(updated.contains("ChangeApplicationState"));
         assert!(updated.contains("RunCommands"));
@@ -1525,6 +1534,7 @@ mod tests {
 \"/p.wasm\" {
     ReadApplicationState
     WriteToClipboard
+    ReadPaneContents
 }
 ";
         assert_eq!(grant_clipboard_in_cache(base, "/p.wasm"), None);
@@ -1548,9 +1558,11 @@ mod tests {
         let ours_block_start = updated.find(r#""/ours.wasm""#).unwrap();
         let other_block = &updated[other_block_start..ours_block_start];
         assert!(!other_block.contains("WriteToClipboard"));
-        // Ours got it.
+        assert!(!other_block.contains("ReadPaneContents"));
+        // Ours got both capability grants.
         let ours_block = &updated[ours_block_start..];
         assert!(ours_block.contains("WriteToClipboard"));
+        assert!(ours_block.contains("ReadPaneContents"));
     }
 
     #[test]

@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use crate::model::{Agent, AgentTool, Lock, Note, Process, Todo, TodoStatus};
+use crate::agent_profiles::ProfileSet;
+use crate::model::{
+    process_status, Agent, AgentTool, Lock, Note, Process, ProcessKind, Todo, TodoStatus,
+};
 
 /// Per-process counter giving each temp file a unique name, so two concurrent
 /// writes to the same target never collide on the temp path.
@@ -62,6 +65,14 @@ fn agent_tools_path(ws: &Path) -> PathBuf {
 /// The processes projection: per-project process instances (instance layer).
 fn processes_path(ws: &Path) -> PathBuf {
     panopt_dir(ws).join("processes.md")
+}
+
+/// The agent-type status patterns projection (todo #142). Single-sourced from
+/// the daemon's loaded [`ProfileSet`]; the sidebar plugin reads it to classify
+/// each running instance's output plugin-side (it cannot load the profiles
+/// itself - the wasm plugin links neither `panopt-core` nor the override file).
+fn agent_types_path(ws: &Path) -> PathBuf {
+    panopt_dir(ws).join("agent-types.md")
 }
 
 /// The pre-V6 roster projection, kept only so [`bootstrap`] can remove it
@@ -247,19 +258,45 @@ pub(crate) fn render_agent_tools_md(tools: &[AgentTool]) -> String {
 }
 
 /// Render the processes projection as a markdown list, one line per instance:
-/// kind, id, and label, with a trailing `(from #N)` for processes that carry
-/// a back-reference to an agent tool, and a trailing ` · <status>` once the row
-/// has a lifecycle status (todo #141). The leading `[kind] #id label (from #N)`
-/// shape is preserved so the cockpit plugin's existing parser keeps decoding
-/// the `(kind, id, label)` tuple cleanly; the status suffix is what lets the
-/// plugin reconcile a `starting` row into a pane off this projection alone.
-pub(crate) fn render_processes_md(processes: &[Process]) -> String {
+/// kind, id, and label, a trailing `(from #N)` for processes that carry a
+/// back-reference to an agent tool, then zero or more ` · `-separated attribute
+/// segments. The first is the bare lifecycle ` · <status>` (todo #141); agent
+/// rows additionally carry keyed segments (todo #142): ` · type:<tool_type>`
+/// (which profile's patterns classify it), ` · state:<agent_state>` (the last
+/// classified activity), and ` · idle:<X>` (presence sourced from the #83
+/// registry, joined by agent id). The leading `[kind] #id label (from #N)`
+/// shape is preserved so the cockpit plugin's parser keeps decoding the
+/// `(kind, id, label)` tuple; the bare status segment is what lets the plugin
+/// reconcile a `starting` row into a pane off this projection alone.
+///
+/// `tool_types` maps `agent_tool_id -> tool_type` (the type key lives on the
+/// config, not copied onto the instance row). `agents` is the live registry
+/// and `now` the clock for the `idle:` annotation, so presence has a single
+/// source - the registry - rather than a column tracked in parallel on the row.
+pub(crate) fn render_processes_md(
+    processes: &[Process],
+    tool_types: &std::collections::BTreeMap<u64, String>,
+    now: SystemTime,
+) -> String {
     let mut out = String::from("# Processes\n\n");
-    if processes.is_empty() {
+    // The cockpit shows only live instances (bug #163): a terminal row -
+    // `stopped` (a `process_stop`) or `exited` (the liveness sweep reaped a
+    // hand-quit process) - is no longer running, so its line leaves the
+    // projection the moment it dies. The row stays in SQLite for history.
+    let live: Vec<&Process> = processes
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.status.as_deref(),
+                Some(process_status::STOPPED) | Some(process_status::EXITED)
+            )
+        })
+        .collect();
+    if live.is_empty() {
         out.push_str("_(no processes)_\n");
         return out;
     }
-    for p in processes {
+    for p in live {
         let label = if !p.display_name.is_empty() {
             p.display_name.as_str()
         } else if !p.name.is_empty() {
@@ -267,22 +304,81 @@ pub(crate) fn render_processes_md(processes: &[Process]) -> String {
         } else {
             "(unnamed)"
         };
-        let tool_suffix = match p.agent_tool_id {
-            Some(tid) => format!(" (from #{tid})"),
-            None => String::new(),
-        };
-        let status_suffix = match p.status.as_deref() {
-            Some(s) if !s.is_empty() => format!(" · {s}"),
-            _ => String::new(),
-        };
-        out.push_str(&format!(
-            "- [{}] #{} {}{}{}\n",
-            p.kind.as_str(),
-            p.id,
-            label,
-            tool_suffix,
-            status_suffix
-        ));
+        let mut line = format!("- [{}] #{} {}", p.kind.as_str(), p.id, label);
+        if let Some(tid) = p.agent_tool_id {
+            line.push_str(&format!(" (from #{tid})"));
+        }
+        if let Some(s) = p.status.as_deref().filter(|s| !s.is_empty()) {
+            line.push_str(&format!(" · {s}"));
+        }
+        // Agent-only enrichment (#142): the type key drives plugin-side
+        // classification, the state is its result, and idle is the age of the
+        // current idle state. Non-agent rows (command/terminal) carry none.
+        if p.kind == ProcessKind::Agent {
+            if let Some(tt) = p
+                .agent_tool_id
+                .and_then(|tid| tool_types.get(&tid))
+                .filter(|s| !s.is_empty())
+            {
+                line.push_str(&format!(" · type:{tt}"));
+            }
+            // The stable agent id (the row's `name`) - the cockpit's status
+            // observer matches this against the `--id` an agent pane stamps onto
+            // its `_mcp-proxy`/`_agent` command, to bind the pane to this row
+            // (todo #142). Without it the observer cannot reliably find the pane,
+            // since Zellij often surfaces the agent's child command, not the shim.
+            if !p.name.is_empty() {
+                line.push_str(&format!(" · agent:{}", p.name));
+            }
+            if let Some(state) = p.agent_state.as_deref().filter(|s| !s.is_empty()) {
+                line.push_str(&format!(" · state:{state}"));
+            }
+            // Idle age (bug #163): only while the agent is actually `idle`,
+            // render how long it has been so - `now - state_since`, where
+            // `state_since` was stamped at the last state transition. This is a
+            // true "sitting idle for N" age derived from observed pane state,
+            // not the old registry-presence (time-since-last-MCP-call) proxy.
+            if p.agent_state.as_deref() == Some("idle") {
+                if let Some(since) = p.state_since {
+                    let now_secs = now
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let age = (now_secs - since).max(0) as u64;
+                    line.push_str(&format!(
+                        " · idle:{}",
+                        format_idle(Duration::from_secs(age))
+                    ));
+                }
+            }
+        }
+        line.push('\n');
+        out.push_str(&line);
+    }
+    out
+}
+
+/// Render the agent-type status patterns as a markdown list (todo #142): a
+/// `## <tool_type>` header per profile, then one `<state> = <regex>` line per
+/// pattern. This is the single source the sidebar plugin parses to classify
+/// each running instance's output - the patterns originate in the daemon's
+/// loaded [`ProfileSet`] (shipped defaults merged with the user override), and
+/// the plugin, which can load neither, only reads what is projected here.
+/// States are emitted in the enum's order; patterns keep their profile order.
+pub(crate) fn render_agent_types_md(profiles: &ProfileSet) -> String {
+    let mut out = String::from("# Agent types\n\n");
+    if profiles.is_empty() {
+        out.push_str("_(no agent types)_\n");
+        return out;
+    }
+    for (tool_type, profile) in profiles.iter() {
+        out.push_str(&format!("## {tool_type}\n"));
+        for (state, patterns) in &profile.status.0 {
+            for pattern in patterns {
+                out.push_str(&format!("{} = {}\n", state.as_str(), pattern));
+            }
+        }
+        out.push('\n');
     }
     out
 }
@@ -370,7 +466,16 @@ pub(crate) fn bootstrap(ws: &Path) -> io::Result<()> {
     atomic_write(&todos_index_path(ws), &render_todos_index_md(&[]))?;
     atomic_write(&notes_index_path(ws), &render_notes_index_md(&[]))?;
     atomic_write(&agent_tools_path(ws), &render_agent_tools_md(&[]))?;
-    atomic_write(&processes_path(ws), &render_processes_md(&[]))?;
+    // Empty process list - the tool-type map and clock are irrelevant because
+    // nothing is rendered.
+    atomic_write(
+        &processes_path(ws),
+        &render_processes_md(
+            &[],
+            &std::collections::BTreeMap::new(),
+            SystemTime::UNIX_EPOCH,
+        ),
+    )?;
     // Empty roster - `now` is irrelevant because nothing is rendered.
     atomic_write(
         &agents_path(ws),
@@ -447,9 +552,25 @@ pub(crate) fn project_agent_tools(ws: &Path, tools: &[AgentTool]) -> io::Result<
     atomic_write(&agent_tools_path(ws), &render_agent_tools_md(tools))
 }
 
-/// Rewrite `.panopt/processes.md` from the current process list.
-pub(crate) fn project_processes(ws: &Path, processes: &[Process]) -> io::Result<()> {
-    atomic_write(&processes_path(ws), &render_processes_md(processes))
+/// Rewrite `.panopt/processes.md` from the current process list, joined to the
+/// `agent_tool_id -> tool_type` map, at clock `now` (used for the `idle:` age).
+/// See [`render_processes_md`].
+pub(crate) fn project_processes(
+    ws: &Path,
+    processes: &[Process],
+    tool_types: &std::collections::BTreeMap<u64, String>,
+    now: SystemTime,
+) -> io::Result<()> {
+    atomic_write(
+        &processes_path(ws),
+        &render_processes_md(processes, tool_types, now),
+    )
+}
+
+/// Rewrite `.panopt/agent-types.md` from the daemon's loaded profile set. See
+/// [`render_agent_types_md`].
+pub(crate) fn project_agent_types(ws: &Path, profiles: &ProfileSet) -> io::Result<()> {
+    atomic_write(&agent_types_path(ws), &render_agent_types_md(profiles))
 }
 
 /// Rewrite `.panopt/agents.md` from the current agent roster. `now` is taken
@@ -808,7 +929,11 @@ mod tests {
     #[test]
     fn empty_processes_renders_placeholder() {
         assert_eq!(
-            render_processes_md(&[]),
+            render_processes_md(
+                &[],
+                &std::collections::BTreeMap::new(),
+                SystemTime::UNIX_EPOCH
+            ),
             "# Processes\n\n_(no processes)_\n"
         );
     }
@@ -832,9 +957,13 @@ mod tests {
             },
         ];
         assert_eq!(
-            render_processes_md(&processes),
+            render_processes_md(
+                &processes,
+                &std::collections::BTreeMap::new(),
+                SystemTime::UNIX_EPOCH
+            ),
             "# Processes\n\n\
-             - [agent] #1 Mediator (from #7)\n\
+             - [agent] #1 Mediator (from #7) · agent:claude-a\n\
              - [command] #2 Run server\n"
         );
     }
@@ -860,10 +989,137 @@ mod tests {
             },
         ];
         assert_eq!(
-            render_processes_md(&processes),
+            render_processes_md(
+                &processes,
+                &std::collections::BTreeMap::new(),
+                SystemTime::UNIX_EPOCH
+            ),
             "# Processes\n\n\
              - [agent] #1 Mediator (from #7) · starting\n\
              - [agent] #2 Worker (from #8) · running\n"
+        );
+    }
+
+    #[test]
+    fn processes_render_drops_terminal_rows() {
+        // `stopped` and `exited` rows are spent; the projection shows only live
+        // instances (bug #163). With every row terminal, the "none" marker.
+        let processes = vec![
+            Process {
+                id: 1,
+                kind: ProcessKind::Agent,
+                display_name: "Alive".into(),
+                agent_tool_id: Some(7),
+                status: Some("running".into()),
+                ..Default::default()
+            },
+            Process {
+                id: 2,
+                kind: ProcessKind::Agent,
+                display_name: "Quit".into(),
+                agent_tool_id: Some(8),
+                status: Some("exited".into()),
+                ..Default::default()
+            },
+            Process {
+                id: 3,
+                kind: ProcessKind::Command,
+                display_name: "Stopped".into(),
+                status: Some("stopped".into()),
+                ..Default::default()
+            },
+        ];
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            render_processes_md(&processes, &empty, SystemTime::UNIX_EPOCH),
+            "# Processes\n\n- [agent] #1 Alive (from #7) · running\n"
+        );
+        let only_terminal = &processes[1..];
+        assert_eq!(
+            render_processes_md(only_terminal, &empty, SystemTime::UNIX_EPOCH),
+            "# Processes\n\n_(no processes)_\n"
+        );
+    }
+
+    #[test]
+    fn agent_types_render_matches_the_plugin_parser_contract() {
+        // The shape the sidebar's `parse_agent_type_matchers` decodes: a
+        // `## <tool_type>` header, then `<state> = <regex>` lines in enum order.
+        let toml = "[t]\ndisplay_name = \"T\"\n\
+                    [t.spawn]\nargv = [\"x\"]\n\
+                    [t.status]\nthinking = ['esc to interrupt']\nwaiting = ['Do you want']\n";
+        let set = ProfileSet::from_layers(toml, None).unwrap();
+        assert_eq!(
+            render_agent_types_md(&set),
+            "# Agent types\n\n## t\nthinking = esc to interrupt\nwaiting = Do you want\n\n"
+        );
+    }
+
+    #[test]
+    fn agent_rows_carry_type_state_and_no_idle_while_busy() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        let processes = vec![
+            Process {
+                id: 1,
+                kind: ProcessKind::Agent,
+                name: "claude-a".into(),
+                display_name: "Mediator".into(),
+                agent_tool_id: Some(7),
+                status: Some("running".into()),
+                agent_state: Some("thinking".into()),
+                // A busy agent carries a state_since, but `idle:` renders only
+                // while the state is `idle`, so it must not appear here.
+                state_since: Some(60),
+                ..Default::default()
+            },
+            // A command row gets none of the agent-only segments even with a
+            // matching tool-type entry.
+            Process {
+                id: 2,
+                kind: ProcessKind::Command,
+                name: "Build".into(),
+                ..Default::default()
+            },
+        ];
+        let tool_types = std::collections::BTreeMap::from([(7u64, "claude-code".to_string())]);
+        assert_eq!(
+            render_processes_md(&processes, &tool_types, now),
+            "# Processes\n\n\
+             - [agent] #1 Mediator (from #7) · running · type:claude-code · agent:claude-a · state:thinking\n\
+             - [command] #2 Build\n"
+        );
+    }
+
+    #[test]
+    fn idle_age_renders_only_while_idle_from_state_since() {
+        // now = epoch + 600s; state became idle at epoch + 420s -> idle for 180s
+        // -> `idle:3m`.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        let processes = vec![Process {
+            id: 1,
+            kind: ProcessKind::Agent,
+            name: "claude-a".into(),
+            display_name: "Mediator".into(),
+            agent_tool_id: Some(7),
+            status: Some("running".into()),
+            agent_state: Some("idle".into()),
+            state_since: Some(420),
+            ..Default::default()
+        }];
+        let tool_types = std::collections::BTreeMap::from([(7u64, "claude-code".to_string())]);
+        assert_eq!(
+            render_processes_md(&processes, &tool_types, now),
+            "# Processes\n\n\
+             - [agent] #1 Mediator (from #7) · running · type:claude-code · agent:claude-a · state:idle · idle:3m\n"
+        );
+
+        // Idle but no state_since stamped yet -> no idle segment (no panic).
+        let mut p = processes;
+        p[0].state_since = None;
+        assert_eq!(
+            render_processes_md(&p, &tool_types, now),
+            "# Processes\n\n\
+             - [agent] #1 Mediator (from #7) · running · type:claude-code · agent:claude-a · state:idle\n"
         );
     }
 

@@ -8,6 +8,9 @@
 //! unreachable there. The plugin re-exports everything here via `use
 //! panopt_zellij_logic::*` and adds the Zellij-bound view/controller on top.
 
+use regex::Regex;
+use std::collections::BTreeMap;
+
 /// Which kind of resource one plugin pane renders. Five plugin instances run
 /// in parallel, one per `Mode`, each configured by the `mode "<kind>"` value
 /// in the layout's plugin block. Zellij keys plugin identity on
@@ -374,6 +377,57 @@ pub struct ProcessRow {
     /// row that predates lifecycle ownership. Drives the cockpit's reconcile of
     /// a `starting` row into a pane.
     pub status: Option<String>,
+    /// The agent type key (`type:<tool_type>` segment, todo #142), present only
+    /// for agent rows backed by a config. Tells the status reconciler which
+    /// profile's patterns to classify this instance's output with.
+    pub tool_type: Option<String>,
+    /// The last classified activity (`state:<agent_state>` segment, todo #142):
+    /// `thinking`/`idle`/`waiting`/`done`. `None` until first observed.
+    pub agent_state: Option<String>,
+    /// The instance's stable agent id (`agent:<name>` segment, todo #142) - the
+    /// process row's `name`, which is also the `--id` every agent stamps onto
+    /// its `panopt _mcp-proxy`/`_agent` invocation. This is the join key the
+    /// status observer uses to bind a pane to its row: the pane command Zellij
+    /// surfaces is unreliable (it often reports the agent's `_mcp-proxy` child,
+    /// not the `_process-run` shim), but that child still carries `--id <name>`,
+    /// so matching it against this field finds the pane regardless. `None` for
+    /// rows with no name (command/terminal kinds, migrated rows).
+    pub agent_id: Option<String>,
+    /// The backing agent config id, lifted from the ` (from #N)` suffix
+    /// `render_processes_md` writes for instances spawned from a config. This is
+    /// the join key the Agents pane uses to bind a config to its single live
+    /// instance (the 1:1 policy). `None` for command/terminal rows and any
+    /// instance with no backing config.
+    pub agent_tool_id: Option<u64>,
+}
+
+/// A parsed `.panopt/agent_tools.md` line: one durable agent config (the
+/// config layer of the two-layer model). The Agents pane is config-centric -
+/// each config *is* an agent, with at most one live instance - so this is the
+/// row it renders, joined to a live [`ProcessRow`] by `id == agent_tool_id`.
+/// Line format (see `render_agent_tools_md`): `- #<id> <label> [<flag>]<cmd>`.
+pub struct ConfigRow {
+    pub id: u64,
+    pub label: String,
+    /// Whether the config is offered for spawning (`[enabled]` vs `[disabled]`).
+    pub enabled: bool,
+}
+
+/// Parse one `.panopt/agent_tools.md` config line into a [`ConfigRow`], or
+/// `None` for the header / `_(no agent tools)_` placeholder / any malformed
+/// line. The label runs up to the ` [<flag>]` segment; a trailing command (when
+/// the config carries one) is ignored - the pane shows the agent, not its argv.
+pub fn parse_config_line(line: &str) -> Option<ConfigRow> {
+    let rest = line.trim().strip_prefix("- #")?;
+    let space = rest.find(' ')?;
+    let id: u64 = rest[..space].parse().ok()?;
+    let after = &rest[space + 1..];
+    let bracket = after.find(" [")?;
+    let label = after[..bracket].trim().to_string();
+    let flag_rest = &after[bracket + 2..];
+    let close = flag_rest.find(']')?;
+    let enabled = &flag_rest[..close] == "enabled";
+    Some(ConfigRow { id, label, enabled })
 }
 
 /// What a content pane is, derived from the command it was launched with.
@@ -411,11 +465,38 @@ pub fn classify_pane(command: Option<&str>) -> PaneRole {
             Some(id) => PaneRole::Process(id),
             None => PaneRole::Shell,
         }
+    } else if let Some(id) = instance_id_from_command(cmd) {
+        // A first-class agent launched directly with its rendered per-instance
+        // config - e.g. `claude --mcp-config .../instances/158/mcp_config` -
+        // never passes through the `_process-run` reconcile shim, so the
+        // `instances/<id>/` directory the spawn-spec interpreter materializes
+        // its files into is the only back-reference from the pane to its
+        // process id. Tying the pane to `Process(id)` here is what lets the
+        // status observer (#142) find it via `process_pane`; without it such
+        // agents fall through to `Shell` and are never observed. See
+        // `panopt::paths::instance_dir`.
+        PaneRole::Process(id)
     } else if cmd.contains("_agent") {
         PaneRole::Agent
     } else {
         PaneRole::Shell
     }
+}
+
+/// Recover the process id from the `.../instances/<id>/...` path the spawn-spec
+/// interpreter bakes into a directly-launched agent's command. The id is the
+/// path segment immediately after `instances`; returns `None` when no such
+/// segment is present (the common case for shells, viewers, and `_agent`
+/// panes). Kept tolerant of a non-numeric follow-on segment so an unrelated
+/// `instances` path never panics or misclassifies.
+fn instance_id_from_command(cmd: &str) -> Option<u64> {
+    let mut segments = cmd.split('/');
+    while let Some(seg) = segments.next() {
+        if seg == "instances" {
+            return segments.next()?.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 /// The presentation snapshot shared across every client attached to the
@@ -661,17 +742,39 @@ pub fn parse_process_line(line: &str) -> Option<ProcessRow> {
     let after = rest[close + 1..].trim_start().strip_prefix('#')?;
     let space = after.find(' ')?;
     let id: u64 = after[..space].parse().ok()?;
-    let mut label = after[space + 1..].trim().to_string();
-    // ` · <status>` is the final segment (see `render_processes_md`); peel it
-    // before the tool ref so the middle-dot separator can't be mistaken for
-    // part of the label or the `(from #N)` chunk.
-    let status = label.rfind(" · ").map(|at| {
-        let s = label[at + " · ".len()..].trim().to_string();
-        label.truncate(at);
-        s
-    });
+    let body = after[space + 1..].trim();
+    // The label is followed by zero or more ` · `-separated attribute segments
+    // (see `render_processes_md`): a bare `status`, then keyed `type:`/`state:`/
+    // `idle:` segments. Split them off the front chunk (the label) so the
+    // middle-dot separator can't be mistaken for label text.
+    let mut segments = body.split(" · ");
+    let mut label = segments.next().unwrap_or("").trim().to_string();
+    let mut status = None;
+    let mut tool_type = None;
+    let mut agent_state = None;
+    let mut agent_id = None;
+    for seg in segments {
+        let seg = seg.trim();
+        if let Some(v) = seg.strip_prefix("type:") {
+            tool_type = Some(v.trim().to_string());
+        } else if let Some(v) = seg.strip_prefix("state:") {
+            agent_state = Some(v.trim().to_string());
+        } else if let Some(v) = seg.strip_prefix("agent:") {
+            agent_id = Some(v.trim().to_string());
+        } else if seg.starts_with("idle:") {
+            // `idle:` is a human-facing presence annotation sourced from the
+            // registry (todo #142); the plugin derives liveness from the row's
+            // status + its own registry view, so it is parsed past, not kept.
+        } else if !seg.is_empty() {
+            // The lone bare segment is the lifecycle status.
+            status = Some(seg.to_string());
+        }
+    }
+    let mut agent_tool_id = None;
     if let Some(from_at) = label.rfind(" (from #") {
         if label.ends_with(')') {
+            let inner = &label[from_at + " (from #".len()..label.len() - 1];
+            agent_tool_id = inner.trim().parse::<u64>().ok();
             label.truncate(from_at);
         }
     }
@@ -680,7 +783,180 @@ pub fn parse_process_line(line: &str) -> Option<ProcessRow> {
         id,
         label,
         status,
+        tool_type,
+        agent_state,
+        agent_id,
+        agent_tool_id,
     })
+}
+
+/// Recover the stable agent id from a pane's launch command - the value after
+/// `--id` on a `panopt _mcp-proxy` or `panopt _agent` invocation (todo #142).
+///
+/// This is the linchpin of pane↔instance binding for the status observer. A
+/// first-class agent's pane runs (after `_process-run` execs into it) the agent
+/// binary, which spawns `panopt _mcp-proxy --id <agent_id> …` as its stdio MCP
+/// server; Zellij's command detection frequently surfaces *that* child for the
+/// pane rather than the `_process-run` shim or the agent binary. The one
+/// constant across every surfacing is the `--id <agent_id>` flag, and that id
+/// equals the instance row's `name` (see [`ProcessRow::agent_id`]), so matching
+/// it binds the pane to its row no matter which command Zellij reports.
+///
+/// Restricted to `_mcp-proxy`/`_agent` commands so an unrelated tool that
+/// happens to take a `--id` flag never masquerades as an agent pane. Returns
+/// `None` when the command is not an agent invocation or carries no `--id`.
+pub fn agent_id_from_command(command: Option<&str>) -> Option<String> {
+    let cmd = command?;
+    if !cmd.contains("_mcp-proxy") && !cmd.contains("_agent") {
+        return None;
+    }
+    let mut tokens = cmd.split_whitespace();
+    while let Some(t) = tokens.next() {
+        if t == "--id" {
+            return tokens.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// The activity a status pattern classifies an agent into (todo #142). Mirrors
+/// `panopt_core::agent_profiles::AgentState`, re-declared here because the wasm
+/// plugin cannot link `panopt-core` (rusqlite has no wasm target). The string
+/// forms are the contract between the two halves: they must match the core
+/// enum's `serde(rename_all = "lowercase")` names, since core projects them
+/// into `agent-types.md` and the plugin reports them back via
+/// `_process-report --agent-state`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum AgentState {
+    Thinking,
+    Idle,
+    Waiting,
+    Done,
+}
+
+impl AgentState {
+    /// The wire/projection name. Must stay in lockstep with core's enum.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentState::Thinking => "thinking",
+            AgentState::Idle => "idle",
+            AgentState::Waiting => "waiting",
+            AgentState::Done => "done",
+        }
+    }
+
+    /// Inverse of [`AgentState::as_str`]; `None` for an unknown token.
+    pub fn parse(s: &str) -> Option<AgentState> {
+        match s {
+            "thinking" => Some(AgentState::Thinking),
+            "idle" => Some(AgentState::Idle),
+            "waiting" => Some(AgentState::Waiting),
+            "done" => Some(AgentState::Done),
+            _ => None,
+        }
+    }
+}
+
+/// The order non-idle states are tested in; first match wins, idle is the
+/// fallthrough. Identical to the core interpreter's precedence (#138): waiting
+/// (the agent needs a human) beats thinking (actively working) beats done (a
+/// completion marker), so an ambiguous snapshot resolves deterministically.
+const STATUS_PRECEDENCE: [AgentState; 3] =
+    [AgentState::Waiting, AgentState::Thinking, AgentState::Done];
+
+/// A compiled set of status patterns for one agent type: `(state, regexes)` in
+/// [`STATUS_PRECEDENCE`] order. Built once when `agent-types.md` changes and
+/// reused across polls. The wasm-side twin of
+/// `panopt_core::agent_profiles::StatusMatcher`.
+#[derive(Debug)]
+pub struct StatusMatcher {
+    rules: Vec<(AgentState, Vec<Regex>)>,
+}
+
+impl StatusMatcher {
+    /// Classify an output snapshot: the highest-precedence state whose any
+    /// pattern matches, or [`AgentState::Idle`] if none do.
+    pub fn classify(&self, output: &str) -> AgentState {
+        for (state, regexes) in &self.rules {
+            if regexes.iter().any(|r| r.is_match(output)) {
+                return *state;
+            }
+        }
+        AgentState::Idle
+    }
+}
+
+/// How many lines up from the bottom of a pane's viewport count as its "live
+/// region" - the footer/spinner/prompt area an agent TUI repaints in place
+/// (todo #142, bug #163). Classification reads only this tail, never the whole
+/// viewport: an agent scrolls its entire transcript through the visible region,
+/// so matching all of it makes the state sticky and flappy - a finished turn's
+/// `esc to interrupt` spinner lingers in the scrollback, and any reply that
+/// merely *mentions* a pattern word (an agent discussing its own status rules,
+/// say) pins the state forever. Wide enough to catch a multi-line permission
+/// prompt, tight enough to leave the bulk of transcript above it.
+pub const LIVE_REGION_LINES: usize = 12;
+
+/// The live-region slice of a pane viewport: the last [`LIVE_REGION_LINES`]
+/// non-empty lines, joined with newlines, for [`StatusMatcher::classify`] to
+/// scan (bug #163). Trailing blank lines (the TUI pads the screen below its
+/// content) are dropped first so the window lands on real footer/prompt text
+/// rather than empty padding. An all-blank or empty viewport yields `""`,
+/// which classifies as [`AgentState::Idle`].
+pub fn viewport_live_region(viewport: &[String]) -> String {
+    let end = viewport
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let start = end.saturating_sub(LIVE_REGION_LINES);
+    viewport[start..end].join("\n")
+}
+
+/// Parse the `.panopt/agent-types.md` projection (todo #142) into a compiled
+/// [`StatusMatcher`] per `tool_type`. The file is a list of `## <tool_type>`
+/// headers, each followed by `<state> = <regex>` lines (one pattern per line,
+/// the same state repeated for several patterns). The patterns are
+/// single-sourced from the daemon's loaded profile set; this only reads what
+/// the daemon projected. Tolerant by design: an unparsable line is skipped and
+/// an invalid regex drops just that one pattern, so a bad user override can
+/// never crash the sidebar - it only loses classification fidelity.
+pub fn parse_agent_type_matchers(body: &str) -> BTreeMap<String, StatusMatcher> {
+    let mut raw: BTreeMap<String, BTreeMap<AgentState, Vec<Regex>>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("## ") {
+            current = Some(name.trim().to_string());
+            continue;
+        }
+        let Some(tool_type) = current.as_ref() else {
+            continue;
+        };
+        let Some(eq) = line.find(" = ") else {
+            continue;
+        };
+        let Some(state) = AgentState::parse(line[..eq].trim()) else {
+            continue;
+        };
+        let Ok(re) = Regex::new(line[eq + " = ".len()..].trim()) else {
+            continue;
+        };
+        raw.entry(tool_type.clone())
+            .or_default()
+            .entry(state)
+            .or_default()
+            .push(re);
+    }
+    raw.into_iter()
+        .map(|(tool_type, by_state)| {
+            let rules = STATUS_PRECEDENCE
+                .into_iter()
+                .filter_map(|s| by_state.get(&s).cloned().map(|res| (s, res)))
+                .collect();
+            (tool_type, StatusMatcher { rules })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -837,6 +1113,24 @@ mod tests {
         assert_eq!(row.id, 4);
         assert_eq!(row.label, "NASTL-Mediator");
         assert_eq!(row.status, None);
+        assert_eq!(row.agent_tool_id, Some(3));
+    }
+
+    #[test]
+    fn parses_config_lines_and_ignores_non_config() {
+        let row = parse_config_line("- #144 good [enabled]").unwrap();
+        assert_eq!(row.id, 144);
+        assert_eq!(row.label, "good");
+        assert!(row.enabled);
+
+        // A label with spaces, a disabled flag, and a trailing command.
+        let row = parse_config_line("- #7 My Mediator [disabled] claude --foo").unwrap();
+        assert_eq!(row.id, 7);
+        assert_eq!(row.label, "My Mediator");
+        assert!(!row.enabled);
+
+        assert!(parse_config_line("# Agent tools").is_none());
+        assert!(parse_config_line("_(no agent tools)_").is_none());
     }
 
     #[test]
@@ -864,6 +1158,119 @@ mod tests {
     }
 
     #[test]
+    fn parses_type_state_agent_segments_and_drops_idle() {
+        let row = parse_process_line(
+            "- [agent] #5 Mediator (from #3) · running · type:claude-code · agent:mediator-1a · state:thinking · idle:2m",
+        )
+        .unwrap();
+        assert_eq!(row.label, "Mediator");
+        assert_eq!(row.status.as_deref(), Some("running"));
+        assert_eq!(row.tool_type.as_deref(), Some("claude-code"));
+        assert_eq!(row.agent_id.as_deref(), Some("mediator-1a"));
+        assert_eq!(row.agent_state.as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn agent_id_parses_from_mcp_proxy_and_agent_commands_only() {
+        // The `_mcp-proxy` child Zellij usually surfaces for an agent pane.
+        assert_eq!(
+            agent_id_from_command(Some(
+                "/bin/panopt --port 7600 _mcp-proxy --host 127.0.0.1 --id good --name good"
+            )),
+            Some("good".to_string())
+        );
+        // The pre-exec `_agent` shim.
+        assert_eq!(
+            agent_id_from_command(Some("/bin/panopt _agent --id mediator-1a2b")),
+            Some("mediator-1a2b".to_string())
+        );
+        // A non-agent command carrying `--id` must not masquerade as an agent.
+        assert_eq!(agent_id_from_command(Some("some-tool --id 42")), None);
+        // Agent command with no `--id` (anonymous) yields nothing to bind on.
+        assert_eq!(agent_id_from_command(Some("/bin/panopt _agent")), None);
+        assert_eq!(agent_id_from_command(None), None);
+    }
+
+    #[test]
+    fn agent_state_roundtrips_through_its_wire_name() {
+        for s in [
+            AgentState::Thinking,
+            AgentState::Idle,
+            AgentState::Waiting,
+            AgentState::Done,
+        ] {
+            assert_eq!(AgentState::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(AgentState::parse("bogus"), None);
+    }
+
+    #[test]
+    fn matcher_classifies_with_waiting_over_thinking_precedence() {
+        let body =
+            "# Agent types\n\n## claude-code\nthinking = esc to interrupt\nwaiting = Do you want\n";
+        let matchers = parse_agent_type_matchers(body);
+        let m = matchers.get("claude-code").expect("claude-code matcher");
+        assert_eq!(m.classify("... esc to interrupt ..."), AgentState::Thinking);
+        assert_eq!(m.classify("quiet output"), AgentState::Idle);
+        // Both patterns present: waiting wins by precedence.
+        assert_eq!(
+            m.classify("esc to interrupt\nDo you want to proceed?"),
+            AgentState::Waiting
+        );
+    }
+
+    #[test]
+    fn live_region_windows_to_the_footer_and_ignores_transcript() {
+        let body =
+            "# Agent types\n\n## claude-code\nthinking = esc to interrupt\nwaiting = Do you want\n";
+        let m = parse_agent_type_matchers(body)
+            .remove("claude-code")
+            .expect("claude-code matcher");
+
+        // A finished turn that mentioned the spinner far up in the transcript,
+        // now sitting idle at the prompt. The whole viewport would (wrongly)
+        // classify as thinking; the live region sees only the idle footer.
+        let mut viewport: Vec<String> = vec!["assistant: running esc to interrupt".into()];
+        for _ in 0..40 {
+            viewport.push("transcript line".into());
+        }
+        viewport.push("> ".into());
+        viewport.push(String::new());
+        viewport.push(String::new());
+        assert!(m.classify(&viewport.join("\n")) == AgentState::Thinking);
+        assert_eq!(
+            m.classify(&viewport_live_region(&viewport)),
+            AgentState::Idle
+        );
+
+        // The live spinner on the last non-blank line is inside the window.
+        let working = vec![
+            "working...".into(),
+            "esc to interrupt".into(),
+            String::new(),
+        ];
+        assert_eq!(
+            m.classify(&viewport_live_region(&working)),
+            AgentState::Thinking
+        );
+
+        // An all-blank or empty viewport is idle, never a panic.
+        assert_eq!(viewport_live_region(&[]), "");
+        assert_eq!(viewport_live_region(&["".into(), "  ".into()]), "");
+    }
+
+    #[test]
+    fn matcher_parse_skips_bad_lines_and_invalid_regex() {
+        let body = "## t\nthinking = (unclosed\nbogus = x\nwaiting = ok\n";
+        let m = parse_agent_type_matchers(body);
+        let t = m.get("t").expect("type t");
+        // The invalid-regex `thinking` and unknown-state `bogus` lines drop;
+        // only the valid `waiting` pattern survives.
+        assert_eq!(t.classify("ok"), AgentState::Waiting);
+        assert_eq!(t.classify("nope"), AgentState::Idle);
+    }
+
+    #[test]
     fn classify_pane_reads_the_launch_command() {
         assert_eq!(
             classify_pane(Some("/bin/panopt _viewer --slot main --port 7600")),
@@ -876,6 +1283,20 @@ mod tests {
         assert_eq!(
             classify_pane(Some("/bin/panopt _agent --id mediator-1a2b")),
             PaneRole::Agent
+        );
+        // A first-class agent launched directly with its rendered per-instance
+        // config ties back to its process id via the `instances/<id>/` segment,
+        // even though it never went through the `_process-run` shim (#142).
+        assert_eq!(
+            classify_pane(Some(
+                "claude --mcp-config /home/u/.local/share/panopt/instances/158/mcp_config"
+            )),
+            PaneRole::Process(158)
+        );
+        // A bare `instances` path with no numeric id must not misclassify.
+        assert_eq!(
+            classify_pane(Some("vim /home/u/code/instances/notes.md")),
+            PaneRole::Shell
         );
         assert_eq!(classify_pane(Some("/bin/zsh -l")), PaneRole::Shell);
         assert_eq!(classify_pane(None), PaneRole::Shell);
@@ -1048,7 +1469,6 @@ mod tests {
 
     #[test]
     fn agent_labels_roundtrip_through_the_projection_format() {
-        use std::collections::BTreeMap;
         let mut input = BTreeMap::new();
         input.insert(4u32, "Mediator".to_string());
         input.insert(9u32, "Edge \"case\" with, commas".to_string());

@@ -307,17 +307,24 @@ fn exec_agent_instance(
 /// reported separately by the in-pane wrapper). Best-effort, like
 /// [`crate::agent::leave`]: a missing daemon is logged by the caller, not
 /// surfaced.
-pub fn exec_report(ws: Option<PathBuf>, id: u64, pane_id: String, port: u16) -> Result<()> {
+pub fn exec_report(
+    ws: Option<PathBuf>,
+    id: u64,
+    pane_id: Option<String>,
+    agent_state: Option<String>,
+    port: u16,
+) -> Result<()> {
     daemon::ensure(None, port)?;
     let client = Client::connect(&observer_url(ws, port)?)?;
-    let result = client.call(
-        "process_report",
-        json!({ "process_id": id, "pane_id": pane_id }),
-    );
+    let mut args = Map::new();
+    args.insert("process_id".into(), json!(id));
+    insert_opt(&mut args, "pane_id", pane_id);
+    insert_opt(&mut args, "agent_state", agent_state);
+    let result = client.call("process_report", Value::Object(args));
     client.close();
     result
         .map(|_| ())
-        .context("reporting the process's pane id")
+        .context("reporting process runtime facts")
 }
 
 fn print_list(v: &Value) {

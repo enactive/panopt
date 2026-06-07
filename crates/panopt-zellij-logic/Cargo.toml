@@ -11,3 +11,10 @@ edition = "2021"
 # on this crate by path and re-exports it; both targets (host + wasm) compile
 # the same source.
 [dependencies]
+# The status interpreter (#142) classifies an agent's terminal output by regex.
+# This crate is wasm-safe (it is what the plugin links), and `regex` compiles
+# to wasm32-wasip1, so classification runs plugin-side and reports only the
+# derived one-word state - no per-poll terminal-output payload to the daemon.
+# `default-features = false` drops the unicode tables the status patterns do not
+# need, keeping the wasm module small.
+regex = { version = "1", default-features = false, features = ["std"] }

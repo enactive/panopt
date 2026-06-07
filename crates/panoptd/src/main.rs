@@ -163,6 +163,49 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Reap instances whose OS process is gone, every 3s, so a hand-quit agent
+    // (Ctrl-c/exit in its pane, no `process_stop`) stops being reported as live
+    // and its row leaves `processes.md` promptly (bug #163). Faster cadence than
+    // the registry sweep: a quit should reflect in the cockpit within a tick.
+    let liveness_state = shared.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+        loop {
+            ticker.tick().await;
+            let reaped = {
+                let mut st = liveness_state.lock().expect("state mutex poisoned");
+                st.sweep_dead_processes(handler::pid_is_alive)
+            };
+            match reaped {
+                Ok(dead) => {
+                    for (project, id) in dead {
+                        tracing::info!(project, process = id, "instance reaped (process gone)");
+                    }
+                }
+                Err(e) => tracing::warn!("process liveness sweep failed: {e}"),
+            }
+        }
+    });
+
+    // Re-project processes.md every 10s so time-based annotations advance even
+    // when no mutation fired - the `idle:` presence age (#142/#163) is computed
+    // at render time, so without this it freezes between mutations. Skips
+    // projects with no live agent, so an idle daemon stays quiet.
+    let projection_state = shared.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            ticker.tick().await;
+            let result = {
+                let st = projection_state.lock().expect("state mutex poisoned");
+                st.tick_process_projections()
+            };
+            if let Err(e) = result {
+                tracing::warn!("process projection tick failed: {e}");
+            }
+        }
+    });
+
     let token_path = default_token_path()?;
     let token = panopt_core::auth::ensure_token(&token_path)
         .with_context(|| format!("ensuring panopt token at {}", token_path.display()))?;

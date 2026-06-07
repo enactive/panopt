@@ -92,6 +92,11 @@ struct PanoptPane {
     /// exists; until then the sidebar shows only live instances, same as the
     /// pre-V6 roster view.
     processes: Vec<ProcessRow>,
+    /// Agent configs parsed from `.panopt/agent_tools.md`. The Agents pane is
+    /// config-centric (#27): each config is one agent, rendered joined to its
+    /// single live instance in `processes`. Populated only in modes that show
+    /// the Agents list.
+    configs: Vec<ConfigRow>,
     /// Live (and suppressed) content panes flattened from Zellij's manifest.
     panes: Vec<PaneRow>,
 
@@ -176,6 +181,21 @@ struct PanoptPane {
     /// process set each poll. Only the Todos gatekeeper populates it, so the
     /// five plugin instances don't each spawn the same row.
     reconciled_panes: BTreeMap<u64, u32>,
+
+    /// Compiled status patterns per `tool_type`, parsed from the daemon's
+    /// `.panopt/agent-types.md` projection (todo #142). Rebuilt only when that
+    /// file's text changes (see [`Self::agent_types_src`]) - regex compilation
+    /// is not free, and the patterns are static for the daemon's lifetime.
+    status_matchers: BTreeMap<String, StatusMatcher>,
+
+    /// The raw text the `status_matchers` were last built from, so a reload can
+    /// skip recompiling when `agent-types.md` is unchanged.
+    agent_types_src: String,
+
+    /// The last `agent_state` reported per process id (todo #142). The status
+    /// observer reports only on a *change*, so a steady-state agent does not
+    /// spawn a `_process-report` subprocess every poll. Pruned to the live set.
+    reported_states: BTreeMap<u64, String>,
 
     /// Whether any plugin pane is currently the focused pane in its tab.
     /// Updated by [`PanoptPane::ingest_panes`] but only from a non-transient
@@ -278,6 +298,12 @@ struct PaneRow {
     /// launch command, used as the routing file name
     /// `.panopt/.cockpit/viewer-<slot>.json`. `None` on any other role.
     viewer_slot: Option<String>,
+    /// For agent panes: the stable agent id parsed from the launch command's
+    /// `--id` (todo #142). The status observer matches this against an instance
+    /// row's `agent_id` to bind the pane to its row - resilient to Zellij
+    /// surfacing the agent's `_mcp-proxy` child rather than the `_process-run`
+    /// shim. `None` on non-agent panes. See `agent_id_from_command`.
+    agent_id: Option<String>,
     /// Tab position from the `PaneManifest`. Used by the CloseTab gate to
     /// scope active-item aggregation to a single tab.
     tab: usize,
@@ -298,6 +324,10 @@ enum ItemTarget {
     Note(u64),
     /// A process agent or command, by process id.
     Process(u64),
+    /// An agent config, by config (agent_tool) id. The Agents pane is
+    /// config-centric (#27): activating one starts (or focuses) its single live
+    /// instance; stopping/deleting acts on the config and that instance.
+    Config(u64),
     /// An existing pane: an ad-hoc agent or a plain terminal.
     Pane(PaneId),
 }
@@ -347,6 +377,10 @@ impl ZellijPlugin for PanoptPane {
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
             PermissionType::WriteToClipboard,
+            // The status observer reads each agent pane's viewport via
+            // `get_pane_scrollback` (#142/#163); without this the host silently
+            // drops the call (an EOF on stdin) and no `state:` is ever derived.
+            PermissionType::ReadPaneContents,
         ]);
         subscribe(&[
             EventType::PaneUpdate,
@@ -419,6 +453,10 @@ impl ZellijPlugin for PanoptPane {
                 // off the same 1s poll that refreshed `self.processes`, gated to
                 // the Todos gatekeeper inside the method.
                 self.reconcile_starting_processes();
+                // Classify each running agent's pane output and report state
+                // changes back to the daemon (todo #142). Same poll, same
+                // gatekeeper gating - the observer mirrors the reconciler.
+                self.observe_agent_states();
                 // PaneUpdate-driven `sync_pane_titles` only fires when Zellij
                 // sends a pane manifest - typing into the form does not. Without
                 // this call, every right-pane title (most visibly a freshly
@@ -859,6 +897,7 @@ impl PanoptPane {
                 self.notes = read_index("/host/.panopt/notes.md");
                 self.processes = read_processes("/host/.panopt/processes.md");
                 self.read_agent_labels();
+                self.reload_status_matchers();
             }
             Mode::Notes => {
                 self.notes = read_index("/host/.panopt/notes.md");
@@ -866,6 +905,11 @@ impl PanoptPane {
             Mode::Agents | Mode::Commands => {
                 self.processes = read_processes("/host/.panopt/processes.md");
                 self.read_agent_labels();
+                // The Agents pane lists configs joined to their live instances
+                // (#27); Commands has no config layer, so only read it there.
+                if self.mode == Mode::Agents {
+                    self.configs = read_configs("/host/.panopt/agent_tools.md");
+                }
             }
             Mode::Terminals => {
                 self.read_agent_labels();
@@ -1009,6 +1053,11 @@ impl PanoptPane {
                 } else {
                     None
                 };
+                // The agent id stamped on the pane's `--id`, captured here at
+                // ingest while the command is in hand (todo #142). It binds the
+                // pane to its instance row for the status observer; see
+                // `agent_id_from_command`.
+                let agent_id = agent_id_from_command(p.terminal_command.as_deref());
                 rows.push(PaneRow {
                     id,
                     title: p.title.clone(),
@@ -1018,6 +1067,7 @@ impl PanoptPane {
                     floating: p.is_floating,
                     role,
                     viewer_slot,
+                    agent_id,
                     tab: *tab,
                 });
             }
@@ -1124,6 +1174,29 @@ impl PanoptPane {
             .iter()
             .find(|p| p.role == PaneRole::Process(id) && !p.exited)
             .map(|p| p.id)
+    }
+
+    /// The live pane hosting agent instance `id`, for the status observer (#142).
+    ///
+    /// Two bindings, tried in order, because an agent pane's command surfaces
+    /// inconsistently in Zellij's manifest. The robust one is by `agent_id`: the
+    /// pane stamps its stable id onto the `--id` of the `_mcp-proxy`/`_agent`
+    /// command (captured into [`PaneRow::agent_id`] at ingest), and that id is
+    /// the instance row's `name`. The fallback is the numeric `Process(id)`
+    /// role: the shape the pane carries before `_process-run` execs into the
+    /// agent, and the shape non-agent process panes keep. An exited pane never
+    /// matches.
+    fn agent_pane(&self, id: u64, agent_id: Option<&str>) -> Option<PaneId> {
+        if let Some(agent_id) = agent_id.filter(|s| !s.is_empty()) {
+            if let Some(p) = self
+                .panes
+                .iter()
+                .find(|p| !p.exited && p.agent_id.as_deref() == Some(agent_id))
+            {
+                return Some(p.id);
+            }
+        }
+        self.process_pane(id)
     }
 
     /// Keep `agent_labels` in step with the live agent panes: forget closed
@@ -1267,26 +1340,24 @@ impl PanoptPane {
                 })
                 .collect(),
             Mode::Agents => {
-                // Agent-kind processes, plus ad-hoc `a`-spawned agent panes
-                // that have no backing process row.
-                let mut items: Vec<Item> = self
-                    .processes
+                // Config-centric (#27): one row per agent config, joined to its
+                // single live instance (the 1:1 policy) for status/state and the
+                // live marker. The agent *is* the config; starting it spawns the
+                // instance, stopping it ends the instance, but the row persists.
+                self.configs
                     .iter()
-                    .filter(|r| r.kind == "agent")
-                    .map(|r| Item {
-                        label: r.label.clone(),
-                        target: ItemTarget::Process(r.id),
-                        live: self.process_pane(r.id).is_some(),
+                    .map(|c| {
+                        let inst = self.config_instance(c.id);
+                        let live = inst
+                            .map(|r| self.process_pane(r.id).is_some())
+                            .unwrap_or(false);
+                        Item {
+                            label: agent_config_label(c, inst),
+                            target: ItemTarget::Config(c.id),
+                            live,
+                        }
                     })
-                    .collect();
-                for p in self.panes.iter().filter(|p| p.role == PaneRole::Agent) {
-                    items.push(Item {
-                        label: self.agent_label(p),
-                        target: ItemTarget::Pane(p.id),
-                        live: true,
-                    });
-                }
-                items
+                    .collect()
             }
             Mode::Commands => self
                 .processes
@@ -1370,6 +1441,10 @@ impl PanoptPane {
                 Some(pane) => self.route_pane_to_slot(pane, false),
                 None => self.clear_slot(),
             },
+            Some(ItemTarget::Config(id)) => match self.config_instance_pane(id) {
+                Some(pane) => self.route_pane_to_slot(pane, false),
+                None => self.clear_slot(),
+            },
             Some(ItemTarget::Pane(pane)) => self.route_pane_to_slot(pane, false),
             None => self.clear_slot(),
         }
@@ -1430,7 +1505,7 @@ impl PanoptPane {
             BareKey::Char('n') if self.mode == Mode::Notes => {
                 self.open_document("new-note", None, true)
             }
-            BareKey::Char('n') if self.mode == Mode::Agents => self.spawn_agent_pane(None),
+            BareKey::Char('n') if self.mode == Mode::Agents => self.create_agent_config(),
             BareKey::Char('L') => self.open_mode_list(true),
             // `Alt-<1..5>` jumps focus to a sibling sidebar pane, lazygit-style
             // (todo #110). Guarded on the Alt modifier so it takes precedence
@@ -1557,6 +1632,7 @@ impl PanoptPane {
             ItemTarget::Todo(id) => self.open_document("todo", Some(id), focus),
             ItemTarget::Note(id) => self.open_document("note", Some(id), focus),
             ItemTarget::Process(id) => self.activate_process(id, focus),
+            ItemTarget::Config(id) => self.activate_config(id, focus),
             ItemTarget::Pane(pane) => self.route_pane_to_slot(pane, focus),
         }
     }
@@ -1597,6 +1673,13 @@ impl PanoptPane {
             ItemTarget::Todo(id) => self.spawn_delete_gate_dialog("todo", id, &label, cwd),
             ItemTarget::Note(id) => self.spawn_delete_gate_dialog("note", id, &label, cwd),
             ItemTarget::Process(id) => self.spawn_delete_gate_dialog("process", id, &label, cwd),
+            // Deleting an agent removes its config (the durable record); the
+            // delete gate already speaks `agent-tool`. The config's label
+            // carries a ` · state` suffix here, so strip it for the dialog.
+            ItemTarget::Config(id) => {
+                let name = label.split(" · ").next().unwrap_or(&label);
+                self.spawn_delete_gate_dialog("agent-tool", id, name, cwd)
+            }
             // A "pane" target is a transient view (a terminal pane, an ad-hoc
             // agent pane) - closing it does not delete any persistent record,
             // so no confirmation is needed.
@@ -1818,6 +1901,7 @@ impl PanoptPane {
                     close_pane_with_id(pane);
                 }
             }
+            Some(ItemTarget::Config(id)) => self.stop_config(id),
             Some(ItemTarget::Pane(pane)) => {
                 close_pane_with_id(pane);
             }
@@ -1846,6 +1930,86 @@ impl PanoptPane {
 
     fn clear_slot(&mut self) {
         self.ensure_viewer_in_slot("empty", None, false);
+    }
+
+    /// The live agent instance of config `config_id`, if one exists (the 1:1
+    /// policy guarantees at most one). The join key is the instance's
+    /// `agent_tool_id`, lifted from the ` (from #N)` suffix in processes.md.
+    fn config_instance(&self, config_id: u64) -> Option<&ProcessRow> {
+        self.processes
+            .iter()
+            .find(|r| r.kind == "agent" && r.agent_tool_id == Some(config_id))
+    }
+
+    /// The Zellij pane hosting config `config_id`'s live instance, if any.
+    fn config_instance_pane(&self, config_id: u64) -> Option<PaneId> {
+        self.config_instance(config_id)
+            .and_then(|r| self.process_pane(r.id))
+    }
+
+    /// Activate an agent config: focus its live instance's pane if running,
+    /// else start a fresh instance via `panopt process start <config_id>`. The
+    /// daemon writes a `starting` row that `reconcile_starting_processes` turns
+    /// into a pane on the next tick - the same path a manual start takes.
+    fn activate_config(&mut self, config_id: u64, focus: bool) {
+        if let Some(pane) = self.config_instance_pane(config_id) {
+            self.route_pane_to_slot(pane, focus);
+            return;
+        }
+        let Some(cwd) = self.launch_cwd() else {
+            return;
+        };
+        let id_str = config_id.to_string();
+        self.run_panopt(
+            &["process", "start", id_str.as_str(), "--port", &self.port],
+            cwd,
+        );
+    }
+
+    /// Stop an agent config's live instance: signal the process via
+    /// `panopt process stop <instance_id>` (which marks the row stopped, so it
+    /// leaves the projection) and close its now-defunct pane. A no-op when the
+    /// config has no live instance. The config row itself stays in the list.
+    fn stop_config(&mut self, config_id: u64) {
+        let Some(inst_id) = self.config_instance(config_id).map(|r| r.id) else {
+            return;
+        };
+        let pane = self.process_pane(inst_id);
+        if let Some(cwd) = self.launch_cwd() {
+            let id_str = inst_id.to_string();
+            self.run_panopt(
+                &["process", "stop", id_str.as_str(), "--port", &self.port],
+                cwd,
+            );
+        }
+        if let Some(pane) = pane {
+            close_pane_with_id(pane);
+        }
+    }
+
+    /// Create a new agent config via `panopt agent-tool add` (#27): the
+    /// config-centric replacement for the old ad-hoc `_agent` spawn on `n`. The
+    /// config defaults to the `claude-code` profile and an auto-minted name the
+    /// user can rename; it appears in the Agents pane on the next reload, ready
+    /// to start with `u`/Enter.
+    fn create_agent_config(&mut self) {
+        let Some(cwd) = self.launch_cwd() else {
+            return;
+        };
+        self.next_agent += 1;
+        let name = format!("agent-{}", self.next_agent);
+        self.run_panopt(
+            &[
+                "agent-tool",
+                "add",
+                name.as_str(),
+                "--tool-type",
+                "claude-code",
+                "--port",
+                &self.port,
+            ],
+            cwd,
+        );
     }
 
     fn activate_process(&mut self, id: u64, focus: bool) {
@@ -1924,6 +2088,83 @@ impl PanoptPane {
                     );
                 }
             }
+        }
+    }
+
+    /// Rebuild the per-type status matchers from `.panopt/agent-types.md` when
+    /// its text changes (todo #142). A cheap no-op when unchanged - the patterns
+    /// are static for the daemon's lifetime and regex compilation is not free.
+    fn reload_status_matchers(&mut self) {
+        let body = fs::read_to_string("/host/.panopt/agent-types.md").unwrap_or_default();
+        if body == self.agent_types_src {
+            return;
+        }
+        self.status_matchers = parse_agent_type_matchers(&body);
+        self.agent_types_src = body;
+    }
+
+    /// Classify each running agent's pane output and report `agent_state`
+    /// changes to the daemon (todo #142). The status half of the lifecycle: the
+    /// plugin is the only code that can read a pane's buffer, so it captures the
+    /// viewport, runs that type's compiled patterns locally, and reports just
+    /// the derived one-word state (never the output) - and only on a *change*,
+    /// so a steady agent costs no subprocess. Gated to the Todos gatekeeper so
+    /// the five plugin instances don't each observe the same panes.
+    fn observe_agent_states(&mut self) {
+        if self.mode != Mode::Todos || !self.permitted {
+            return;
+        }
+        // A running agent backed by a config whose type we have patterns for is
+        // observable; snapshot `(id, tool_type, agent_id)` so the borrow of
+        // `self.processes` is released before the per-process round-trips below.
+        // `agent_id` (the row's stable name) is the key that binds the row to a
+        // pane below.
+        let observable: Vec<(u64, String, Option<String>)> = self
+            .processes
+            .iter()
+            .filter(|r| r.kind == "agent" && r.status.as_deref() == Some("running"))
+            .filter_map(|r| r.tool_type.clone().map(|t| (r.id, t, r.agent_id.clone())))
+            .collect();
+        let live: Vec<u64> = observable.iter().map(|(id, _, _)| *id).collect();
+        self.reported_states.retain(|id, _| live.contains(id));
+
+        let Some(cwd) = self.launch_cwd() else {
+            return;
+        };
+        for (id, tool_type, agent_id) in observable {
+            let Some(matcher) = self.status_matchers.get(&tool_type) else {
+                continue;
+            };
+            let Some(pane) = self.agent_pane(id, agent_id.as_deref()) else {
+                continue;
+            };
+            let Ok(contents) = get_pane_scrollback(pane, false) else {
+                continue;
+            };
+            // Classify only the live footer/prompt region, not the whole
+            // viewport: an agent scrolls its transcript through the visible
+            // area, so matching all of it makes the state sticky and flappy
+            // (bug #163). See `viewport_live_region`.
+            let state = matcher
+                .classify(&viewport_live_region(&contents.viewport))
+                .as_str();
+            if self.reported_states.get(&id).map(String::as_str) == Some(state) {
+                continue;
+            }
+            let id_str = id.to_string();
+            self.run_panopt(
+                &[
+                    "_process-report",
+                    "--port",
+                    self.port.as_str(),
+                    "--id",
+                    id_str.as_str(),
+                    "--agent-state",
+                    state,
+                ],
+                cwd.clone(),
+            );
+            self.reported_states.insert(id, state.to_string());
         }
     }
 
@@ -2580,6 +2821,24 @@ fn read_processes(path: &str) -> Vec<ProcessRow> {
     match fs::read_to_string(path) {
         Ok(body) => body.lines().filter_map(parse_process_line).collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+fn read_configs(path: &str) -> Vec<ConfigRow> {
+    match fs::read_to_string(path) {
+        Ok(body) => body.lines().filter_map(parse_config_line).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The Agents-pane row label for a config: its name, plus a ` · <status>`
+/// suffix drawn from its live instance when one exists - the agent's classified
+/// activity (`thinking`/`waiting`/...) if observed, else the lifecycle status
+/// (`starting`/`running`). A config with no live instance shows just its name.
+fn agent_config_label(c: &ConfigRow, inst: Option<&ProcessRow>) -> String {
+    match inst.and_then(|r| r.agent_state.as_deref().or(r.status.as_deref())) {
+        Some(s) if !s.is_empty() => format!("{} · {}", c.label, s),
+        _ => c.label.clone(),
     }
 }
 

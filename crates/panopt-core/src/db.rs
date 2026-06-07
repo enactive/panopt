@@ -15,7 +15,7 @@ use crate::agent_profiles::DEFAULT_PROFILE_KEY;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -306,6 +306,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 12 {
         apply_v12(conn)?;
     }
+    if version < 13 {
+        apply_v13(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -464,6 +467,20 @@ fn apply_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// binary before its `user_version` bump landed upgrades cleanly.
 fn apply_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column_if_missing(conn, "processes", "pane_id", "TEXT")
+}
+
+/// Version 13: `state_since` on processes (bug #163).
+///
+/// A Unix-epoch-seconds stamp of when a process's `agent_state` last changed,
+/// written by `process_report` on a state transition. The processes projection
+/// renders `idle:<age>` as `now - state_since` while the agent is in the `idle`
+/// state - a real "how long has it been sitting idle" age, replacing the old
+/// `idle:` that was sourced from registry presence (time since last MCP call),
+/// which measured connection heartbeat, not idleness. Integer epoch rather than
+/// the `datetime('now')` TEXT the other timestamps use, so the projection can
+/// diff it against the render clock without parsing.
+fn apply_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "processes", "state_since", "INTEGER")
 }
 
 /// True if a table named `table` exists. Used by migrations that must stay

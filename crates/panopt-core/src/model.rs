@@ -249,9 +249,10 @@ pub mod process_status {
     pub const RUNNING: &str = "running";
     /// `process_stop` signalled the process; the pane is left standing.
     pub const STOPPED: &str = "stopped";
-    /// Pane death observed (reserved for #142; not written here). Allowed to be
-    /// unused until the liveness child consumes it.
-    #[allow(dead_code)]
+    /// The instance's OS process is gone: written by the daemon's liveness
+    /// sweep ([`crate::Store::sweep_dead_processes`], todo #142/#163) when a
+    /// `running` row's pid no longer exists - the hand-quit path that
+    /// `process_stop` (which writes `STOPPED`) does not cover.
     pub const EXITED: &str = "exited";
 }
 
@@ -347,6 +348,12 @@ pub struct Process {
     /// SQLite `datetime('now')` text of the last lifecycle ping. `None`
     /// until lifecycle ownership lands.
     pub last_seen: Option<String>,
+    /// Unix-epoch seconds of the last `agent_state` transition (bug #163),
+    /// stamped by `process_report`. The processes projection renders the
+    /// `idle:` age from this while the agent is `idle` - a real "time sitting
+    /// idle", not the old registry-presence (last-MCP-call) proxy. `None`
+    /// until the first state is reported.
+    pub state_since: Option<i64>,
     /// SQLite `datetime('now')` text (UTC) at row creation.
     pub created_at: String,
 }
@@ -366,6 +373,7 @@ pub struct ProcessPatch {
     pub status: Option<Option<String>>,
     pub agent_state: Option<Option<String>>,
     pub last_seen: Option<Option<String>>,
+    pub state_since: Option<Option<i64>>,
 }
 
 /// How the registry came to know about an agent.

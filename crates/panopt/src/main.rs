@@ -217,7 +217,10 @@ enum Cmd {
         /// Numeric id of the process to start.
         id: u64,
     },
-    /// Internal: report the pane a reconciled instance landed in.
+    /// Internal: report runtime facts for a reconciled instance - the pane it
+    /// landed in (once, at reconcile) and/or its latest classified activity
+    /// (each poll the state changes, todo #142). Both are optional so the two
+    /// reporters call independently.
     #[command(name = "_process-report", hide = true)]
     ProcessReport {
         #[arg(long)]
@@ -227,7 +230,10 @@ enum Cmd {
         id: u64,
         /// Opaque pane identifier (the Zellij terminal id) to record.
         #[arg(long = "pane-id")]
-        pane_id: String,
+        pane_id: Option<String>,
+        /// Classified activity (`thinking`/`idle`/`waiting`/`done`) to record.
+        #[arg(long = "agent-state")]
+        agent_state: Option<String>,
     },
     /// Internal: a long-lived cockpit viewer pane.
     #[command(name = "_viewer", hide = true)]
@@ -311,7 +317,12 @@ fn main() -> anyhow::Result<()> {
             token,
         } => mcp_proxy::run(host, cli.port, ws, project, id, name, token),
         Cmd::ProcessRun { ws, id } => process::exec_entry(ws, id, cli.port),
-        Cmd::ProcessReport { ws, id, pane_id } => process::exec_report(ws, id, pane_id, cli.port),
+        Cmd::ProcessReport {
+            ws,
+            id,
+            pane_id,
+            agent_state,
+        } => process::exec_report(ws, id, pane_id, agent_state, cli.port),
         Cmd::ViewerExec { ws, slot, kind, id } => viewer::run(ws, cli.port, slot, kind, id),
         Cmd::CloseGateExec {
             scope,

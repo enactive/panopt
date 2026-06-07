@@ -461,6 +461,94 @@ impl Store {
         Ok(pruned.into_iter().map(|(_, key)| key).collect())
     }
 
+    /// Reap instances whose OS process is gone, flipping each from `running`
+    /// to [`process_status::EXITED`] and re-projecting (todo #142, bug #163).
+    ///
+    /// The daemon calls this on a timer so a hand-quit agent (the user pressed
+    /// `Ctrl-c`/`exit` in its pane, no `process_stop` ever ran) stops being
+    /// reported as live - otherwise its `running` row lingers in `processes.md`
+    /// forever and the 1:1 policy in [`Self::process_start`] keeps handing the
+    /// zombie back instead of spawning a fresh instance.
+    ///
+    /// Liveness itself is supplied by the caller via `is_alive` (a `kill(pid, 0)`
+    /// probe): the OS-signal effect belongs to the daemon, which lives on the
+    /// executing host, not to the state layer - the same split as
+    /// [`Self::process_stop`]. Core owns only the enumeration, the status flip,
+    /// and the reprojection, so this stays unit-testable with a fake predicate.
+    /// Only `running` rows carrying a pid are probed; `starting` (no pid yet)
+    /// and already-terminal rows are left alone. Returns the
+    /// `(project_id, process_id)` pairs reaped.
+    pub fn sweep_dead_processes(
+        &mut self,
+        is_alive: impl Fn(i64) -> bool,
+    ) -> Result<Vec<(i64, u64)>, CoreError> {
+        let candidates: Vec<(i64, u64, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT project_id, id, pid FROM processes
+                  WHERE deleted_at IS NULL AND status = ?1 AND pid IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![process_status::RUNNING], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let dead: Vec<(i64, u64)> = candidates
+            .into_iter()
+            .filter(|(_, _, pid)| !is_alive(*pid))
+            .map(|(project, id, _)| (project, id))
+            .collect();
+        for (project, id) in &dead {
+            // `process_update` re-projects the owning project, so a reaped row
+            // drops out of `processes.md` immediately (terminal rows are not
+            // rendered).
+            self.process_update(
+                ProjectId(*project),
+                *id,
+                ProcessPatch {
+                    status: Some(Some(process_status::EXITED.to_string())),
+                    ..Default::default()
+                },
+            )?;
+        }
+        Ok(dead)
+    }
+
+    /// Re-project `processes.md` for every project with a live agent instance so
+    /// time-based annotations advance without a mutation to drive them - notably
+    /// the `idle:` presence age (#142/#163), which is `now - last_seen` computed
+    /// at render time and therefore frozen between reprojections. The daemon
+    /// calls this on a ~10s timer.
+    ///
+    /// Cheap by construction: projects with no `starting`/`running` agent are
+    /// skipped, so an idle daemon does nothing; an active one does a couple of
+    /// small reads and one atomic write per such project. Returns how many
+    /// projects were re-projected (for logging).
+    pub fn tick_process_projections(&self) -> Result<usize, CoreError> {
+        let projects: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT project_id FROM processes
+                  WHERE kind = ?1 AND deleted_at IS NULL AND status IN (?2, ?3)",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    ProcessKind::Agent.as_str(),
+                    process_status::STARTING,
+                    process_status::RUNNING,
+                ],
+                |r| r.get::<_, i64>(0),
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for pid in &projects {
+            self.reproject_processes(ProjectId(*pid))?;
+        }
+        Ok(projects.len())
+    }
+
     /// Prune agents in `project` that have gone silent, release any locks they
     /// held, and re-project whatever changed. Returns whether anything was
     /// pruned.
@@ -1026,7 +1114,8 @@ impl Store {
     pub fn process_list(&self, project: ProjectId) -> Result<Vec<Process>, CoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, name, display_name, command, cwd, position,
-                    agent_tool_id, pid, pane_id, status, agent_state, last_seen, created_at
+                    agent_tool_id, pid, pane_id, status, agent_state, last_seen,
+                    state_since, created_at
                FROM processes
               WHERE project_id = ?1 AND deleted_at IS NULL
               ORDER BY position, id",
@@ -1047,7 +1136,8 @@ impl Store {
                 status: r.get(10)?,
                 agent_state: r.get(11)?,
                 last_seen: r.get(12)?,
-                created_at: r.get(13)?,
+                state_since: r.get(13)?,
+                created_at: r.get(14)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1111,12 +1201,16 @@ impl Store {
         if let Some(v) = patch.last_seen {
             entry.last_seen = v;
         }
+        if let Some(v) = patch.state_since {
+            entry.state_since = v;
+        }
         self.conn.execute(
             "UPDATE processes
                 SET name = ?1, display_name = ?2, command = ?3, cwd = ?4,
                     position = ?5, agent_tool_id = ?6, pid = ?7, pane_id = ?8,
-                    status = ?9, agent_state = ?10, last_seen = ?11
-              WHERE project_id = ?12 AND id = ?13",
+                    status = ?9, agent_state = ?10, last_seen = ?11,
+                    state_since = ?12
+              WHERE project_id = ?13 AND id = ?14",
             params![
                 entry.name,
                 entry.display_name,
@@ -1129,6 +1223,7 @@ impl Store {
                 entry.status,
                 entry.agent_state,
                 entry.last_seen,
+                entry.state_since,
                 project.0,
                 id as i64,
             ],
@@ -1236,13 +1331,23 @@ impl Store {
     ) -> Result<(), CoreError> {
         let mut patch = ProcessPatch {
             pane_id: pane_id.map(Some),
-            agent_state: agent_state.map(Some),
+            agent_state: agent_state.clone().map(Some),
             ..Default::default()
         };
         if let Some(pid) = pid {
             patch.pid = Some(Some(pid));
             patch.status = Some(Some(process_status::RUNNING.to_string()));
             patch.last_seen = Some(Some(now_text(&self.conn)?));
+        }
+        // A genuine state change stamps `state_since` (bug #163), so the
+        // projection can render "time in this state". Re-reporting the same
+        // state leaves the clock alone (the observer only reports on change,
+        // but a periodic re-report must not reset the age either).
+        if let Some(new_state) = &agent_state {
+            let current = self.fetch_process(project, id)?;
+            if current.agent_state.as_deref() != Some(new_state.as_str()) {
+                patch.state_since = Some(Some(now_epoch_secs()));
+            }
         }
         self.process_update(project, id, patch)
     }
@@ -1274,7 +1379,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT kind, name, display_name, command, cwd, position,
-                        agent_tool_id, pid, pane_id, status, agent_state, last_seen, created_at
+                        agent_tool_id, pid, pane_id, status, agent_state, last_seen,
+                        state_since, created_at
                    FROM processes
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
@@ -1294,7 +1400,8 @@ impl Store {
                         status: r.get(9)?,
                         agent_state: r.get(10)?,
                         last_seen: r.get(11)?,
-                        created_at: r.get(12)?,
+                        state_since: r.get(12)?,
+                        created_at: r.get(13)?,
                     })
                 },
             )
@@ -1913,8 +2020,27 @@ impl Store {
 
     fn reproject_processes(&self, project: ProjectId) -> Result<(), CoreError> {
         let root = self.project_root(project)?;
-        projection::project_processes(&root, &self.process_list(project)?)?;
+        projection::project_processes(
+            &root,
+            &self.process_list(project)?,
+            &self.tool_type_map(project)?,
+            std::time::SystemTime::now(),
+        )?;
         Ok(())
+    }
+
+    /// `agent_tool_id -> tool_type` for this project, the join the processes
+    /// projection needs to tag each agent row with the profile that classifies
+    /// it (#142). The type key lives on the config, not copied onto the row.
+    fn tool_type_map(
+        &self,
+        project: ProjectId,
+    ) -> Result<std::collections::BTreeMap<u64, String>, CoreError> {
+        Ok(self
+            .agent_tool_list(project)?
+            .into_iter()
+            .map(|t| (t.id, t.tool_type))
+            .collect())
     }
 
     fn reproject_agents(&self, project: ProjectId) -> Result<(), CoreError> {
@@ -1938,7 +2064,15 @@ impl Store {
     fn reproject_all(&self, root: &Path, project: ProjectId) -> Result<(), CoreError> {
         projection::project_todos(root, &self.todo_list(project)?)?;
         projection::project_agent_tools(root, &self.agent_tool_list(project)?)?;
-        projection::project_processes(root, &self.process_list(project)?)?;
+        projection::project_processes(
+            root,
+            &self.process_list(project)?,
+            &self.tool_type_map(project)?,
+            std::time::SystemTime::now(),
+        )?;
+        if let Ok(profiles) = crate::agent_profiles::ProfileSet::load() {
+            projection::project_agent_types(root, &profiles)?;
+        }
         projection::project_agents(
             root,
             &self.registry.list(project.0),
@@ -1979,6 +2113,17 @@ fn next_id(conn: &Connection, pid: i64) -> Result<i64, CoreError> {
 /// `created_at`/`updated_at` column already stores.
 fn now_text(conn: &Connection) -> Result<String, CoreError> {
     Ok(conn.query_row("SELECT datetime('now')", [], |r| r.get(0))?)
+}
+
+/// Wall-clock now as Unix-epoch seconds, for the `state_since` stamp (bug #163).
+/// Stored as an integer (not the `datetime('now')` TEXT the other timestamps
+/// use) so the processes projection can diff it against its render clock without
+/// parsing a date string. A clock before the epoch clamps to 0.
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -3402,6 +3547,130 @@ mod tests {
         // a spent (stopped) row no longer blocks a fresh start.
         let restarted = fx.store.process_start(p, config).unwrap();
         assert_ne!(restarted.id, started.id);
+    }
+
+    #[test]
+    fn sweep_dead_processes_reaps_only_gone_pids() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                true,
+            )
+            .unwrap();
+        let started = fx.store.process_start(p, config).unwrap();
+        fx.store
+            .process_report(p, started.id, Some(4242), None, None)
+            .unwrap();
+
+        // A `starting` row (no pid) of a second config must never be probed or
+        // reaped - liveness only applies once a pid is anchored.
+        let cfg2 = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-b".into(),
+                "Worker".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                true,
+            )
+            .unwrap();
+        let starting = fx.store.process_start(p, cfg2).unwrap();
+
+        // Predicate reports the pid alive: nothing is reaped.
+        let reaped = fx.store.sweep_dead_processes(|_| true).unwrap();
+        assert!(reaped.is_empty());
+        assert_eq!(
+            fx.store
+                .process_get(p, started.id)
+                .unwrap()
+                .status
+                .as_deref(),
+            Some(process_status::RUNNING)
+        );
+
+        // Predicate reports the pid gone: the running row flips to exited and
+        // its line leaves the projection; the pid-less `starting` row is intact.
+        let reaped = fx.store.sweep_dead_processes(|_| false).unwrap();
+        assert_eq!(reaped, vec![(p.0, started.id)]);
+        let row = fx.store.process_get(p, started.id).unwrap();
+        assert_eq!(row.status.as_deref(), Some(process_status::EXITED));
+        assert_eq!(
+            fx.store
+                .process_get(p, starting.id)
+                .unwrap()
+                .status
+                .as_deref(),
+            Some(process_status::STARTING)
+        );
+        let md = std::fs::read_to_string(root.join(".panopt/processes.md")).unwrap();
+        assert!(
+            !md.contains("Mediator"),
+            "reaped row still projected:\n{md}"
+        );
+
+        // A reaped (exited) row no longer blocks a fresh start of its config.
+        let restarted = fx.store.process_start(p, config).unwrap();
+        assert_ne!(restarted.id, started.id);
+    }
+
+    #[test]
+    fn tick_process_projections_refreshes_idle_for_active_agents() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                true,
+            )
+            .unwrap();
+        let started = fx.store.process_start(p, config).unwrap();
+        // Flip it to running, then report `idle` (which stamps `state_since`).
+        fx.store
+            .process_report(p, started.id, Some(4242), None, None)
+            .unwrap();
+        fx.store
+            .process_report(p, started.id, None, None, Some("idle".into()))
+            .unwrap();
+
+        // Backdate `state_since` 180s so the next reproject renders a non-zero
+        // whole-minute idle age. The reproject clock is `now`, so age >= 180s
+        // -> `idle:3m`.
+        fx.store
+            .process_update(
+                p,
+                started.id,
+                ProcessPatch {
+                    state_since: Some(Some(now_epoch_secs() - 180)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let count = fx.store.tick_process_projections().unwrap();
+        assert_eq!(count, 1, "one project has a live agent");
+        let md = std::fs::read_to_string(root.join(".panopt/processes.md")).unwrap();
+        assert!(md.contains("state:idle"), "state not idle:\n{md}");
+        assert!(md.contains("idle:3m"), "idle age not refreshed:\n{md}");
+
+        // A project with no live agent is skipped (no work, no panic).
+        let (_q, _) = fx.project("empty");
+        assert_eq!(fx.store.tick_process_projections().unwrap(), 1);
     }
 
     #[test]

@@ -90,6 +90,21 @@ pub enum AgentState {
     Done,
 }
 
+impl AgentState {
+    /// The lowercase wire name, matching the `serde(rename_all = "lowercase")`
+    /// above. Used to project the status patterns to `.panopt/agent-types.md`
+    /// (todo #142), where the sidebar's wasm-side `AgentState` reads them back -
+    /// the two enums share these strings as their contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentState::Thinking => "thinking",
+            AgentState::Idle => "idle",
+            AgentState::Waiting => "waiting",
+            AgentState::Done => "done",
+        }
+    }
+}
+
 /// The launch template for an agent type. Rendered by the spawn interpreter
 /// into a concrete process launch; this struct only holds the un-rendered
 /// templates.

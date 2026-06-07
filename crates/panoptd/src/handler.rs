@@ -628,6 +628,23 @@ fn signal_terminate(pid: i64) {
     }
 }
 
+/// Whether a co-located process is still alive, the predicate the daemon feeds
+/// to [`panopt_core::Store::sweep_dead_processes`] (bug #163). `kill(pid, 0)`
+/// sends no signal - it only asks the kernel whether the pid is deliverable:
+/// `0` means alive, `EPERM` means alive-but-not-ours (still alive), `ESRCH`
+/// means gone. Treats anything but a clean "gone" as alive so the sweep never
+/// reaps a live instance on an ambiguous error. Only meaningful for instances
+/// on the daemon's own host (the documented co-located assumption).
+pub(crate) fn pid_is_alive(pid: i64) -> bool {
+    // SAFETY: `kill` with signal 0 performs only an existence/permission check;
+    // no memory effects, and a bad pid is reported via errno, which we read.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let json =
         serde_json::to_string(value).map_err(|e| McpError::internal_error(e.to_string(), None))?;
