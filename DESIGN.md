@@ -555,6 +555,15 @@ process row so post-spawn edits to the tool don't perturb the running
 instance. Deleting a tool nulls the `agent_tool_id` back-reference on any
 process that referenced it; the live instance keeps running.
 
+Copy-on-spawn is also where **per-launch overrides** land (the orchestration
+spawn surface, Section 10): `process_start`/`spawn_agent` accept an optional
+`name` (the instance's display name for this run) and `extra_args` (a JSON
+array stored on the `processes` row). Both are written onto the new instance
+and never back to the config, so two launches of the same tool can differ
+without mutating it. The edge that renders the launch (`panopt _process-run`)
+reads `extra_args` back off the row and appends them after the profile's own
+`argv`/`default_args`.
+
 Both tables draw ids from the unified per-project `next_id` counter
 (Section 6.4), so a `#N` reference still resolves to exactly one row across
 todos, notes, agent_tools, and processes.
@@ -562,7 +571,7 @@ todos, notes, agent_tools, and processes.
 Whether a process is currently running is *not* stored today: the cockpit
 derives it from live Zellij pane state, same as the pre-V6 roster did. The
 nullable lifecycle columns turn that into a follow-up rather than a schema
-break, once panoptd owns process spawn (Section 10).
+break, once panoptd owns process spawn (Section 11).
 
 The config and instance layers each project to their own markdown file:
 `.panopt/agent_tools.md` and `.panopt/processes.md`. The cockpit sidebar
@@ -586,14 +595,22 @@ adapter.
 - **spawn** - a launch template: an `argv` vector, an `env` map, and a set of
   `files` to materialize, all carrying `{{placeholder}}` references. The spawn
   interpreter renders these against the facts PANopt supplies (`panopt_bin`,
-  `host`, `port`, `ws`, `project`, `agent_id`, `name`, `token`, `model`) into a
-  concrete process launch. env-vs-flag-vs-config-file is not three mechanisms
+  `host`, `port`, `ws`, `project`, `agent_id`, `name`, `token`, `model`, and -
+  once a row exists - `process_id`) into a concrete process launch. env-vs-flag-vs-config-file is not three mechanisms
   but one template shape - *where a placeholder lands* - so one engine launches
   every CLI agent. This is what lets PANopt render the launch itself rather than
   leaning on the agent's own `${VAR}` expansion (which the cockpit's hand-built
   claude config currently does; see `crates/panopt/src/mcp.rs`).
 - **status** - regexes per activity state (`thinking` / `idle` / `waiting` /
   `done`) matched against the agent's output by the status interpreter.
+- **instructions** - an optional bootstrap template (the orchestration spawn
+  surface, Section 10) returned as `agent_instructions` from `spawn_agent`. It
+  draws on the same placeholder set as `spawn` plus `{{process_id}}` (the
+  spawned instance's id), but is rendered by the *daemon* at spawn time rather
+  than the edge - so it may reference only known facts, never `{{file:NAME}}`
+  (the daemon materializes no files). An orchestrator prepends the rendered text
+  to a child's first prompt to tell it its panopt identity and how to
+  coordinate.
 
 The only irreducible code is the interpreters themselves (substitution, pattern
 matching) and the providers that produce the injectable facts - both fixed and
@@ -722,10 +739,35 @@ bidirectional editing and the remaining note and process tools remain.
   blocked and on whom. (See todo #83 for the design that supersedes the
   earlier idle-prune-everything model.)
 
-## 10. Out of Scope and Future Work
+## 10. Agent orchestration surface
 
-- The remainder of Solo's large tool surface (timers, prompt templates, process
-  spawn and management, services). Added incrementally after the POC.
+Beyond the human cockpit, an orchestrator *agent* needs a programmatic way to
+spawn, bootstrap, task, and dispose of sub-agents - the parity target is Solo's
+`spawn_agent` / `send_input` / `close_process`. This rides the same
+daemon-decides / plugin-effects seam as the instance lifecycle: the daemon owns
+the record, the cockpit reconciles it into panes.
+
+- **Spawn** - `spawn_agent` is a thin alias over `process_start` (same args,
+  same one-live-instance-per-config policy, same dispatch path). Its return
+  carries the new `process_id`, the resolved instance `name`, and rendered
+  `agent_instructions` - the per-type bootstrap text (Section 6.7) the parent
+  prepends to the child's first prompt. Per-launch `name` / `extra_args` vary a
+  launch without mutating the config (copy-on-spawn, Section 6.6).
+- **Input** - `send_input(process_id, input)`, the linchpin that turns a spawned
+  child into a working one with no human keystroke: the daemon enqueues the
+  input, the plugin writes it into the owned pane (`write_chars_to_pane_id`).
+- **Dispose** - no new tool: Solo's `close_process` maps onto the existing
+  `process_stop` (kill the process; the pane stands, per the never-close-panes
+  invariant) followed by `process_delete`.
+
+`project_id` cross-project spawn is a deferred non-goal - it collides with the
+per-connection `?ws=` project scoping; revisit when a real cross-project
+orchestration case appears.
+
+## 11. Out of Scope and Future Work
+
+- The remainder of Solo's large tool surface (timers, prompt templates,
+  services). Added incrementally after the POC.
 - Process spawning and supervision. Solo spawns and manages processes itself;
   PANopt initially relies on Zellij to host agent and command panes, and may
   add direct process management later.

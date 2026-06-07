@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::agent_profiles::{ProfileSet, DEFAULT_PROFILE_KEY};
+use crate::agent_profiles::{render_instructions, Facts, ProfileSet, DEFAULT_PROFILE_KEY};
 use crate::db;
 use crate::error::CoreError;
 use crate::locks::Locks;
@@ -1123,7 +1123,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, name, display_name, command, cwd, position,
                     agent_tool_id, pid, pane_id, status, agent_state, last_seen,
-                    state_since, created_at
+                    state_since, created_at, extra_args
                FROM processes
               WHERE project_id = ?1 AND deleted_at IS NULL
               ORDER BY position, id",
@@ -1146,6 +1146,7 @@ impl Store {
                 last_seen: r.get(12)?,
                 state_since: r.get(13)?,
                 created_at: r.get(14)?,
+                extra_args: parse_extra_args(&r.get::<_, String>(15)?),
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1271,6 +1272,28 @@ impl Store {
         project: ProjectId,
         agent_tool_id: u64,
     ) -> Result<Process, CoreError> {
+        self.process_start_with(project, agent_tool_id, None, Vec::new())
+    }
+
+    /// [`Store::process_start`] with the orchestration spawn surface's per-launch
+    /// overrides (todo #159): `name` overrides the instance's display name for
+    /// this run only, and `extra_args` are recorded on the row for the edge to
+    /// append to the rendered argv. Both are *copy-on-spawn* - written onto the
+    /// new `processes` row, never back to the `agent_tools` config - so a second
+    /// spawn of the same config with different overrides leaves the config (and
+    /// the first instance) untouched.
+    ///
+    /// The 1:1 policy still holds: if a live instance of this config exists it is
+    /// returned unchanged and the overrides are ignored (the caller treats this
+    /// as "focus the existing one"), since there is no second row to apply them
+    /// to.
+    pub fn process_start_with(
+        &mut self,
+        project: ProjectId,
+        agent_tool_id: u64,
+        name: Option<String>,
+        extra_args: Vec<String>,
+    ) -> Result<Process, CoreError> {
         let config = self.fetch_agent_tool(project, agent_tool_id)?;
         if !config.enabled {
             return Err(CoreError::BadRequest(format!(
@@ -1290,6 +1313,15 @@ impl Store {
             return Ok(existing);
         }
 
+        // The instance display name is the per-launch override when given, else
+        // the config's own display name (copy-on-spawn). A blank override falls
+        // through to the config so an empty string never blanks the row.
+        let display_name = name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(config.display_name);
+        let extra_args_json =
+            serde_json::to_string(&extra_args).unwrap_or_else(|_| "[]".to_string());
+
         let pid = project.0;
         let id = {
             let tx = self.conn.transaction()?;
@@ -1297,19 +1329,20 @@ impl Store {
             tx.execute(
                 "INSERT INTO processes
                     (project_id, id, kind, name, display_name, command, cwd,
-                     position, agent_tool_id, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+                     position, agent_tool_id, status, created_at, extra_args)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), ?11)",
                 params![
                     pid,
                     next,
                     ProcessKind::Agent.as_str(),
                     config.name,
-                    config.display_name,
+                    display_name,
                     config.command,
                     config.cwd,
                     next,
                     agent_tool_id as i64,
                     process_status::STARTING,
+                    extra_args_json,
                 ],
             )?;
             tx.execute(
@@ -1321,6 +1354,63 @@ impl Store {
         };
         self.reproject_processes(project)?;
         self.fetch_process(project, id)
+    }
+
+    /// Render the bootstrap `agent_instructions` for instance `process` (todo
+    /// #159): the spawn surface's reply that an orchestrator prepends to a
+    /// spawned child's first prompt. `None` when the instance has no backing
+    /// config, the config's type has no profile, or the profile declares no
+    /// `instructions`.
+    ///
+    /// `host`/`port`/`token`/`panopt_bin` come from the daemon (the Store does
+    /// not own the listener config); `ws`/`project`/`process_id`/`name`/`model`
+    /// are sourced here from the project record, the row, and the profile - so
+    /// the renderer sees the same facts the edge will when it builds the launch.
+    pub fn render_agent_instructions(
+        &self,
+        project: ProjectId,
+        process: &Process,
+        host: &str,
+        port: u16,
+        token: &str,
+        panopt_bin: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let Some(tool_id) = process.agent_tool_id else {
+            return Ok(None);
+        };
+        let config = self.fetch_agent_tool(project, tool_id)?;
+        let Some(profile) = self.profiles.get(&config.tool_type) else {
+            return Ok(None);
+        };
+        let root = self.project_root(project)?;
+        let identity: String = self.conn.query_row(
+            "SELECT identity FROM projects WHERE id = ?1",
+            [project.0],
+            |r| r.get(0),
+        )?;
+        let agent_id = if process.name.trim().is_empty() {
+            config.name.clone()
+        } else {
+            process.name.clone()
+        };
+        let name = if process.display_name.trim().is_empty() {
+            agent_id.clone()
+        } else {
+            process.display_name.clone()
+        };
+        let facts = Facts {
+            panopt_bin: panopt_bin.to_string(),
+            host: host.to_string(),
+            port,
+            ws: root.to_string_lossy().into_owned(),
+            project: identity,
+            agent_id,
+            name,
+            token: token.to_string(),
+            model: profile.default_model.clone(),
+            process_id: Some(process.id),
+        };
+        render_instructions(profile, &facts).map_err(|e| CoreError::BadRequest(e.to_string()))
     }
 
     /// Report runtime facts for an instance from its executing host (todo
@@ -1388,7 +1478,7 @@ impl Store {
             .query_row(
                 "SELECT kind, name, display_name, command, cwd, position,
                         agent_tool_id, pid, pane_id, status, agent_state, last_seen,
-                        state_since, created_at
+                        state_since, created_at, extra_args
                    FROM processes
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
@@ -1410,6 +1500,7 @@ impl Store {
                         last_seen: r.get(11)?,
                         state_since: r.get(12)?,
                         created_at: r.get(13)?,
+                        extra_args: parse_extra_args(&r.get::<_, String>(14)?),
                     })
                 },
             )
@@ -2132,6 +2223,14 @@ fn now_epoch_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Parse the `processes.extra_args` JSON-array column (todo #159) into the
+/// instance's per-launch argument list. A malformed or legacy value reads back
+/// as empty rather than erroring the whole row - the args are an additive launch
+/// detail, not load-bearing state.
+fn parse_extra_args(json: &str) -> Vec<String> {
+    serde_json::from_str(json).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3563,6 +3662,98 @@ mod tests {
         // a spent (stopped) row no longer blocks a fresh start.
         let restarted = fx.store.process_start(p, config).unwrap();
         assert_ne!(restarted.id, started.id);
+    }
+
+    #[test]
+    fn process_start_with_records_overrides_without_mutating_the_config() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+
+        // A per-launch name + extra_args land on the instance row.
+        let started = fx
+            .store
+            .process_start_with(
+                p,
+                config,
+                Some("Mediator (run 1)".into()),
+                vec!["--model".into(), "opus".into()],
+            )
+            .unwrap();
+        assert_eq!(started.display_name, "Mediator (run 1)");
+        assert_eq!(started.extra_args, vec!["--model", "opus"]);
+
+        // The durable config is untouched: name and (absence of) args both stay.
+        let cfg = fx.store.agent_tool_get(p, config).unwrap();
+        assert_eq!(cfg.display_name, "Mediator");
+
+        // Stop it, then a second launch with different overrides proves no
+        // mutation carried over from the first.
+        fx.store.process_stop(p, started.id).unwrap();
+        let second = fx
+            .store
+            .process_start_with(p, config, None, vec!["--resume".into()])
+            .unwrap();
+        assert_ne!(second.id, started.id);
+        // No name override falls back to the config's display name.
+        assert_eq!(second.display_name, "Mediator");
+        assert_eq!(second.extra_args, vec!["--resume"]);
+        // And the first instance still carries its own args, unchanged.
+        let first = fx.store.process_get(p, started.id).unwrap();
+        assert_eq!(first.extra_args, vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn render_agent_instructions_substitutes_real_process_facts() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "mediator-1".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        let started = fx.store.process_start(p, config).unwrap();
+
+        let rendered = fx
+            .store
+            .render_agent_instructions(
+                p,
+                &started,
+                "127.0.0.1",
+                7600,
+                "secret-token",
+                "/abs/panopt",
+            )
+            .unwrap()
+            .expect("claude-code ships an instructions template");
+        // The shipped template names the instance's real id and token, fully
+        // substituted - no placeholders leak through.
+        assert!(
+            rendered.contains(&format!("process #{}", started.id)),
+            "instructions name the process id:\n{rendered}"
+        );
+        assert!(rendered.contains("mediator-1"), "names the agent id");
+        assert!(!rendered.contains("{{"), "no unrendered placeholder");
     }
 
     #[test]

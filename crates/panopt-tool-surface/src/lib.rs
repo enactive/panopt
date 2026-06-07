@@ -357,8 +357,20 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
                       Writes a desired-state process row in `starting` that the cockpit \
                       reconciles into a live pane; the daemon never spawns the pane \
                       itself. One live instance per config: if one is already starting or \
-                      running, that row is returned instead of spawning a second. Returns \
-                      the process row as JSON.",
+                      running, that row is returned instead of spawning a second. Optional \
+                      per-launch `name` and `extra_args` override the instance for this run \
+                      only without touching the config. Returns the process row as JSON, \
+                      including rendered `agent_instructions` to bootstrap the child.",
+        schema_fn: schema_for::<ProcessStartArgs>,
+    },
+    ToolDef {
+        name: "spawn_agent",
+        description: "Spawn a sub-agent: the orchestration-friendly alias for \
+                      `process_start`, taking the same arguments and the same one-live-\
+                      instance-per-config policy. Returns the process row plus rendered \
+                      `agent_instructions` - the per-type bootstrap text to prepend to the \
+                      spawned child's first prompt. Use `extra_args`/`name` to vary a launch \
+                      without mutating the config.",
         schema_fn: schema_for::<ProcessStartArgs>,
     },
     ToolDef {

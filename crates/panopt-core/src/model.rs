@@ -360,6 +360,15 @@ pub struct Process {
     pub state_since: Option<i64>,
     /// SQLite `datetime('now')` text (UTC) at row creation.
     pub created_at: String,
+    /// Per-launch extra arguments appended to the rendered spawn argv for this
+    /// instance only (todo #159). Captured at `process_start` from the
+    /// orchestrator's `spawn_agent`/`process_start` call and *never* written
+    /// back to the source [`AgentTool`] - copy-on-spawn, so two launches of the
+    /// same config can carry different args without mutating it. Empty for the
+    /// common cockpit start and for command/terminal rows. The edge
+    /// (`panopt _process-run`) reads these back and appends them after the
+    /// profile's own `argv`/`default_args`.
+    pub extra_args: Vec<String>,
 }
 
 /// A set of optional edits to a [`Process`], applied by

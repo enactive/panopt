@@ -275,10 +275,20 @@ fn exec_agent_instance(
         name,
         token,
         model: profile.default_model.clone(),
+        process_id: Some(id),
     };
     let dir = paths::instance_dir(id)?;
-    let launch = build_launch(profile, &facts, &dir)
+    let mut launch = build_launch(profile, &facts, &dir)
         .with_context(|| format!("rendering the spawn plan for process #{id}"))?;
+    // Per-launch extra args (#159): appended after the profile's own argv +
+    // default_args, so an orchestrator's `spawn_agent(extra_args=...)` reaches
+    // the real command line. They live on the instance row (copy-on-spawn), so
+    // re-running this shim re-applies the same args without touching the config.
+    if let Some(extra) = entry["extra_args"].as_array() {
+        launch
+            .argv
+            .extend(extra.iter().filter_map(|v| v.as_str().map(str::to_string)));
+    }
 
     report(std::process::id());
     client.close();

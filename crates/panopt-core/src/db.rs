@@ -15,7 +15,7 @@ use crate::agent_profiles::DEFAULT_PROFILE_KEY;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -312,6 +312,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 14 {
         apply_v14(conn)?;
     }
+    if version < 15 {
+        apply_v15(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -501,6 +504,22 @@ fn apply_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
+/// Version 15: `extra_args` on processes (todo #159).
+///
+/// A JSON array of per-launch extra arguments the orchestration spawn surface
+/// (`spawn_agent`/`process_start`) records on the *instance* row, appended to
+/// the rendered spawn argv by the edge without ever mutating the source
+/// `agent_tools` config (copy-on-spawn, DESIGN S6.6). `NOT NULL DEFAULT '[]'`
+/// keeps every existing process row valid with no extra args.
+fn apply_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "processes",
+        "extra_args",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+}
+
 /// True if a table named `table` exists. Used by migrations that must stay
 /// idempotent against a transitional dev-database that already applied a
 /// rename or create before its `user_version` bump landed.
@@ -619,6 +638,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prompt, "");
+    }
+
+    #[test]
+    fn fresh_database_has_the_v15_processes_extra_args() {
+        // A process row inserted without naming extra_args picks up the NOT NULL
+        // DEFAULT '[]' the V15 ALTER established, so every pre-V15 instance reads
+        // back as an empty JSON array rather than NULL.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO processes (project_id, id, kind, created_at)
+                 VALUES (1, 1, 'agent', '');",
+        )
+        .unwrap();
+        let extra: String = conn
+            .query_row("SELECT extra_args FROM processes WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(extra, "[]");
     }
 
     #[test]

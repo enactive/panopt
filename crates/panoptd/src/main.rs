@@ -212,8 +212,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(token = %token_path.display(), "panopt token ready");
 
     let factory_state = shared.clone();
+    // The handler renders spawned children's `agent_instructions` (#159), which
+    // needs the daemon's own listener facts - so each per-connection handler is
+    // built with host/port/token in hand.
+    let handler_host = cli.host.clone();
+    let handler_port = cli.port;
+    let handler_token = token.clone();
     let service = StreamableHttpService::new(
-        move || Ok(Handler::new(factory_state.clone())),
+        move || {
+            Ok(Handler::new(
+                factory_state.clone(),
+                handler_host.clone(),
+                handler_port,
+                handler_token.clone(),
+            ))
+        },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );

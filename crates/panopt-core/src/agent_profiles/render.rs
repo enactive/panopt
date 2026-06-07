@@ -50,6 +50,10 @@ pub struct Facts {
     pub token: String,
     /// The model the config pins, if any. `{{model}}` renders empty when unset.
     pub model: Option<String>,
+    /// The spawned instance's numeric id (todo #159). `None` renders
+    /// `{{process_id}}` empty - the case for any spawn template evaluated before
+    /// a row exists; the instructions renderer always sets it.
+    pub process_id: Option<u64>,
 }
 
 impl Facts {
@@ -66,6 +70,7 @@ impl Facts {
             "name" => self.name.clone(),
             "token" => self.token.clone(),
             "model" => self.model.clone().unwrap_or_default(),
+            "process_id" => self.process_id.map(|n| n.to_string()).unwrap_or_default(),
             _ => return None,
         })
     }
@@ -125,6 +130,29 @@ pub fn build_launch(
         env,
         files: written,
     })
+}
+
+/// Render `profile`'s `instructions` template against `facts` (todo #159), or
+/// `Ok(None)` if the type declares no instructions. Unlike [`build_launch`] this
+/// writes no files and resolves only facts (`{{file:NAME}}` is rejected at load
+/// for instructions), so it is a pure string render the daemon runs at spawn
+/// time to hand an orchestrator the child's bootstrap text.
+pub fn render_instructions(
+    profile: &AgentProfile,
+    facts: &Facts,
+) -> Result<Option<String>, RenderError> {
+    let Some(template) = &profile.instructions else {
+        return Ok(None);
+    };
+    let rendered = substitute(template, &|name| {
+        if name.starts_with("file:") {
+            return Err(RenderError::UnknownFile(name.to_string()));
+        }
+        facts
+            .lookup(name)
+            .ok_or_else(|| RenderError::UnknownPlaceholder(name.to_string()))
+    })?;
+    Ok(Some(rendered))
 }
 
 /// Resolve one placeholder name: `file:NAME` -> the materialized path, anything
@@ -215,6 +243,7 @@ mod tests {
             name: "greg-main".into(),
             token: "secret-token".into(),
             model: None,
+            process_id: None,
         }
     }
 
@@ -329,5 +358,42 @@ argv = ["m", "--model", "{{model}}"]
     fn unterminated_placeholder_errors() {
         let err = substitute("a {{oops", &|_| Ok(String::new())).unwrap_err();
         assert!(matches!(err, RenderError::Unterminated));
+    }
+
+    #[test]
+    fn instructions_render_facts_including_process_id() {
+        let toml = r#"
+[orchestrated]
+display_name = "Orchestrated"
+instructions = "You are #{{process_id}} ({{name}}). Token {{token}} on {{host}}:{{port}}."
+[orchestrated.spawn]
+argv = ["agent"]
+"#;
+        let set = ProfileSet::from_layers(toml, None).expect("load");
+        let profile = set.get("orchestrated").unwrap();
+        let mut facts = sample_facts();
+        facts.process_id = Some(42);
+        let rendered = render_instructions(profile, &facts)
+            .expect("render")
+            .expect("instructions present");
+        assert_eq!(
+            rendered,
+            "You are #42 (greg-main). Token secret-token on 127.0.0.1:7600."
+        );
+    }
+
+    #[test]
+    fn instructions_absent_render_to_none() {
+        let toml = r#"
+[plain]
+display_name = "Plain"
+[plain.spawn]
+argv = ["agent"]
+"#;
+        let set = ProfileSet::from_layers(toml, None).expect("load");
+        let profile = set.get("plain").unwrap();
+        assert!(render_instructions(profile, &sample_facts())
+            .expect("render")
+            .is_none());
     }
 }

@@ -56,6 +56,15 @@ pub struct Handler {
     /// Built once in `new()` from [`build_router`] and consulted by this
     /// type's manual `ServerHandler` impl (see `call_tool`, `list_tools`).
     tool_router: ToolRouter<Self>,
+    /// The daemon's own listener facts (#159), needed to render a spawned
+    /// child's `agent_instructions`: the Store owns profiles and project
+    /// records but not where the daemon listens, so host/port/token are threaded
+    /// in from `main`. `panopt_bin` is the launcher path the rendered
+    /// instructions can reference (best-effort; instructions rarely need it).
+    host: String,
+    port: u16,
+    token: String,
+    panopt_bin: String,
 }
 
 /// Wire shape for a note in `note_list` output.
@@ -274,6 +283,14 @@ struct ProcessDto {
     agent_state: Option<String>,
     last_seen: Option<String>,
     created_at: String,
+    /// Per-launch extra args recorded on the instance (#159), so the edge that
+    /// runs `_process-run <id>` can append them to the rendered argv.
+    extra_args: Vec<String>,
+    /// Rendered bootstrap text for the spawned child (#159). Populated only by
+    /// `process_start`/`spawn_agent`; omitted from list/get responses, where it
+    /// is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_instructions: Option<String>,
 }
 
 impl ProcessDto {
@@ -293,6 +310,8 @@ impl ProcessDto {
             agent_state: p.agent_state,
             last_seen: p.last_seen,
             created_at: p.created_at,
+            extra_args: p.extra_args,
+            agent_instructions: None,
         }
     }
 }
@@ -654,10 +673,24 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
 }
 
 impl Handler {
-    pub fn new(state: Arc<Mutex<Store>>) -> Self {
+    pub fn new(state: Arc<Mutex<Store>>, host: String, port: u16, token: String) -> Self {
+        // The launcher path the rendered spawn/instructions templates may
+        // reference. The daemon binary is `panoptd`, but the agent proxy is the
+        // `panopt` launcher; the edge renders the real spawn argv with its own
+        // `current_exe`, so the daemon only needs a sensible value for the rare
+        // instructions template that mentions it.
+        let panopt_bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("panopt")))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "panopt".to_string());
         Self {
             state,
             tool_router: build_router(),
+            host,
+            port,
+            token,
+            panopt_bin,
         }
     }
 
@@ -1419,10 +1452,31 @@ impl Handler {
         let dto = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
-            ProcessDto::from_entry(
-                st.process_start(project, args.agent_tool_id)
-                    .map_err(map_core_err)?,
-            )
+            let process = st
+                .process_start_with(
+                    project,
+                    args.agent_tool_id,
+                    args.name,
+                    args.extra_args.unwrap_or_default(),
+                )
+                .map_err(map_core_err)?;
+            // Render the child's bootstrap text (#159) against the daemon's
+            // listener facts. A profile with no `instructions` yields `None`,
+            // which serializes away - so `process_start` and `spawn_agent`
+            // share one path and one return shape regardless of agent type.
+            let instructions = st
+                .render_agent_instructions(
+                    project,
+                    &process,
+                    &self.host,
+                    self.port,
+                    &self.token,
+                    &self.panopt_bin,
+                )
+                .map_err(map_core_err)?;
+            let mut dto = ProcessDto::from_entry(process);
+            dto.agent_instructions = instructions;
+            dto
         };
         json_result(&dto)
     }
@@ -1547,6 +1601,7 @@ enum Tool {
     ProcessUpdate,
     ProcessDelete,
     ProcessStart,
+    SpawnAgent,
     ProcessStop,
     ProcessReport,
     IdKind,
@@ -1600,6 +1655,7 @@ impl Tool {
             "process_update" => Tool::ProcessUpdate,
             "process_delete" => Tool::ProcessDelete,
             "process_start" => Tool::ProcessStart,
+            "spawn_agent" => Tool::SpawnAgent,
             "process_stop" => Tool::ProcessStop,
             "process_report" => Tool::ProcessReport,
             "id_kind" => Tool::IdKind,
@@ -1802,6 +1858,13 @@ async fn dispatch_local<'a>(
             handler.process_delete(parts, args).await
         }
         Tool::ProcessStart => {
+            let args: ProcessStartArgs = parse_json_object(raw_args)?;
+            handler.process_start(parts, args).await
+        }
+        // `spawn_agent` is a thin alias: same args, same handler, same one-live-
+        // instance policy and `agent_instructions` return as `process_start`
+        // (todo #159). One dispatch path keeps the two from drifting.
+        Tool::SpawnAgent => {
             let args: ProcessStartArgs = parse_json_object(raw_args)?;
             handler.process_start(parts, args).await
         }

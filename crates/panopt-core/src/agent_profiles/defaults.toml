@@ -17,6 +17,21 @@
 [claude-code]
 display_name = "Claude Code"
 
+# Bootstrap text returned as `agent_instructions` from `spawn_agent` (#159). An
+# orchestrator prepends this to the spawned child's first prompt so it knows its
+# own panopt identity and how to coordinate. Rendered by the daemon at spawn time
+# against the known facts (no `{{file:...}}` here - the daemon writes no files).
+# The child already has the panopt MCP tools wired via its launch config, so this
+# is about identity and etiquette, not connection.
+instructions = '''
+You are a panopt-managed agent. Your instance is process #{{process_id}}, named "{{name}}" (stable id `{{agent_id}}`) in workspace {{ws}}.
+
+You already have the panopt MCP tools available. To coordinate:
+- Call `identify` (or `whoami`) to register your presence under `{{agent_id}}`.
+- Use `process_report` to report your status as you work.
+- Use todos, notes, and locks to coordinate with the other agents in this project.
+'''
+
 [claude-code.spawn]
 # Launch claude with a generated stdio MCP config that boots `panopt _mcp-proxy`.
 # The proxy holds the long-lived MCP session and forwards to panoptd over HTTP,

@@ -367,6 +367,16 @@ pub struct ProcessDeleteArgs {
 pub struct ProcessStartArgs {
     /// Numeric id of the agent config (agent_tool) to start an instance of.
     pub agent_tool_id: u64,
+    /// Per-launch display name for this instance. Overrides the config's name
+    /// for this run only - the durable config is never touched. Omit to inherit
+    /// the config's name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Per-launch extra arguments appended to the rendered spawn command for
+    /// this instance only. Copied onto the instance, never written back to the
+    /// config, so two launches of the same config can differ. Omit for none.
+    #[serde(default)]
+    pub extra_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

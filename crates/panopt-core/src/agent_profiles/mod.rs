@@ -40,7 +40,7 @@ use serde::Deserialize;
 
 mod render;
 mod status;
-pub use render::{build_launch, Facts, Launch, RenderError};
+pub use render::{build_launch, render_instructions, Facts, Launch, RenderError};
 pub use status::{StatusError, StatusMatcher};
 
 /// The shipped default profile set, compiled into the binary.
@@ -66,6 +66,10 @@ pub const DEFAULT_PROFILE_KEY: &str = "claude-code";
 /// - `agent_id` / `name` - the agent's stable id and friendly display name.
 /// - `token` - the daemon's bearer token.
 /// - `model` - the configured model, when a config pins one.
+/// - `process_id` - the spawned instance's numeric id (todo #159). Known only
+///   once a row exists, so it renders empty in any context with no instance
+///   (it is meaningful in `instructions` and in spawn templates rendered at the
+///   edge, where the id is already assigned).
 pub const KNOWN_PLACEHOLDERS: &[&str] = &[
     "panopt_bin",
     "host",
@@ -76,6 +80,7 @@ pub const KNOWN_PLACEHOLDERS: &[&str] = &[
     "name",
     "token",
     "model",
+    "process_id",
 ];
 
 /// The activity states the status interpreter derives from agent output. Used
@@ -152,6 +157,15 @@ pub struct AgentProfile {
     /// How to read an instance's activity from its output.
     #[serde(default)]
     pub status: StatusRules,
+    /// Bootstrap text an orchestrator prepends to a spawned child's first prompt
+    /// (todo #159), returned as `agent_instructions` from `spawn_agent`. A
+    /// template over the same placeholder set as `spawn`, but rendered by the
+    /// daemon at spawn time (not the edge), so it must reference only known
+    /// facts - a `{{file:NAME}}` is rejected here because no files are
+    /// materialized on the daemon's side. `None` for a type that needs no
+    /// bootstrap text.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 /// The merged, validated set of agent profiles, keyed by `tool_type`.
@@ -271,6 +285,22 @@ impl ProfileSet {
             }
             for contents in profile.spawn.files.values() {
                 check(contents)?;
+            }
+            // The instructions template (#159) is rendered by the daemon, which
+            // materializes no files - so it may only reference known facts, not
+            // `{{file:NAME}}`. A `file:` placeholder here is a profile error even
+            // when the name matches a declared spawn file.
+            if let Some(instructions) = &profile.instructions {
+                for placeholder in placeholders(instructions) {
+                    if placeholder.starts_with("file:")
+                        || !KNOWN_PLACEHOLDERS.contains(&placeholder)
+                    {
+                        return Err(ProfileError::UnknownPlaceholder {
+                            tool_type: tool_type.clone(),
+                            placeholder: placeholder.to_string(),
+                        });
+                    }
+                }
             }
         }
         Ok(())
