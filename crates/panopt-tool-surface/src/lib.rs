@@ -206,7 +206,7 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         description: "Edit a todo's fields. Every argument but todo_id is optional; an \
                       omitted field is left unchanged. status is one of open/in_progress/\
                       backlog/draft/completed/not_done, priority one of high/medium/low; tags \
-                      replaces the whole tag list.",
+                      replaces the whole tag list. Pass assignee: null to clear the assignee.",
         schema_fn: schema_for::<TodoUpdateArgs>,
     },
     ToolDef {

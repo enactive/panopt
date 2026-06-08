@@ -11,7 +11,27 @@
 //! bit-identical to the ones panoptd deserializes against.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Deserialize a field into a *double* `Option` so three input states stay
+/// distinguishable: absent (`None`), present-and-`null` (`Some(None)`), and
+/// present-with-a-value (`Some(Some(v))`). Paired with `#[serde(default)]`,
+/// an omitted field is `None` while an explicit JSON `null` is `Some(None)`.
+///
+/// This exists to route around a defect in the MCP *client* (Claude Code's
+/// tool-use → JSON serialization): when an argument value is the empty string
+/// `""`, the client drops the entire arguments object before it leaves the
+/// agent, so the daemon receives `{}` and rejects the call ("missing field
+/// todo_id"). JSON `null` survives that path intact (verified end-to-end), so
+/// fields that want a "clear this" signal accept `null` for it instead of `""`
+/// — the one value the agent cannot actually transmit. See todo #239.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NoteCreateArgs {
@@ -148,10 +168,12 @@ pub struct TodoUpdateArgs {
     /// New priority: one of high, medium, low. Omit to leave unchanged.
     #[serde(default)]
     pub priority: Option<String>,
-    /// New assignee name, or an empty string to clear it. Omit to leave
-    /// unchanged.
-    #[serde(default)]
-    pub assignee: Option<String>,
+    /// New assignee name. Pass JSON `null` to clear the assignee; omit to
+    /// leave it unchanged. (Use `null`, not `""` — an empty-string argument is
+    /// dropped in transit by the MCP client, taking the whole call with it;
+    /// see todo #239.)
+    #[serde(default, deserialize_with = "double_option")]
+    pub assignee: Option<Option<String>>,
     /// New complete tag list, replacing the old one. Omit to leave unchanged.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
@@ -510,4 +532,55 @@ pub struct LockAcquireArgs {
 pub struct LockReleaseArgs {
     /// Name of the advisory lock to release.
     pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{from_value, json};
+
+    /// The reporter's hypothesis was a serde defect in `TodoUpdateArgs`. It
+    /// isn't: a `{todo_id, status}` payload parses cleanly. The "missing field
+    /// todo_id" they saw only arises from an *empty* arguments object, which is
+    /// what the MCP client actually delivered after dropping the call (#239).
+    #[test]
+    fn todo_update_parses_minimal_payload() {
+        let args: TodoUpdateArgs =
+            from_value(json!({"todo_id": 16, "status": "open"})).expect("must parse");
+        assert_eq!(args.todo_id, 16);
+        assert_eq!(args.status.as_deref(), Some("open"));
+        assert_eq!(args.assignee, None); // absent -> leave unchanged
+    }
+
+    /// The three `assignee` input states must stay distinguishable so the
+    /// handler can tell "leave unchanged" from "clear". This is the whole point
+    /// of the double `Option`.
+    #[test]
+    fn todo_update_assignee_tristate() {
+        // absent -> None -> leave unchanged
+        let omitted: TodoUpdateArgs = from_value(json!({"todo_id": 1})).unwrap();
+        assert_eq!(omitted.assignee, None);
+
+        // explicit null -> Some(None) -> clear
+        let cleared: TodoUpdateArgs =
+            from_value(json!({"todo_id": 1, "assignee": null})).unwrap();
+        assert_eq!(cleared.assignee, Some(None));
+
+        // a name -> Some(Some(name)) -> set
+        let set: TodoUpdateArgs =
+            from_value(json!({"todo_id": 1, "assignee": "greg"})).unwrap();
+        assert_eq!(set.assignee, Some(Some("greg".to_string())));
+    }
+
+    /// An arguments object with no `todo_id` is the exact shape that reaches the
+    /// daemon after the client drops an empty-string call - and the exact source
+    /// of the reported error. Pin that this is the only thing that fails.
+    #[test]
+    fn todo_update_rejects_empty_object() {
+        let err = from_value::<TodoUpdateArgs>(json!({})).unwrap_err();
+        assert!(
+            err.to_string().contains("todo_id"),
+            "expected a missing-todo_id error, got: {err}"
+        );
+    }
 }

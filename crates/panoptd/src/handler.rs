@@ -1051,12 +1051,18 @@ impl Handler {
             Some(p) => Some(parse_priority(p)?),
             None => None,
         };
+        // `assignee` is a double `Option` so the three input states stay
+        // distinct: absent (leave unchanged), `null` (clear), or a name (set).
+        // Both `null` and an explicit empty string collapse to "clear" -
+        // though in practice agents can only ever send `null`, since the MCP
+        // client drops empty-string arguments before they reach us (#239).
+        let assignee = args.assignee.map(|a| a.unwrap_or_default());
         let patch = TodoPatch {
             title: args.title,
             body: args.body,
             status,
             priority,
-            assignee: args.assignee,
+            assignee,
             tags: args.tags,
         };
         {
