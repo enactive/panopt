@@ -1,0 +1,1 @@
+Check the current weather in Portland, OR and report the temperature, conditions, and today's forecast. Use a web search.

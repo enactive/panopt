@@ -1,0 +1,78 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "192d6ed1a78d",
+  "session_id": "d9c8d96a-e8cd-4619-9e10-614852358a26",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-08T03:46:35.88342645Z",
+  "branch": "agent-model",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "DESIGN.md",
+    "README.md",
+    "crates/panopt-core/src/agent_profiles/defaults.toml",
+    "crates/panopt-core/src/agent_profiles/render.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-zellij-logic/src/lib.rs",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/agent.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "b2167d7792ff",
+  "token_usage": {
+    "input_tokens": 3598,
+    "cache_creation_tokens": 16724,
+    "cache_read_tokens": 53846,
+    "output_tokens": 463,
+    "api_call_count": 3
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-08T03:46:35.869737532Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 83,
+    "total_committed": 8,
+    "total_lines_changed": 83,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 307,
+      "user_lines_removed": 83,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "DESIGN.md": 22,
+        "README.md": 25,
+        "crates/panopt-core/src/agent_profiles/defaults.toml": 12,
+        "crates/panopt-core/src/agent_profiles/render.rs": 8,
+        "crates/panopt-core/src/state.rs": 153,
+        "crates/panopt-tool-surface/src/lib.rs": 12,
+        "crates/panopt-zellij-logic/src/lib.rs": 7,
+        "crates/panopt-zellij/src/main.rs": 41,
+        "crates/panopt/src/agent.rs": 23,
+        "crates/panoptd/src/handler.rs": 4
+      },
+      "user_removed_per_file": {
+        "DESIGN.md": 12,
+        "README.md": 1,
+        "crates/panopt-core/src/agent_profiles/defaults.toml": 1,
+        "crates/panopt-core/src/agent_profiles/render.rs": 2,
+        "crates/panopt-core/src/state.rs": 46,
+        "crates/panopt-tool-surface/src/lib.rs": 7,
+        "crates/panopt-zellij-logic/src/lib.rs": 5,
+        "crates/panopt-zellij/src/main.rs": 8,
+        "crates/panoptd/src/handler.rs": 1
+      }
+    }
+  ]
+}
