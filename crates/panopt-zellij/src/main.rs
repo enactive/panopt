@@ -2286,11 +2286,28 @@ impl PanoptPane {
             if self.delivered_inputs.contains(&row.seq) {
                 continue;
             }
-            let Some(proc) = self
-                .processes
-                .iter()
-                .find(|r| r.id == row.process_id && r.status.as_deref() == Some("running"))
-            else {
+            // Deliver only once the agent is *ready*, not merely `running`: the
+            // edge reports its pid (flipping the row to running) just before it
+            // execs the agent, so `running` precedes the TUI by seconds. Typing
+            // then is lost, and the input is acked with no retry. `agent_state`
+            // is set only after the status observer has classified the pane - a
+            // good proxy for "the prompt is up and accepting input" (#190 line:
+            // a spawned agent's opening prompt was delivered into a not-yet-ready
+            // pane and dropped).
+            let Some(proc) = self.processes.iter().find(|r| {
+                if r.id != row.process_id || r.status.as_deref() != Some("running") {
+                    return false;
+                }
+                // Ready = the status observer has classified the pane at least
+                // once (agent_state set), our proxy for "the TUI is up". A type
+                // with no status patterns can never be classified, so fall back to
+                // delivering on `running` for it rather than waiting forever.
+                let observable = r
+                    .tool_type
+                    .as_deref()
+                    .is_some_and(|t| self.status_matchers.contains_key(t));
+                r.agent_state.is_some() || !observable
+            }) else {
                 continue;
             };
             let Some(pane) = self.agent_pane(row.process_id, proc.agent_id.as_deref()) else {

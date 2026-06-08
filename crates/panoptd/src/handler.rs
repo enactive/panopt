@@ -1627,21 +1627,46 @@ impl Handler {
         let wait_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
         let want_all = !matches!(args.mode.as_deref(), Some("any"));
+        // A freshly-spawned agent sits idle at its prompt *before* it picks up its
+        // task, so bare `agent_state == idle` is a false "finished" (the stale-idle
+        // bug). Settle a process only once it is idle AND has no undelivered queued
+        // input (its task has at least been typed) AND either it was seen busy
+        // during this wait (it actually worked) or it was already idle-with-nothing-
+        // queued on the first poll (it had finished before we began waiting).
+        // Terminal/gone processes settle unconditionally.
+        let mut seen_busy: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut initially_done: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut first_poll = true;
         loop {
             let (snapshot, settled) = {
                 let mut st = self.state.lock().expect("state mutex poisoned");
                 let (project, _) = enter(&mut st, &parts)?;
+                let pending_ids: std::collections::HashSet<u64> = st
+                    .pending_inputs(project)
+                    .map_err(map_core_err)?
+                    .into_iter()
+                    .map(|p| p.process_id)
+                    .collect();
                 let mut rows = Vec::with_capacity(args.process_ids.len());
                 let mut settled = 0usize;
                 for &id in &args.process_ids {
-                    // A process is "settled" when it has gone idle (finished its
-                    // turn), reached a terminal status, or no longer exists.
                     let (state, status, is_settled) = match st.process_get(project, id) {
                         Ok(p) => {
                             let terminal =
                                 matches!(p.status.as_deref(), Some("stopped") | Some("exited"));
                             let idle = p.agent_state.as_deref() == Some("idle");
-                            (p.agent_state, p.status, terminal || idle)
+                            let busy = p.agent_state.as_deref().is_some_and(|s| s != "idle");
+                            if busy {
+                                seen_busy.insert(id);
+                            }
+                            let has_pending = pending_ids.contains(&id);
+                            if first_poll && idle && !has_pending {
+                                initially_done.insert(id);
+                            }
+                            let done = idle
+                                && !has_pending
+                                && (seen_busy.contains(&id) || initially_done.contains(&id));
+                            (p.agent_state, p.status, terminal || done)
                         }
                         Err(_) => (None, Some("gone".to_string()), true),
                     };
@@ -1655,6 +1680,7 @@ impl Handler {
                         "settled": is_settled,
                     }));
                 }
+                first_poll = false;
                 (rows, settled)
             }; // state guard dropped here, before any await
             let condition = if want_all {
