@@ -1,0 +1,91 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "d776995ea04c",
+  "session_id": "b7f3f9f2-476c-4dfe-aed5-1a2198dc3bf8",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-08T06:49:32.441662437Z",
+  "branch": "agent-model",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "DESIGN.md",
+    "crates/panopt-core/src/db.rs",
+    "crates/panopt-core/src/model.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "316c38cc38a8",
+  "token_usage": {
+    "input_tokens": 17991,
+    "cache_creation_tokens": 1631560,
+    "cache_read_tokens": 48295125,
+    "output_tokens": 265415,
+    "api_call_count": 253
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_017QCupaaYjHT619qxgvYWVK",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "316c38cc38a8",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 244,
+        "end": 245,
+        "entry_ids": [
+          "111d235e-bbde-480d-bca6-4bdc23d8e483"
+        ],
+        "tool_use_id": "toolu_017QCupaaYjHT619qxgvYWVK"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017QCupaaYjHT619qxgvYWVK"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-08T06:49:32.28344981Z",
+    "agent_lines": 265,
+    "agent_removed": 26,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 265,
+    "total_lines_changed": 291,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 265,
+      "agent_lines_removed": 26
+    }
+  ]
+}
