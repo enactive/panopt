@@ -402,6 +402,13 @@ pub struct SpawnAgentArgs {
     /// instance only, never written back to the config.
     #[serde(default)]
     pub extra_args: Option<Vec<String>>,
+    /// Opt-in idle auto-reap window, in seconds. When set, the daemon stops and
+    /// deletes this instance once it has sat idle for at least this long - a
+    /// safety valve for fire-and-forget sub-agents. Omit (the default) and the
+    /// agent is never auto-killed: an idle-but-live agent you want to keep around
+    /// is left running. Use for one-shot children you do not plan to reuse.
+    #[serde(default)]
+    pub idle_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

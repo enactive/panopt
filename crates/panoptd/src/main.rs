@@ -187,6 +187,35 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Auto-reap instances that opted into an idle TTL (#206), every 15s: an
+    // ad-hoc child spawned with `idle_ttl_secs` is stopped + deleted once it has
+    // sat idle past it, so fire-and-forget sub-agents clean themselves up. The
+    // state layer flips the rows (and reaps an ephemeral backing config, #205);
+    // signalling the freed pid is the host effect, done here. Strictly opt-in:
+    // instances with no TTL (the default) are never candidates.
+    let idle_ttl_state = shared.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            let reaped = {
+                let mut st = idle_ttl_state.lock().expect("state mutex poisoned");
+                st.sweep_idle_ttl()
+            };
+            match reaped {
+                Ok(reaped) => {
+                    for (project, id, pid) in reaped {
+                        if let Some(pid) = pid {
+                            handler::signal_terminate(pid);
+                        }
+                        tracing::info!(project, process = id, "instance reaped (idle TTL)");
+                    }
+                }
+                Err(e) => tracing::warn!("idle-TTL sweep failed: {e}"),
+            }
+        }
+    });
+
     // Re-project processes.md every 10s so time-based annotations advance even
     // when no mutation fired - the `idle:` presence age (#142/#163) is computed
     // at render time, so without this it freezes between mutations. Skips

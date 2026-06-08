@@ -377,6 +377,15 @@ pub struct Process {
     /// (`panopt _process-run`) reads these back and appends them after the
     /// profile's own `argv`/`default_args`.
     pub extra_args: Vec<String>,
+    /// Opt-in idle auto-reap window in seconds (todo #206). When `Some(ttl)`,
+    /// the daemon's idle sweep stops + deletes this instance once it has been
+    /// `idle` (by `agent_state`/`state_since`) for at least `ttl` seconds.
+    /// `None` — the default for every spawn that does not ask — means the
+    /// instance is *never* auto-killed: an idle-but-live agent the caller wants
+    /// parked is left alone (the expensive-context constraint). Distinct from
+    /// the config's [`AgentTool::ephemeral`] flag, which governs config reaping
+    /// on delete, not whether the running agent is auto-stopped.
+    pub idle_ttl_secs: Option<i64>,
 }
 
 /// A set of optional edits to a [`Process`], applied by
@@ -395,6 +404,7 @@ pub struct ProcessPatch {
     pub agent_state: Option<Option<String>>,
     pub last_seen: Option<Option<String>>,
     pub state_since: Option<Option<i64>>,
+    pub idle_ttl_secs: Option<Option<i64>>,
 }
 
 /// One undelivered entry of the `process_inputs` queue (todo #160): a line of

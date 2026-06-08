@@ -290,6 +290,10 @@ struct ProcessDto {
     /// Per-launch extra args recorded on the instance (#159), so the edge that
     /// runs `_process-run <id>` can append them to the rendered argv.
     extra_args: Vec<String>,
+    /// Opt-in idle auto-reap window in seconds (#206); `None` (the default)
+    /// means the instance is never auto-killed. Omitted from output when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idle_ttl_secs: Option<i64>,
     /// Rendered bootstrap text for the spawned child (#159). Populated only by
     /// `process_start`/`spawn_agent`; omitted from list/get responses, where it
     /// is `None`.
@@ -315,6 +319,7 @@ impl ProcessDto {
             last_seen: p.last_seen,
             created_at: p.created_at,
             extra_args: p.extra_args,
+            idle_ttl_secs: p.idle_ttl_secs,
             agent_instructions: None,
         }
     }
@@ -641,11 +646,12 @@ fn parse_process_kind(s: &str) -> Result<ProcessKind, McpError> {
 }
 
 /// Send `SIGTERM` to `pid`, best-effort. Used by `process_stop` to terminate a
-/// co-located instance whose pid the state layer handed back. A failure (the
-/// process already exited, or it lives on another host the daemon can't reach -
-/// the documented remote wrinkle) is intentionally ignored: the row is already
-/// marked `stopped`, and the goal is to leave the pane standing regardless.
-fn signal_terminate(pid: i64) {
+/// co-located instance whose pid the state layer handed back, and by the daemon's
+/// idle-TTL sweep (#206) to kill an auto-reaped child. A failure (the process
+/// already exited, or it lives on another host the daemon can't reach - the
+/// documented remote wrinkle) is intentionally ignored: the row is already marked
+/// `stopped`, and the goal is to leave the pane standing regardless.
+pub(crate) fn signal_terminate(pid: i64) {
     // SAFETY: `kill` is a plain libc call with no memory effects; a bad pid
     // just returns -1/ESRCH, which we discard.
     unsafe {
@@ -1562,6 +1568,21 @@ impl Handler {
                 )
                 .map_err(map_core_err)?;
 
+            // Opt-in idle auto-reap (todo #206): record the per-instance TTL so
+            // the daemon's idle sweep can stop+delete this child once it sits
+            // idle past it. Omitted -> NULL -> never auto-killed.
+            if let Some(ttl) = args.idle_ttl_secs {
+                st.process_update(
+                    project,
+                    process.id,
+                    ProcessPatch {
+                        idle_ttl_secs: Some(Some(ttl as i64)),
+                        ..Default::default()
+                    },
+                )
+                .map_err(map_core_err)?;
+            }
+
             // The opening task rides the same input queue as send_input: queued
             // now, typed into the pane by the cockpit once the instance is live.
             // Ensure a trailing newline so it submits like a human's Enter.
@@ -2241,7 +2262,9 @@ impl ServerHandler for Handler {
                  what you spawn: process_stop then process_delete when a sub-agent is done. \
                  For an ad-hoc spawn (no agent_tool_id) process_delete of its last instance \
                  also reaps the throwaway config it created; configured slots you spawn by \
-                 agent_tool_id are durable templates and stay. \
+                 agent_tool_id are durable templates and stay. For a fire-and-forget child \
+                 you won't reuse, pass spawn_agent idle_ttl_secs to have the daemon auto- \
+                 stop+delete it once it sits idle that long (omit it and nothing auto-kills). \
                  Getting a result back: spawn_agent returns a handle, not a value - agree a \
                  channel up front. Create a note (or todo), tell the child in its prompt to \
                  write its result there (note_append / todo_comment_add) before it stops, \

@@ -378,7 +378,9 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
                       `send_input` to task it further. Spawned agents PERSIST until disposed \
                       - nothing auto-kills an idle-but-live agent - so reap the ones you \
                       spawn: when a sub-agent's task is done, `process_stop` (ends the run) \
-                      then `process_delete` (removes the instance).",
+                      then `process_delete` (removes the instance). For a fire-and-forget \
+                      child you won't reuse, pass `idle_ttl_secs` to have the daemon stop + \
+                      delete it automatically once it sits idle that long.",
         schema_fn: schema_for::<SpawnAgentArgs>,
     },
     ToolDef {

@@ -516,6 +516,45 @@ impl Store {
         Ok(dead)
     }
 
+    /// Auto-reap instances that opted into an idle TTL (todo #206) and have now
+    /// sat idle past it: `status = running`, `agent_state = "idle"`,
+    /// `idle_ttl_secs` set, and `now - state_since >= idle_ttl_secs`. For each it
+    /// runs [`Store::process_stop`] (→`stopped`) then [`Store::process_delete`]
+    /// (which also reaps an ephemeral backing config, #205), and returns
+    /// `(project_id, process_id, pid)` so the caller can signal the pid — the
+    /// actual kill is a host effect kept out of core, mirroring `process_stop`.
+    ///
+    /// **Strictly opt-in.** `idle_ttl_secs IS NULL` (the default for every spawn
+    /// that does not ask) is never a candidate, so an idle-but-live agent the
+    /// caller wants parked is left alone. This is why the sweep keys off the
+    /// per-instance TTL and not the config's `ephemeral` flag: ad-hoc spawns are
+    /// all ephemeral (for config reaping) but must *not* all be idle-auto-killed.
+    pub fn sweep_idle_ttl(&mut self) -> Result<Vec<(i64, u64, Option<i64>)>, CoreError> {
+        let now = now_epoch_secs();
+        let due: Vec<(i64, u64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT project_id, id FROM processes
+                  WHERE deleted_at IS NULL
+                    AND status = ?1
+                    AND agent_state = 'idle'
+                    AND idle_ttl_secs IS NOT NULL
+                    AND state_since IS NOT NULL
+                    AND (?2 - state_since) >= idle_ttl_secs",
+            )?;
+            let rows = stmt.query_map(params![process_status::RUNNING, now], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut reaped = Vec::with_capacity(due.len());
+        for (project, id) in due {
+            let pid = self.process_stop(ProjectId(project), id)?;
+            self.process_delete(ProjectId(project), id)?;
+            reaped.push((project, id, pid));
+        }
+        Ok(reaped)
+    }
+
     /// Re-project `processes.md` for every project with a live agent instance so
     /// time-based annotations advance without a mutation to drive them - notably
     /// the `idle:` presence age (#142/#163), which is `now - last_seen` computed
@@ -1129,7 +1168,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, name, display_name, command, cwd, position,
                     agent_tool_id, pid, pane_id, status, agent_state, last_seen,
-                    state_since, created_at, extra_args
+                    state_since, created_at, extra_args, idle_ttl_secs
                FROM processes
               WHERE project_id = ?1 AND deleted_at IS NULL
               ORDER BY position, id",
@@ -1153,6 +1192,7 @@ impl Store {
                 state_since: r.get(13)?,
                 created_at: r.get(14)?,
                 extra_args: parse_extra_args(&r.get::<_, String>(15)?),
+                idle_ttl_secs: r.get(16)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1274,13 +1314,16 @@ impl Store {
         if let Some(v) = patch.state_since {
             entry.state_since = v;
         }
+        if let Some(v) = patch.idle_ttl_secs {
+            entry.idle_ttl_secs = v;
+        }
         self.conn.execute(
             "UPDATE processes
                 SET name = ?1, display_name = ?2, command = ?3, cwd = ?4,
                     position = ?5, agent_tool_id = ?6, pid = ?7, pane_id = ?8,
                     status = ?9, agent_state = ?10, last_seen = ?11,
-                    state_since = ?12
-              WHERE project_id = ?13 AND id = ?14",
+                    state_since = ?12, idle_ttl_secs = ?13
+              WHERE project_id = ?14 AND id = ?15",
             params![
                 entry.name,
                 entry.display_name,
@@ -1294,6 +1337,7 @@ impl Store {
                 entry.agent_state,
                 entry.last_seen,
                 entry.state_since,
+                entry.idle_ttl_secs,
                 project.0,
                 id as i64,
             ],
@@ -1684,7 +1728,7 @@ impl Store {
             .query_row(
                 "SELECT kind, name, display_name, command, cwd, position,
                         agent_tool_id, pid, pane_id, status, agent_state, last_seen,
-                        state_since, created_at, extra_args
+                        state_since, created_at, extra_args, idle_ttl_secs
                    FROM processes
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
@@ -1707,6 +1751,7 @@ impl Store {
                         state_since: r.get(12)?,
                         created_at: r.get(13)?,
                         extra_args: parse_extra_args(&r.get::<_, String>(14)?),
+                        idle_ttl_secs: r.get(15)?,
                     })
                 },
             )
@@ -4109,6 +4154,70 @@ mod tests {
             "ephemeral config reaped with its last instance"
         );
         assert!(fx.store.agent_tool_list(p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweep_idle_ttl_reaps_only_opted_in_stale_idle_instances() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        let old = now_epoch_secs() - 10_000;
+
+        // Helper: start an instance and drive it to a (status, state, since, ttl).
+        let prep = |fx: &mut Fixture, state: &str, since: i64, ttl: Option<i64>| {
+            let inst = fx.store.process_start(p, config).unwrap();
+            fx.store
+                .process_update(
+                    p,
+                    inst.id,
+                    ProcessPatch {
+                        status: Some(Some(process_status::RUNNING.to_string())),
+                        agent_state: Some(Some(state.to_string())),
+                        state_since: Some(Some(since)),
+                        idle_ttl_secs: Some(ttl),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            inst.id
+        };
+
+        // (a) opted-in + idle + stale -> the one reaped.
+        let reaped_id = prep(&mut fx, "idle", old, Some(60));
+        // (b) no TTL (default) + idle + stale -> parked, never auto-killed.
+        let parked = prep(&mut fx, "idle", old, None);
+        // (c) opted-in but busy -> survives until it actually goes idle.
+        let busy = prep(&mut fx, "thinking", old, Some(60));
+        // (d) opted-in + idle but not yet past its TTL -> survives.
+        let fresh = prep(&mut fx, "idle", now_epoch_secs() - 5, Some(60));
+
+        let reaped = fx.store.sweep_idle_ttl().unwrap();
+        assert_eq!(reaped.len(), 1, "exactly the stale opted-in idle instance");
+        assert_eq!(reaped[0].1, reaped_id);
+
+        let live: Vec<u64> = fx
+            .store
+            .process_list(p)
+            .unwrap()
+            .into_iter()
+            .map(|pr| pr.id)
+            .collect();
+        assert!(!live.contains(&reaped_id), "reaped instance is gone");
+        assert!(live.contains(&parked), "no-TTL agent left alone");
+        assert!(live.contains(&busy), "busy agent left alone");
+        assert!(live.contains(&fresh), "within-TTL agent left alone");
     }
 
     #[test]

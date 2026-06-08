@@ -783,6 +783,18 @@ the record, the cockpit reconciles it into panes.
   reaps that config once its last live instance is gone, so a throwaway slot does
   not strand an orphaned config. Configs you spawn from explicitly (by `agent_tool_id`,
   or created via `agent_tool_create`) are durable templates and are never auto-reaped.
+  - *Opt-in idle auto-reap (V18, todo #206).* A spawn may pass `idle_ttl_secs`; the
+    daemon's idle sweep then stops + deletes that instance once it has sat `idle`
+    (by `agent_state`/`state_since`) past the TTL. The TTL lives on the instance,
+    not the config, and the sweep keys off it - **not** the `ephemeral` flag - so
+    auto-kill is strictly opt-in: an instance with no TTL (the default) is never
+    touched, honoring the rule that an idle-but-live agent is expensive context and
+    must not be auto-killed unless asked.
+  - *Pane suppression (todo #207).* `process_stop`/`process_delete` only change the
+    daemon record; the cockpit plugin reconciles the disposal by **suppressing** the
+    now-dead agent pane (swap a viewer over it - hidden, not closed, per the
+    never-close invariant), the mirror of how it reconciles a `starting` row into a
+    pane. So disposing a sub-agent over MCP sheds its husk from the cockpit.
 
 `project_id` cross-project spawn is a deferred non-goal - it collides with the
 per-connection `?ws=` project scoping; revisit when a real cross-project

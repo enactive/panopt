@@ -15,7 +15,7 @@ use crate::agent_profiles::DEFAULT_PROFILE_KEY;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -321,6 +321,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 17 {
         apply_v17(conn)?;
     }
+    if version < 18 {
+        apply_v18(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -569,6 +572,20 @@ fn apply_v17(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
+/// Version 18: `idle_ttl_secs` on processes (todo #206).
+///
+/// The opt-in idle auto-reap window. A spawn that passes `idle_ttl_secs` records
+/// it on the instance row; the daemon's idle sweep stops + deletes the instance
+/// once it has been `idle` for at least that long. The column is *nullable* with
+/// no default — NULL means "never auto-reap", so every existing instance and
+/// every spawn that does not opt in is left running. Deliberately on the
+/// instance, not the config: it is a per-launch disposition, and keying the
+/// sweep off it (not the config's `ephemeral` flag) keeps idle auto-kill strictly
+/// opt-in rather than firing on every ad-hoc spawn.
+fn apply_v18(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "processes", "idle_ttl_secs", "INTEGER")
+}
+
 /// True if a table named `table` exists. Used by migrations that must stay
 /// idempotent against a transitional dev-database that already applied a
 /// rename or create before its `user_version` bump landed.
@@ -729,6 +746,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ephemeral, 0);
+    }
+
+    #[test]
+    fn fresh_database_has_the_v18_processes_idle_ttl_secs() {
+        // A process row inserted without naming idle_ttl_secs reads back NULL -
+        // the V18 column is nullable with no default, so an instance that did not
+        // opt into the idle sweep is never auto-reaped.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO processes (project_id, id, kind, created_at)
+                 VALUES (1, 1, 'agent', '');",
+        )
+        .unwrap();
+        let ttl: Option<i64> = conn
+            .query_row(
+                "SELECT idle_ttl_secs FROM processes WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ttl, None);
     }
 
     #[test]
