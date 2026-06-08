@@ -589,6 +589,15 @@ is the ephemeral set of MCP agents *currently connected*, while agent_tools
 and processes are the durable set of agents/commands/terminals the project
 is configured to run and the live instances of them.
 
+One config row carries an `ephemeral` flag (V17, todo #205) that splits the
+config layer in two by *lifecycle*. A config a human or orchestrator creates
+deliberately (`agent_tool_create`, or `spawn_agent` by `agent_tool_id`) is a
+durable, reusable template. A config the *ad-hoc* `spawn_agent` path auto-mints
+(no `agent_tool_id` given) is a disposable slot, flagged `ephemeral`, that exists
+only to back that one spawn through the config -> instance -> profile-render
+pipeline; `process_delete` reaps it once its last live instance is gone (Section
+10, Dispose), so the 1:N factory doesn't accumulate one orphaned config per spawn.
+
 ### 6.7 Agent type profiles
 
 Above the per-project config/instance split sits a third, global level: the
@@ -768,7 +777,12 @@ the record, the cockpit reconciles it into panes.
   input, the plugin writes it into the owned pane (`write_chars_to_pane_id`).
 - **Dispose** - no new tool: Solo's `close_process` maps onto the existing
   `process_stop` (kill the process; the pane stands, per the never-close-panes
-  invariant) followed by `process_delete`.
+  invariant) followed by `process_delete`. Disposal is **caller-driven**: nothing
+  auto-kills an idle-but-live agent. An ad-hoc `spawn_agent` (no `agent_tool_id`)
+  auto-mints a backing config flagged `ephemeral` (V17, todo #205); `process_delete`
+  reaps that config once its last live instance is gone, so a throwaway slot does
+  not strand an orphaned config. Configs you spawn from explicitly (by `agent_tool_id`,
+  or created via `agent_tool_create`) are durable templates and are never auto-reaped.
 
 `project_id` cross-project spawn is a deferred non-goal - it collides with the
 per-connection `?ws=` project scoping; revisit when a real cross-project

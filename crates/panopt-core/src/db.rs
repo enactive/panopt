@@ -15,7 +15,7 @@ use crate::agent_profiles::DEFAULT_PROFILE_KEY;
 
 /// The current schema version. Bump this and add a step to [`migrate`]
 /// whenever the schema changes.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// Version 1: the initial three-table schema.
 ///
@@ -318,6 +318,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 16 {
         apply_v16(conn)?;
     }
+    if version < 17 {
+        apply_v17(conn)?;
+    }
     if version != SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -548,6 +551,24 @@ fn apply_v16(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
+/// Version 17: `ephemeral` on agent_tools (todo #205).
+///
+/// Marks an agent config as a disposable ad-hoc slot rather than a reusable
+/// template. An ad-hoc `spawn_agent` (no `agent_tool_id`) auto-mints a config
+/// and stamps it `ephemeral = 1`; with the 1:N factory (#190) that would leave
+/// one orphaned config per spawn. `process_delete` reaps an ephemeral config
+/// once its last live instance is gone, so disposable slots clean themselves up
+/// while explicitly-created templates (`ephemeral = 0`) persist. `NOT NULL
+/// DEFAULT 0` keeps every existing config a durable template.
+fn apply_v17(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "agent_tools",
+        "ephemeral",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+}
+
 /// True if a table named `table` exists. Used by migrations that must stay
 /// idempotent against a transitional dev-database that already applied a
 /// rename or create before its `user_version` bump landed.
@@ -687,6 +708,27 @@ mod tests {
             })
             .unwrap();
         assert_eq!(extra, "[]");
+    }
+
+    #[test]
+    fn fresh_database_has_the_v17_agent_tools_ephemeral() {
+        // A config inserted without naming ephemeral picks up the NOT NULL
+        // DEFAULT 0 the V17 ALTER established, so every pre-V17 config reads
+        // back as a durable template rather than NULL.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, root) VALUES (1, '/x');
+             INSERT INTO agent_tools (project_id, id, name, tool_type, created_at)
+                 VALUES (1, 1, 'Claude', 'claude-code', '');",
+        )
+        .unwrap();
+        let ephemeral: i64 = conn
+            .query_row("SELECT ephemeral FROM agent_tools WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ephemeral, 0);
     }
 
     #[test]

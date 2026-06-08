@@ -931,7 +931,7 @@ impl Store {
     /// List a project's agent tools, ordered by `position` then `id`.
     pub fn agent_tool_list(&self, project: ProjectId) -> Result<Vec<AgentTool>, CoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, display_name, command, cwd, tool_type, system_prompt, enabled, position, created_at
+            "SELECT id, name, display_name, command, cwd, tool_type, system_prompt, enabled, ephemeral, position, created_at
                FROM agent_tools
               WHERE project_id = ?1 AND deleted_at IS NULL
               ORDER BY position, id",
@@ -946,8 +946,9 @@ impl Store {
                 tool_type: Self::normalize_tool_type(r.get(5)?),
                 system_prompt: r.get(6)?,
                 enabled: r.get::<_, i64>(7)? != 0,
-                position: r.get(8)?,
-                created_at: r.get(9)?,
+                ephemeral: r.get::<_, i64>(8)? != 0,
+                position: r.get(9)?,
+                created_at: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -989,14 +990,18 @@ impl Store {
         if let Some(v) = patch.enabled {
             entry.enabled = v;
         }
+        if let Some(v) = patch.ephemeral {
+            entry.ephemeral = v;
+        }
         if let Some(v) = patch.position {
             entry.position = v;
         }
         self.conn.execute(
             "UPDATE agent_tools
                 SET name = ?1, display_name = ?2, command = ?3, cwd = ?4,
-                    tool_type = ?5, system_prompt = ?6, enabled = ?7, position = ?8
-              WHERE project_id = ?9 AND id = ?10",
+                    tool_type = ?5, system_prompt = ?6, enabled = ?7,
+                    ephemeral = ?8, position = ?9
+              WHERE project_id = ?10 AND id = ?11",
             params![
                 entry.name,
                 entry.display_name,
@@ -1005,6 +1010,7 @@ impl Store {
                 entry.tool_type,
                 entry.system_prompt,
                 entry.enabled as i64,
+                entry.ephemeral as i64,
                 entry.position,
                 project.0,
                 id as i64,
@@ -1033,7 +1039,7 @@ impl Store {
     fn fetch_agent_tool(&self, project: ProjectId, id: u64) -> Result<AgentTool, CoreError> {
         self.conn
             .query_row(
-                "SELECT name, display_name, command, cwd, tool_type, system_prompt, enabled, position, created_at
+                "SELECT name, display_name, command, cwd, tool_type, system_prompt, enabled, ephemeral, position, created_at
                    FROM agent_tools
                   WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
                 params![project.0, id as i64],
@@ -1047,8 +1053,9 @@ impl Store {
                         tool_type: Self::normalize_tool_type(r.get(4)?),
                         system_prompt: r.get(5)?,
                         enabled: r.get::<_, i64>(6)? != 0,
-                        position: r.get(7)?,
-                        created_at: r.get(8)?,
+                        ephemeral: r.get::<_, i64>(7)? != 0,
+                        position: r.get(8)?,
+                        created_at: r.get(9)?,
                     })
                 },
             )
@@ -1296,7 +1303,26 @@ impl Store {
 
     /// Soft-delete a process: stamp `deleted_at` and re-project so the row
     /// drops out of the live listing while staying behind for future undelete.
+    ///
+    /// If the instance was backed by an *ephemeral* ad-hoc config (todo #205)
+    /// and was its last live instance, the config is reaped too - so a
+    /// disposable `spawn_agent` slot cleans itself up rather than stranding an
+    /// orphaned config in `agent_tool_list`. Durable, explicitly-created
+    /// templates (`ephemeral = 0`) are never auto-reaped.
     pub fn process_delete(&mut self, project: ProjectId, id: u64) -> Result<(), CoreError> {
+        // Capture the backing config before the soft-delete so we can decide
+        // whether to reap it once this instance is gone.
+        let tool_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT agent_tool_id FROM processes
+                  WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+                params![project.0, id as i64],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+
         let changed = self.conn.execute(
             "UPDATE processes SET deleted_at = datetime('now')
               WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
@@ -1305,7 +1331,55 @@ impl Store {
         if changed == 0 {
             return Err(CoreError::ProcessNotFound(id));
         }
-        self.reproject_processes(project)
+
+        let reaped_config = match tool_id {
+            Some(tool_id) => self.reap_ephemeral_config(project, tool_id as u64)?,
+            None => false,
+        };
+
+        self.reproject_processes(project)?;
+        if reaped_config {
+            self.reproject_agent_tools(project)?;
+        }
+        Ok(())
+    }
+
+    /// Soft-delete the agent config `tool_id` iff it is an ephemeral ad-hoc slot
+    /// (todo #205) with no remaining live instances. Returns whether it reaped.
+    /// Durable templates (`ephemeral = 0`) are never reaped; an ephemeral config
+    /// that still backs another live instance is left alone until the last one
+    /// is deleted. Called from [`Store::process_delete`] after the instance row
+    /// is soft-deleted, so the just-deleted instance is already excluded from
+    /// the live count.
+    fn reap_ephemeral_config(&self, project: ProjectId, tool_id: u64) -> Result<bool, CoreError> {
+        let is_ephemeral: bool = self
+            .conn
+            .query_row(
+                "SELECT ephemeral FROM agent_tools
+                  WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+                params![project.0, tool_id as i64],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !is_ephemeral {
+            return Ok(false);
+        }
+        let live: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM processes
+              WHERE project_id = ?1 AND agent_tool_id = ?2 AND deleted_at IS NULL",
+            params![project.0, tool_id as i64],
+            |r| r.get(0),
+        )?;
+        if live > 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE agent_tools SET deleted_at = datetime('now')
+              WHERE project_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+            params![project.0, tool_id as i64],
+        )?;
+        Ok(true)
     }
 
     /// Start an instance of the agent config `agent_tool_id`: the daemon half
@@ -3948,6 +4022,93 @@ mod tests {
         assert_eq!(one.display_name, format!("Reviewer #{}", one.id));
         assert_eq!(two.display_name, format!("Reviewer #{}", two.id));
         assert_ne!(one.display_name, two.display_name);
+    }
+
+    /// Helper: create an ad-hoc-style ephemeral config (todo #205). Core's
+    /// `agent_tool_create` always makes a durable template, so the ad-hoc path
+    /// (and these tests) flips `ephemeral` via the patch, exactly as the
+    /// daemon's `spawn_agent` does.
+    fn ephemeral_config(fx: &mut Fixture, p: ProjectId, name: &str) -> u64 {
+        let id = fx
+            .store
+            .agent_tool_create(
+                p,
+                name.into(),
+                name.into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        fx.store
+            .agent_tool_update(
+                p,
+                id,
+                AgentToolPatch {
+                    ephemeral: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn process_delete_does_not_reap_a_durable_config() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        // A plain, explicitly-created config is a reusable template: deleting
+        // its last instance must leave the config standing (todo #205).
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        assert!(!fx.store.agent_tool_get(p, config).unwrap().ephemeral);
+        let inst = fx.store.process_start(p, config).unwrap();
+        fx.store.process_delete(p, inst.id).unwrap();
+        // Config survives so it can spawn again.
+        assert!(fx.store.agent_tool_get(p, config).is_ok());
+    }
+
+    #[test]
+    fn process_delete_reaps_an_ephemeral_config_with_its_last_instance() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        let config = ephemeral_config(&mut fx, p, "ad-hoc");
+        assert!(fx.store.agent_tool_get(p, config).unwrap().ephemeral);
+
+        // Two instances of the one ephemeral config.
+        let first = fx.store.process_start(p, config).unwrap();
+        let second = fx.store.process_start(p, config).unwrap();
+
+        // Deleting the first leaves a live sibling, so the config stays.
+        fx.store.process_delete(p, first.id).unwrap();
+        assert!(
+            fx.store.agent_tool_get(p, config).is_ok(),
+            "config still backs a live instance"
+        );
+
+        // Deleting the last instance reaps the disposable config too.
+        fx.store.process_delete(p, second.id).unwrap();
+        assert!(
+            matches!(
+                fx.store.agent_tool_get(p, config),
+                Err(CoreError::AgentToolNotFound(_))
+            ),
+            "ephemeral config reaped with its last instance"
+        );
+        assert!(fx.store.agent_tool_list(p).unwrap().is_empty());
     }
 
     #[test]

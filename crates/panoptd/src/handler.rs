@@ -246,6 +246,7 @@ struct AgentToolDto {
     tool_type: String,
     system_prompt: String,
     enabled: bool,
+    ephemeral: bool,
     position: i64,
     created_at: String,
 }
@@ -261,6 +262,7 @@ impl AgentToolDto {
             tool_type: t.tool_type,
             system_prompt: t.system_prompt,
             enabled: t.enabled,
+            ephemeral: t.ephemeral,
             position: t.position,
             created_at: t.created_at,
         }
@@ -1333,6 +1335,8 @@ impl Handler {
             tool_type: args.tool_type,
             system_prompt: args.system_prompt,
             enabled: args.enabled,
+            // ephemeral is set only by the ad-hoc spawn path, not the MCP wire.
+            ephemeral: None,
             position: args.position,
         };
         {
@@ -1522,22 +1526,29 @@ impl Handler {
                             true,
                         )
                         .map_err(map_core_err)?;
-                    // With no name given, stamp a unique one so the registry
-                    // agent id (derived from the config name) can't collide with
-                    // another nameless ad-hoc spawn.
-                    if label.trim().is_empty() {
+                    // Mark the auto-minted config ephemeral (todo #205): it is a
+                    // disposable slot, reaped by process_delete once its last
+                    // instance is gone, not a reusable template. With no name
+                    // given, also stamp a unique one so the registry agent id
+                    // (derived from the config name) can't collide with another
+                    // nameless ad-hoc spawn.
+                    let (name, display_name) = if label.trim().is_empty() {
                         let nm = format!("agent-{created}");
-                        st.agent_tool_update(
-                            project,
-                            created,
-                            AgentToolPatch {
-                                name: Some(nm.clone()),
-                                display_name: Some(nm),
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(map_core_err)?;
-                    }
+                        (Some(nm.clone()), Some(nm))
+                    } else {
+                        (None, None)
+                    };
+                    st.agent_tool_update(
+                        project,
+                        created,
+                        AgentToolPatch {
+                            name,
+                            display_name,
+                            ephemeral: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(map_core_err)?;
                     created
                 }
             };
@@ -2228,6 +2239,9 @@ impl ServerHandler for Handler {
                  instance, so one config can back many concurrent agents. Spawned agents \
                  persist until disposed (nothing auto-kills an idle-but-live one), so reap \
                  what you spawn: process_stop then process_delete when a sub-agent is done. \
+                 For an ad-hoc spawn (no agent_tool_id) process_delete of its last instance \
+                 also reaps the throwaway config it created; configured slots you spawn by \
+                 agent_tool_id are durable templates and stay. \
                  Getting a result back: spawn_agent returns a handle, not a value - agree a \
                  channel up front. Create a note (or todo), tell the child in its prompt to \
                  write its result there (note_append / todo_comment_add) before it stops, \

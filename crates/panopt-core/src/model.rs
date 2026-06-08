@@ -282,6 +282,11 @@ pub struct AgentTool {
     /// Whether the tool is offered in spawn UIs. Stored but not yet enforced
     /// (no spawn UI exists in PANopt yet).
     pub enabled: bool,
+    /// Disposable ad-hoc slot vs. reusable template (todo #205). An ad-hoc
+    /// `spawn_agent` (no `agent_tool_id`) auto-mints a config and sets this; the
+    /// config is then reaped by `process_delete` once its last live instance is
+    /// gone. Explicitly-created configs are durable templates (`false`).
+    pub ephemeral: bool,
     /// Sort key within the project's agent tools.
     pub position: i64,
     /// SQLite `datetime('now')` text (UTC).
@@ -299,6 +304,9 @@ pub struct AgentToolPatch {
     pub tool_type: Option<String>,
     pub system_prompt: Option<String>,
     pub enabled: Option<bool>,
+    /// See [`AgentTool::ephemeral`]. Set by the ad-hoc spawn path (todo #205);
+    /// not exposed on the MCP `agent_tool_update` wire.
+    pub ephemeral: Option<bool>,
     pub position: Option<i64>,
 }
 
