@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "9695595d69ca",
+  "strategy": "manual-commit",
+  "branch": "agent-model",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/96/95595d69ca/0/metadata.json",
+      "transcript": "/96/95595d69ca/0/full.jsonl",
+      "content_hash": "/96/95595d69ca/0/content_hash.txt",
+      "prompt": "/96/95595d69ca/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 419,
+    "cache_creation_tokens": 35719,
+    "cache_read_tokens": 3429554,
+    "output_tokens": 26782,
+    "api_call_count": 16
+  }
+}

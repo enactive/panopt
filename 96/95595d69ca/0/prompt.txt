@@ -1,0 +1,5 @@
+another project reported the spontaneous deletion of a todo.  it's the 'twopics' one #10.  check it.
+
+---
+
+confirm what happens if the agent managment tools are given the ID of a todo.  can *that* delete?
