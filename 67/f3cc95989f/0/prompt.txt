@@ -1,0 +1,17 @@
+go #208
+
+---
+
+go
+
+---
+
+i can't track exactly waht's going on.  you refer to these by ID number.  it would be nice to shoe th eID number in the agent pane to make thie easier.
+
+---
+
+ready
+
+---
+
+the pane appears to be gone.  the entry for it in the agents pane is gone.  BUT: the UI is all messed up.  the panes are a jumble.
