@@ -1,0 +1,74 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "192d6ed1a78d",
+  "session_id": "2aaa87da-d5f5-4779-b648-97618baa7e7d",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-08T03:46:31.483349076Z",
+  "branch": "agent-model",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "DESIGN.md",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-zellij-logic/src/lib.rs",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "1fd6f22bfcdf",
+  "token_usage": {
+    "input_tokens": 3602,
+    "cache_creation_tokens": 21812,
+    "cache_read_tokens": 108112,
+    "output_tokens": 1267,
+    "api_call_count": 5
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-08T03:46:31.458541722Z",
+    "agent_lines": 0,
+    "agent_removed": 2,
+    "human_added": 0,
+    "human_modified": 69,
+    "human_removed": 8,
+    "total_committed": 35,
+    "total_lines_changed": 83,
+    "agent_percentage": 2.4096385542168677,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 203,
+      "user_lines_removed": 77,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "DESIGN.md": 22,
+        "crates/panopt-core/src/state.rs": 153,
+        "crates/panopt-tool-surface/src/lib.rs": 8,
+        "crates/panopt-zellij-logic/src/lib.rs": 7,
+        "crates/panopt-zellij/src/main.rs": 11,
+        "crates/panoptd/src/handler.rs": 2
+      },
+      "user_removed_per_file": {
+        "DESIGN.md": 12,
+        "crates/panopt-core/src/state.rs": 46,
+        "crates/panopt-tool-surface/src/lib.rs": 6,
+        "crates/panopt-zellij-logic/src/lib.rs": 5,
+        "crates/panopt-zellij/src/main.rs": 7,
+        "crates/panoptd/src/handler.rs": 1
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 203,
+      "agent_lines_removed": 77
+    }
+  ]
+}
