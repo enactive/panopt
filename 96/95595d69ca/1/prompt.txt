@@ -1,0 +1,13 @@
+investigate #239
+
+---
+
+the loss of argument set can't be otherwise overcome?
+
+---
+
+i am still not understanding.  this application suite is both the client, server, upstream...  there's no one else. !
+
+---
+
+yes
