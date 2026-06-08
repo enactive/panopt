@@ -1,0 +1,77 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "5f1b3b8036a2",
+  "session_id": "b7f3f9f2-476c-4dfe-aed5-1a2198dc3bf8",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-08T03:57:07.445066965Z",
+  "branch": "agent-model",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panoptd/src/handler.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-zellij/src/main.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "ad921c30e654",
+  "checkpoint_transcript_start": 806,
+  "transcript_lines_at_start": 806,
+  "token_usage": {
+    "input_tokens": 723,
+    "cache_creation_tokens": 51417,
+    "cache_read_tokens": 13020253,
+    "output_tokens": 33455,
+    "api_call_count": 39
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_017QCupaaYjHT619qxgvYWVK",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "ad921c30e654",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 244,
+        "end": 245,
+        "entry_ids": [
+          "111d235e-bbde-480d-bca6-4bdc23d8e483"
+        ],
+        "tool_use_id": "toolu_017QCupaaYjHT619qxgvYWVK"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017QCupaaYjHT619qxgvYWVK"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-08T03:57:07.372203516Z",
+    "agent_lines": 322,
+    "agent_removed": 9,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 322,
+    "total_lines_changed": 331,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
