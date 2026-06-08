@@ -1,0 +1,107 @@
+read #190
+
+---
+
+yes
+
+---
+
+the entire contents are missing.  no todos, no nothing.  the panes are laid out, but empty.
+
+---
+
+i *am* doing just refresh!  ???
+
+---
+
+there were some panopt processesl still. i killed them and it works, now.
+
+---
+
+once again I did " spawn an agent to check the weather in Portald, OR." and the agent used the claude sub-agent rather than panopot.
+
+---
+
+when an agent is spawned, instructions are sent, but it stops.  no one ever 'hits enter'
+
+---
+
+spawned agents persist.  how and when should they be cleaned up?
+
+here;s what an analysis of soloterm revealed:
+
+Based on soloterm's own help/tool surface, here's the cleanup model:
+  How soloterm cleans up spawned agents
+  Soloterm treats a spawned agent as a first-class stored "process" entry (one of three kinds: command,
+  terminal, agent), and cleanup is split into two distinct operations:
+
+  1. Stopping the running session (lifecycle) — stop_process
+  - Halts the agent's running PID but keeps the stored entry in the project. It can be brought back with   start_process / restart_process. This is reversible suspend/resume, not removal.
+
+  2. Removing the entry entirely — close_process
+  - This is the actual "clean up / get rid of it" operation. close_process removes a Solo terminal or Solo   agent from the project. Notably, the docs explicitly scope it: "This does not apply to command processes;  use stop_process or restart_process for commands." So:
+    - command processes → can't be closed, only stopped/restarted (they're declared in solo.yml, so removal  would be meaningless).
+    - terminal and agent processes → close_process removes them (they were spawned ad-hoc, so they're   disposable).
+
+  Key design points:
+  - Spawning never changes the caller's identity — spawn_agent/spawn_process create a child without   rebinding who you are, so a parent can spawn and later close children without identity churn.
+  - Cleanup is explicit and caller-driven. There's no auto-reap visible in the tool surface; the
+  orchestrator that spawned an agent is expected to close_process it. Bulk operations
+  (start_all_commands/stop_all_commands) deliberately only affect commands, not agents/terminals — so you   can't accidentally mass-kill spawned agents.
+
+---
+
+% just refresh
+error: recipe `refresh` failed with exit code 1
+
+---
+
+still no 'enter' on sub-agent instructions
+
+---
+
+that works.  now: how do sub-agent results get back to the spawning agent?
+
+soloterm analysis:
+
+ Solo has no return-value channel — results come back out-of-band
+  A Solo sub-agent is a PTY-backed terminal session, not a function call. spawn_agent hands you a
+  process_id, you prompt it with send_input, and from then on the child and parent are two independent
+  conversations. There is no result = await child(...). Results get back to the spawner through three
+  separate mechanisms that you compose yourself:
+  1. Reading the child's terminal output (the raw channel)
+  The parent scrapes the child's PTY:
+  - get_process_output(process_id, lines=N) — recent rendered terminal rows
+  - get_process_raw_output — raw bytes
+  - search_output / search_raw_output — find a sentinel in the scrollback
+  This is brittle for structured data (you're parsing a terminal), so it's mostly used to confirm progress
+  or grep for a marker the child was told to print (e.g. ROUND 3 READY in Solo's own worked example).
+  2. Shared coordination primitives (the real result hand-off)
+  The durable pattern is: the child writes its result into shared state, the parent reads it. Solo's
+  coordination plane gives you:
+  - Scratchpads — the canonical "hand back a findings/plan/report" channel. Parent tells the child in its
+  prompt "write your result to scratchpad X"; child calls scratchpad_write/scratchpad_append; parent reads
+  it with scratchpad_read. Revision guards (expected_revision) prevent clobbering.
+  - Todos — when the result is task-shaped (ownership, status, comments).
+  - Locks — mutual exclusion around shared edits.
+  - (KV exists in the model but is disabled in this Solo instance.)
+
+  So the actual "return value" is a scratchpad id agreed on up front, not a tool response.
+
+  3. Knowing when the result is ready (synchronization)
+
+  There's no blocking await. The parent doesn't poll — it arms an idle-triggered timer:
+  - timer_fire_when_idle_any(processes, max_wait_ms, body) — wake me when any watched child goes idle (i.e.  finished its turn)
+  - timer_fire_when_idle_all([...], max_wait_ms, body) — wake me when all of them are idle
+
+  When the timer fires, body is injected into the parent's conversation as a fresh user turn. That body is   where you put the "now go read scratchpad X / get_process_output on pid N" instruction. So the loop is:
+
+  spawn_agent → send_input(prompt: "...do work, write result to scratchpad 42")
+              → timer_fire_when_idle_any([child_pid], 600000,
+                   "child idle: read scratchpad 42, then continue")
+     (parent suspends; on wake it reads the scratchpad / output)
+
+  The shape of it
+
+  Spawn returns a handle, not a future. The child pushes its result into a shared store (scratchpad/todo)   or its terminal; the parent is woken by an idle timer and pulls the result back. Coupling is by
+  convention — both sides have to agree on the scratchpad id or output marker in advance.

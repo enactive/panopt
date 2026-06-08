@@ -1,0 +1,152 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "192d6ed1a78d",
+  "session_id": "b7f3f9f2-476c-4dfe-aed5-1a2198dc3bf8",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-08T03:46:35.60654717Z",
+  "branch": "agent-model",
+  "checkpoints_count": 9,
+  "files_touched": [
+    "DESIGN.md",
+    "README.md",
+    "crates/panopt-core/src/agent_profiles/defaults.toml",
+    "crates/panopt-core/src/agent_profiles/render.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-zellij-logic/src/lib.rs",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panopt/src/agent.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "ad921c30e654",
+  "token_usage": {
+    "input_tokens": 7861,
+    "cache_creation_tokens": 645795,
+    "cache_read_tokens": 24252108,
+    "output_tokens": 171081,
+    "api_call_count": 145
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_017QCupaaYjHT619qxgvYWVK",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "ad921c30e654",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 244,
+        "end": 245,
+        "entry_ids": [
+          "111d235e-bbde-480d-bca6-4bdc23d8e483"
+        ],
+        "tool_use_id": "toolu_017QCupaaYjHT619qxgvYWVK"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017QCupaaYjHT619qxgvYWVK"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-08T03:46:35.52874288Z",
+    "agent_lines": 315,
+    "agent_removed": 83,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 315,
+    "total_lines_changed": 398,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 203,
+      "agent_lines_removed": 77
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 203,
+      "agent_lines_removed": 77
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 203,
+      "agent_lines_removed": 77
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 271,
+      "agent_lines_removed": 81
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 284,
+      "agent_lines_removed": 82
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 290,
+      "agent_lines_removed": 83
+    },
+    {
+      "checkpoint_number": 8,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 290,
+      "agent_lines_removed": 83
+    },
+    {
+      "checkpoint_number": 9,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 307,
+      "agent_lines_removed": 83
+    },
+    {
+      "checkpoint_number": 10,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 315,
+      "agent_lines_removed": 83
+    }
+  ]
+}
