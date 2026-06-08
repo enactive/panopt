@@ -440,10 +440,13 @@ pub fn parse_config_line(line: &str) -> Option<ConfigRow> {
     Some(ConfigRow { id, label, enabled })
 }
 
-/// The Agents-pane row label for a config: its name, plus a ` · <status>`
+/// The Agents-pane row label for a config: `#<id> <name>`, plus a ` · <status>`
 /// suffix drawn from its live instance when one exists - the agent's classified
 /// activity (`thinking`/`waiting`/...) if observed, else the lifecycle status
-/// (`starting`/`running`). A config with no live instance shows just its name.
+/// (`starting`/`running`). A config with no live instance shows just `#<id>
+/// <name>`. The leading `#<id>` matches the `#N <label>` shape the Todos and
+/// Notes panes use, so every sidebar row is addressable by the same `#N` an
+/// operator (or another agent) quotes elsewhere.
 ///
 /// While the agent sits `idle`, the daemon's "idle for N" age rides along as
 /// ` · idle <age>` (#143) - the same presence cue the roster shows as
@@ -451,8 +454,9 @@ pub fn parse_config_line(line: &str) -> Option<ConfigRow> {
 /// merely that it is waiting. The age only rides the `idle` state because that
 /// is the only state the daemon projects it for.
 pub fn agent_config_label(config: &ConfigRow, inst: Option<&ProcessRow>) -> String {
+    let base = format!("#{} {}", config.id, config.label);
     let Some(inst) = inst else {
-        return config.label.clone();
+        return base;
     };
     let Some(state) = inst
         .agent_state
@@ -460,15 +464,15 @@ pub fn agent_config_label(config: &ConfigRow, inst: Option<&ProcessRow>) -> Stri
         .or(inst.status.as_deref())
         .filter(|s| !s.is_empty())
     else {
-        return config.label.clone();
+        return base;
     };
     match inst
         .idle
         .as_deref()
         .filter(|_| inst.agent_state.as_deref() == Some("idle"))
     {
-        Some(age) => format!("{} · {state} {age}", config.label),
-        None => format!("{} · {state}", config.label),
+        Some(age) => format!("{base} · {state} {age}"),
+        None => format!("{base} · {state}"),
     }
 }
 
@@ -780,6 +784,40 @@ pub fn kind_prefixed_title(kind: &str, label: &str) -> String {
         label.to_string()
     } else {
         format!("{kind}: {label}")
+    }
+}
+
+/// Drop a trailing instance id from a process label. The daemon names
+/// instances by appending their own id (`good-224`, `verify-submit #220`), so
+/// the id is already baked into `label`; we strip it before re-adding an
+/// explicit `#<id>` to avoid the doubled `good-224` / `#224` read. Only a
+/// *separated* trailing id is removed (`-224`, ` #220`, ` 193`) or an id that
+/// is the whole label - bare digits that merely end a name (`abc224`) are left
+/// alone, since they are part of the name, not a disambiguator.
+pub fn strip_trailing_id(label: &str, id: u64) -> String {
+    let label = label.trim();
+    if let Some(prefix) = label.strip_suffix(&id.to_string()) {
+        let trimmed = prefix.trim_end_matches(['#', '-', ' ']);
+        if trimmed.len() < prefix.len() || prefix.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    label.to_string()
+}
+
+/// Title for a process (agent/command/terminal) pane: `<Kind> #<id> - <name>`,
+/// matching the `Todo #N - <title>` / `Note #N - <title>` shape
+/// [`viewer_title_for`] gives document panes. Surfacing the `#<id>` lets an
+/// operator map a process id quoted on the coordination plane (`dispose #224`)
+/// to the pane on screen. The daemon-appended id is stripped from `name` first
+/// (see [`strip_trailing_id`]) so it shows exactly once; a name that was *only*
+/// the id collapses to the bare `<Kind> #<id>`.
+pub fn process_pane_title_for(kind: &str, id: u64, name: &str) -> String {
+    let bare = strip_trailing_id(name, id);
+    if bare.is_empty() {
+        format!("{kind} #{id}")
+    } else {
+        format!("{kind} #{id} - {bare}")
     }
 }
 
@@ -1255,8 +1293,10 @@ mod tests {
     }
 
     #[test]
-    fn label_for_config_with_no_instance_is_just_its_name() {
-        assert_eq!(agent_config_label(&config("Mediator"), None), "Mediator");
+    fn label_for_config_with_no_instance_is_id_and_name() {
+        // The `#<id>` prefix mirrors the Todos/Notes panes' `#N <label>` shape
+        // so every Agents row is addressable by the same id quoted elsewhere.
+        assert_eq!(agent_config_label(&config("Mediator"), None), "#7 Mediator");
     }
 
     #[test]
@@ -1265,7 +1305,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             agent_config_label(&config("Mediator"), Some(&inst)),
-            "Mediator · thinking"
+            "#7 Mediator · thinking"
         );
     }
 
@@ -1276,7 +1316,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             agent_config_label(&config("Mediator"), Some(&inst)),
-            "Mediator · idle 3m"
+            "#7 Mediator · idle 3m"
         );
     }
 
@@ -1287,8 +1327,49 @@ mod tests {
         let inst = parse_process_line("- [agent] #5 Mediator (from #7) · starting").unwrap();
         assert_eq!(
             agent_config_label(&config("Mediator"), Some(&inst)),
-            "Mediator · starting"
+            "#7 Mediator · starting"
         );
+    }
+
+    #[test]
+    fn strip_trailing_id_removes_only_a_separated_or_whole_id() {
+        // Daemon-appended forms: `name-<id>` and `name #<id>`.
+        assert_eq!(strip_trailing_id("good-224", 224), "good");
+        assert_eq!(
+            strip_trailing_id("verify-submit #220", 220),
+            "verify-submit"
+        );
+        assert_eq!(
+            strip_trailing_id("weather-portland #193", 193),
+            "weather-portland"
+        );
+        // The id IS the whole label -> collapses to empty.
+        assert_eq!(strip_trailing_id("224", 224), "");
+        // No trailing id, or digits that are part of the name -> left alone.
+        assert_eq!(strip_trailing_id("good", 224), "good");
+        assert_eq!(strip_trailing_id("abc224", 224), "abc224");
+        // A different trailing number is not this row's id -> left alone.
+        assert_eq!(strip_trailing_id("good-225", 224), "good-225");
+    }
+
+    #[test]
+    fn process_pane_title_matches_viewer_pane_shape() {
+        // `Agent #<id> - <name>`, parallel to `Todo #N - <title>`, with the
+        // daemon-baked id stripped from the name so it appears exactly once.
+        assert_eq!(
+            process_pane_title_for("Agent", 224, "good-224"),
+            "Agent #224 - good"
+        );
+        assert_eq!(
+            process_pane_title_for("Agent", 220, "verify-submit #220"),
+            "Agent #220 - verify-submit"
+        );
+        assert_eq!(
+            process_pane_title_for("Command", 30, "deploy"),
+            "Command #30 - deploy"
+        );
+        // Name that was only the id -> bare `<Kind> #<id>`, no dangling dash.
+        assert_eq!(process_pane_title_for("Agent", 9, "9"), "Agent #9");
     }
 
     #[test]

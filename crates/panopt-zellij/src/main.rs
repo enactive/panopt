@@ -912,7 +912,7 @@ impl PanoptPane {
             "terminal" => "Terminal",
             _ => return format!("Process #{id}: {}", row.label),
         };
-        kind_prefixed_title(prefix, &row.label)
+        process_pane_title_for(prefix, id, &row.label)
     }
 
     // --- data ---
