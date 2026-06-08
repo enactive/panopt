@@ -209,6 +209,13 @@ struct PanoptPane {
     /// from typing the same input twice in that window.
     delivered_inputs: std::collections::HashSet<i64>,
 
+    /// Panes whose just-typed input still needs its submitting Enter, deferred
+    /// to the *next* timer tick. Claude Code treats a fast burst (the body plus
+    /// a trailing `\r` in one write) as a paste and inserts the newline instead
+    /// of running the prompt; sending the carriage return ~1s later, as its own
+    /// input event, lands as a real Enter. See [`Self::deliver_pending_inputs`].
+    pending_submit: Vec<PaneId>,
+
     /// Whether any plugin pane is currently the focused pane in its tab.
     /// Updated by [`PanoptPane::ingest_panes`] but only from a non-transient
     /// manifest: a transient `zellij action pipe` pane briefly steals focus
@@ -1361,10 +1368,12 @@ impl PanoptPane {
                 })
                 .collect(),
             Mode::Agents => {
-                // Config-centric (#27): one row per agent config, joined to its
-                // single live instance (the 1:1 policy) for status/state and the
-                // live marker. The agent *is* the config; starting it spawns the
-                // instance, stopping it ends the instance, but the row persists.
+                // Config-centric (#27): one row per agent config, joined to a
+                // representative live instance for status/state and the live
+                // marker. The agent *is* the config; starting it spawns an
+                // instance, stopping it ends one, but the row persists. The
+                // daemon is a 1:N factory (todo #190); rendering each instance as
+                // its own row is a follow-up.
                 self.configs
                     .iter()
                     .map(|c| {
@@ -1964,9 +1973,11 @@ impl PanoptPane {
         self.ensure_viewer_in_slot("empty", None, false);
     }
 
-    /// The live agent instance of config `config_id`, if one exists (the 1:1
-    /// policy guarantees at most one). The join key is the instance's
-    /// `agent_tool_id`, lifted from the ` (from #N)` suffix in processes.md.
+    /// A representative live agent instance of config `config_id`, if any. The
+    /// daemon is a 1:N factory (todo #190), so a config can have several live
+    /// instances; the config-centric Agents pane binds to the first. The join key
+    /// is the instance's `agent_tool_id`, lifted from the ` (from #N)` suffix in
+    /// processes.md.
     fn config_instance(&self, config_id: u64) -> Option<&ProcessRow> {
         self.processes
             .iter()
@@ -2237,6 +2248,14 @@ impl PanoptPane {
         if self.mode != Mode::Todos || !self.permitted {
             return;
         }
+        // Flush Enter keystrokes deferred from the previous tick first: the body
+        // was typed last tick, so this carriage return now arrives as a separate
+        // input event (Claude Code has finished absorbing the paste) and submits
+        // the prompt instead of inserting a newline. Drained before new inputs so
+        // this tick's writes get their own Enter on the *next* tick, never now.
+        for pane in std::mem::take(&mut self.pending_submit) {
+            write_chars_to_pane_id("\r", pane);
+        }
         let Ok(body) = fs::read_to_string(INPUTS_PATH) else {
             return;
         };
@@ -2264,7 +2283,21 @@ impl PanoptPane {
             return;
         };
         for (seq, pane, content) in to_write {
-            write_chars_to_pane_id(&content, pane);
+            // Claude Code's TUI inserts a written "\n" into its multiline prompt
+            // rather than running it - submission is the Enter *key*, a carriage
+            // return. So the send_input contract ("a trailing newline submits")
+            // is honored by translation: type the body now, and defer the "\r" to
+            // the next tick (queued on `pending_submit`). The defer matters - a
+            // body+CR written together is read by Claude Code as one paste burst,
+            // where the CR becomes a literal newline; a CR arriving ~1s later,
+            // after the paste settles, is a real Enter that runs the prompt (bug:
+            // a spawned agent's prompt was typed but never submitted).
+            let submit = content.ends_with('\n');
+            let body = content.trim_end_matches(['\r', '\n']);
+            write_chars_to_pane_id(body, pane);
+            if submit {
+                self.pending_submit.push(pane);
+            }
             self.delivered_inputs.insert(seq);
             let seq_str = seq.to_string();
             self.run_panopt(

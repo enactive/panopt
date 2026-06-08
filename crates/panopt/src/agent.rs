@@ -13,6 +13,25 @@ use serde_json::json;
 use crate::mcpclient::Client;
 use crate::{mcp, paths};
 
+/// Steer agents to spawn sub-agents *through* panopt rather than with Claude
+/// Code's built-in sub-agent tool (todo #190 follow-up). Two launch-level
+/// guards, because the MCP server `instructions` alone lose to the built-in
+/// tool's pull on "spawn an agent":
+///
+/// - [`DISALLOW_BUILTIN_AGENT`] removes the built-in `Agent`/Task tool from the
+///   model's context entirely (a bare tool name in `--disallowedTools` is not a
+///   permission denial - the model never sees the tool), so "spawn an agent" has
+///   no built-in path to fall into. It does not touch the MCP tools, so
+///   `spawn_agent` and the rest of the panopt surface stay available.
+/// - [`SPAWN_DIRECTIVE`] is appended to the system prompt as the positive
+///   pointer at the tool that *is* available.
+const DISALLOW_BUILTIN_AGENT: &str = "Agent";
+const SPAWN_DIRECTIVE: &str = "To spawn, launch, run, or delegate to an agent in \
+    this project, use the panopt `spawn_agent` MCP tool, then `send_input` to task \
+    it. The built-in sub-agent (Agent/Task) tool is intentionally unavailable: \
+    every agent must be a first-class panopt pane so it joins the shared \
+    coordination plane (registry, todos, notes, locks).";
+
 // Note: `_agent` no longer pre-registers against the daemon directly. The
 // stdio MCP proxy that Claude Code spawns from this pane (via the config at
 // `mcp.rs`) initializes its panoptd session as soon as Claude Code sends
@@ -79,6 +98,10 @@ pub fn exec_in_pane(ws: Option<PathBuf>, id: Option<String>, port: u16) -> Resul
     let err = Command::new("claude")
         .arg("--mcp-config")
         .arg(&config)
+        .arg("--disallowedTools")
+        .arg(DISALLOW_BUILTIN_AGENT)
+        .arg("--append-system-prompt")
+        .arg(SPAWN_DIRECTIVE)
         .env("PANOPT_BIN", &panopt_bin)
         .env("PANOPT_WS", &ws)
         .env("PANOPT_PROJECT", &project)

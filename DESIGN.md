@@ -545,15 +545,21 @@ edit to the tool does not perturb them. The **runtime** (status) columns -
 layer while the instance runs and are NULL when it is not. The config is what
 *should* run; the row's runtime columns are what *is* running; the two may
 legitimately diverge (edited-but-not-restarted, crashed, never-started). This is
-why config and instance stay distinct even at today's one-instance-per-config:
-run-level identity is where a session or plan attaches, not the durable slot.
+why config and instance stay distinct: run-level identity is where a session
+or plan attaches, not the durable slot.
 
 The split lets a project carry two Claude instances both spawned from agent
-tool `#3`, with each instance addressable by its own `#N`. When a process is
-spawned from a tool, the tool's `command` and `cwd` are copied into the
-process row so post-spawn edits to the tool don't perturb the running
-instance. Deleting a tool nulls the `agent_tool_id` back-reference on any
-process that referenced it; the live instance keeps running.
+tool `#3`, with each instance addressable by its own `#N` (the 1:N factory
+model, todo #190 — `process_start`/`spawn_agent` always write a fresh row, never
+returning an existing one). To keep concurrent instances of one config from
+colliding in the agent registry and advisory locks, their identity is
+uniquified with the new instance id at spawn: the internal `name` becomes
+`{config.name}-{id}` (or `agent-{id}` when the config is unnamed) and the
+friendly `display_name` becomes `{friendly} #{id}`. When a process is spawned
+from a tool, the tool's `command` and `cwd` are copied into the process row so
+post-spawn edits to the tool don't perturb the running instance. Deleting a
+tool nulls the `agent_tool_id` back-reference on any process that referenced
+it; the live instance keeps running.
 
 Copy-on-spawn is also where **per-launch overrides** land (the orchestration
 spawn surface, Section 10): `process_start`/`spawn_agent` accept an optional
@@ -748,11 +754,15 @@ daemon-decides / plugin-effects seam as the instance lifecycle: the daemon owns
 the record, the cockpit reconciles it into panes.
 
 - **Spawn** - `spawn_agent` is a thin alias over `process_start` (same args,
-  same one-live-instance-per-config policy, same dispatch path). Its return
-  carries the new `process_id`, the resolved instance `name`, and rendered
-  `agent_instructions` - the per-type bootstrap text (Section 6.7) the parent
-  prepends to the child's first prompt. Per-launch `name` / `extra_args` vary a
-  launch without mutating the config (copy-on-spawn, Section 6.6).
+  same dispatch path). Both are **pure factories** (todo #190): every call spawns
+  a fresh instance, with the instance `name`/`display_name` uniquified by its
+  `#N` (Section 6.6) so multiple instances of one config are individually
+  addressable and never collide in the registry/locks. "Focus the existing one"
+  is a cockpit/UI concern, not a daemon policy. The return carries the new
+  `process_id`, the resolved instance `name`, and rendered `agent_instructions` -
+  the per-type bootstrap text (Section 6.7) the parent prepends to the child's
+  first prompt. Per-launch `name` / `extra_args` vary a launch without mutating
+  the config (copy-on-spawn, Section 6.6).
 - **Input** - `send_input(process_id, input)`, the linchpin that turns a spawned
   child into a working one with no human keystroke: the daemon enqueues the
   input, the plugin writes it into the owned pane (`write_chars_to_pane_id`).

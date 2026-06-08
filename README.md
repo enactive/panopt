@@ -35,7 +35,13 @@ Todos, notes, and new agents are all created from the sidebar.
 **Multiple agents, one project.** Spawn another agent from the agents
 pane and it joins the cockpit with its own pane. Every agent shares the
 same todos, notes, and locks, so they can hand work between each
-other instead of stepping on each other.
+other instead of stepping on each other. Agents spawn *each other* the same
+way: a cockpit agent asked to "spawn an agent" uses panopt's `spawn_agent`
+tool, so the new agent is a first-class cockpit pane on the shared
+coordination plane. To make that the obvious path, panopt launches its Claude
+Code agents with the built-in sub-agent (Agent/Task) tool disabled
+(`--disallowedTools Agent`) plus a system-prompt pointer at `spawn_agent`;
+the panopt MCP tools themselves are unaffected.
 
 **Remote agents.** Run the daemon on your workstation and connect an agent
 from another machine on the LAN - a laptop, a Mac running Solo, a host with
@@ -146,6 +152,24 @@ claude --mcp-config "$(panopt agent-config --name my-name)"
 
 That session shows up in the agents list as `my-name` and shares the same
 todos, notes, and locks as the cockpit-spawned agents.
+
+One difference from cockpit-spawned agents: a hand-launched session keeps
+Claude Code's built-in sub-agent (Agent/Task) tool, so when you ask it to
+"spawn an agent" it may use that instead of panopt's `spawn_agent` - the new
+agent would then be invisible to the cockpit and unable to coordinate. To get
+the cockpit behavior, disable the built-in tool and point at `spawn_agent`:
+
+```sh
+claude --mcp-config "$(panopt agent-config --name my-name)" \
+  --disallowedTools "Agent" \
+  --append-system-prompt "To spawn/launch/run an agent in this project, use the panopt spawn_agent MCP tool."
+```
+
+Or make it durable for the project via `.claude/settings.json`:
+
+```json
+{ "permissions": { "deny": ["Agent"] } }
+```
 
 ### From another machine
 

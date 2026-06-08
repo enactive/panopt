@@ -30,6 +30,7 @@ You already have the panopt MCP tools available. To coordinate:
 - Call `identify` (or `whoami`) to register your presence under `{{agent_id}}`.
 - Use `process_report` to report your status as you work.
 - Use todos, notes, and locks to coordinate with the other agents in this project.
+- If whoever spawned you named a note or todo for your result, write it there (`note_append` / `todo_comment_add`) before you finish - that is how your result gets back to them.
 '''
 
 [claude-code.spawn]
@@ -40,7 +41,18 @@ You already have the panopt MCP tools available. To coordinate:
 # `{{...}}` placeholders itself rather than leaning on claude's own `${VAR}`
 # expansion, which is what lets the same engine launch agents that don't expand
 # env vars.
-argv = ["claude", "--mcp-config", "{{file:mcp_config}}"]
+# `--disallowedTools Agent` removes Claude Code's built-in sub-agent (Agent/Task)
+# tool from the model's context entirely, and `--append-system-prompt` points at
+# the tool that is available, so a spawned agent that is itself asked to "spawn an
+# agent" reaches for panopt's `spawn_agent` rather than its own built-in tool
+# (todo #190 follow-up). MCP tools (spawn_agent et al.) are unaffected. Keep this
+# text in sync with `SPAWN_DIRECTIVE` in crates/panopt/src/agent.rs.
+argv = [
+    "claude",
+    "--mcp-config", "{{file:mcp_config}}",
+    "--disallowedTools", "Agent",
+    "--append-system-prompt", "To spawn, launch, run, or delegate to an agent in this project, use the panopt `spawn_agent` MCP tool, then `send_input` to task it. The built-in sub-agent (Agent/Task) tool is intentionally unavailable: every agent must be a first-class panopt pane so it joins the shared coordination plane (registry, todos, notes, locks).",
+]
 
 [claude-code.spawn.files]
 # Rendered to a temp file at spawn; its path replaces `{{file:mcp_config}}` in

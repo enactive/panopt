@@ -467,8 +467,7 @@ impl Store {
     /// The daemon calls this on a timer so a hand-quit agent (the user pressed
     /// `Ctrl-c`/`exit` in its pane, no `process_stop` ever ran) stops being
     /// reported as live - otherwise its `running` row lingers in `processes.md`
-    /// forever and the 1:1 policy in [`Self::process_start`] keeps handing the
-    /// zombie back instead of spawning a fresh instance.
+    /// forever and the cockpit keeps drawing a pane for a process that is gone.
     ///
     /// Liveness itself is supplied by the caller via `is_alive` (a `kill(pid, 0)`
     /// probe): the OS-signal effect belongs to the daemon, which lives on the
@@ -1259,14 +1258,15 @@ impl Store {
     /// reconciler (the cockpit plugin) turns into a live pane - the daemon
     /// never spawns the pane itself, so this is pure record-keeping.
     ///
-    /// The config must exist and be enabled. The policy is **one live instance
-    /// per config**: if a non-deleted instance of this config is already
-    /// `starting` or `running`, that row is returned unchanged (a no-op the
-    /// caller can treat as "focus the existing one") rather than spawning a
-    /// second. Otherwise a fresh row is written in
-    /// [`process_status::STARTING`], copying the config's command/cwd/name at
-    /// spawn time (copy-on-spawn, DESIGN S6.6) so later edits to the config do
-    /// not perturb the running instance.
+    /// The config must exist and be enabled. This is a **pure factory** (todo
+    /// #190): every call spawns a fresh instance, so one config can back many
+    /// concurrent instances. Each row is written in [`process_status::STARTING`],
+    /// copying the config's command/cwd at spawn time (copy-on-spawn, DESIGN
+    /// S6.6) so later edits to the config do not perturb the running instance.
+    /// The instance's `name`/`display_name` are uniquified with the new id
+    /// (`{config.name}-{id}` / `{friendly} #{id}`) so concurrent instances of
+    /// one config never collide in the agent registry or advisory locks.
+    /// "Focus the existing one" is a cockpit/UI concern, not a daemon policy.
     pub fn process_start(
         &mut self,
         project: ProjectId,
@@ -1276,17 +1276,16 @@ impl Store {
     }
 
     /// [`Store::process_start`] with the orchestration spawn surface's per-launch
-    /// overrides (todo #159): `name` overrides the instance's display name for
-    /// this run only, and `extra_args` are recorded on the row for the edge to
-    /// append to the rendered argv. Both are *copy-on-spawn* - written onto the
-    /// new `processes` row, never back to the `agent_tools` config - so a second
-    /// spawn of the same config with different overrides leaves the config (and
-    /// the first instance) untouched.
+    /// overrides (todo #159): `name` sets the friendly base of the instance's
+    /// display name for this run only (still suffixed with the new id, so two
+    /// spawns sharing one override stay distinguishable), and `extra_args` are
+    /// recorded on the row for the edge to append to the rendered argv. Both are
+    /// *copy-on-spawn* - written onto the new `processes` row, never back to the
+    /// `agent_tools` config - so a second spawn of the same config with different
+    /// overrides leaves the config (and the first instance) untouched.
     ///
-    /// The 1:1 policy still holds: if a live instance of this config exists it is
-    /// returned unchanged and the overrides are ignored (the caller treats this
-    /// as "focus the existing one"), since there is no second row to apply them
-    /// to.
+    /// Like [`Store::process_start`] this is a pure factory (todo #190): every
+    /// call writes a fresh row, never returning an existing one.
     pub fn process_start_with(
         &mut self,
         project: ProjectId,
@@ -1300,23 +1299,11 @@ impl Store {
                 "agent config #{agent_tool_id} is disabled"
             )));
         }
-        // 1:1 policy: a config already has at most one live instance. A row
-        // counts as live while it is starting (pane pending) or running; a
-        // stopped/exited row is spent and a fresh start replaces it.
-        if let Some(existing) = self.process_list(project)?.into_iter().find(|p| {
-            p.agent_tool_id == Some(agent_tool_id)
-                && matches!(
-                    p.status.as_deref(),
-                    Some(process_status::STARTING) | Some(process_status::RUNNING)
-                )
-        }) {
-            return Ok(existing);
-        }
-
-        // The instance display name is the per-launch override when given, else
+        // The friendly display base: the per-launch override when given, else
         // the config's own display name (copy-on-spawn). A blank override falls
-        // through to the config so an empty string never blanks the row.
-        let display_name = name
+        // through to the config so an empty string never blanks the row. The new
+        // instance id is appended below so concurrent instances stay distinct.
+        let friendly = name
             .filter(|n| !n.trim().is_empty())
             .unwrap_or(config.display_name);
         let extra_args_json =
@@ -1326,6 +1313,23 @@ impl Store {
         let id = {
             let tx = self.conn.transaction()?;
             let next = next_id(&tx, pid)?;
+            // Uniquify identity with the just-allocated id (todo #190): the
+            // internal `name` is the agent's registry/lock key, so two instances
+            // of one config must differ. A blank config name falls back to
+            // `agent-<id>` (matching the edge and the ad-hoc spawn path).
+            let instance_name = if config.name.trim().is_empty() {
+                format!("agent-{next}")
+            } else {
+                format!("{}-{next}", config.name)
+            };
+            // The display gets a `#<id>` suffix so the cockpit can tell instances
+            // apart; a blank friendly base falls back to the internal name rather
+            // than rendering a bare " #<id>".
+            let instance_display = if friendly.trim().is_empty() {
+                instance_name.clone()
+            } else {
+                format!("{friendly} #{next}")
+            };
             tx.execute(
                 "INSERT INTO processes
                     (project_id, id, kind, name, display_name, command, cwd,
@@ -1335,8 +1339,8 @@ impl Store {
                     pid,
                     next,
                     ProcessKind::Agent.as_str(),
-                    config.name,
-                    display_name,
+                    instance_name,
+                    instance_display,
                     config.command,
                     config.cwd,
                     next,
@@ -3698,16 +3702,19 @@ mod tests {
         assert_eq!(started.agent_tool_id, Some(config));
         assert_eq!(started.command, "claude");
         assert_eq!(started.cwd, "/work");
-        assert_eq!(started.display_name, "Mediator");
+        // Identity is uniquified with the instance id (todo #190).
+        assert_eq!(started.name, format!("claude-a-{}", started.id));
+        assert_eq!(started.display_name, format!("Mediator #{}", started.id));
         assert_eq!(started.status.as_deref(), Some(process_status::STARTING));
 
         let md = std::fs::read_to_string(root.join(".panopt/processes.md")).unwrap();
         assert!(md.contains("· starting"), "{md}");
 
-        // 1:1 policy: starting again returns the same live row, no second spawn.
+        // Pure factory: starting again spawns a second live instance, distinct
+        // from the first (no focus-the-existing-one in the daemon).
         let again = fx.store.process_start(p, config).unwrap();
-        assert_eq!(again.id, started.id);
-        assert_eq!(fx.store.process_list(p).unwrap().len(), 1);
+        assert_ne!(again.id, started.id);
+        assert_eq!(fx.store.process_list(p).unwrap().len(), 2);
 
         // pid report flips to running and anchors liveness.
         fx.store
@@ -3732,7 +3739,7 @@ mod tests {
         let row = fx.store.process_get(p, started.id).unwrap();
         assert_eq!(row.status.as_deref(), Some(process_status::STOPPED));
 
-        // a spent (stopped) row no longer blocks a fresh start.
+        // each start is a fresh instance, stopped predecessors notwithstanding.
         let restarted = fx.store.process_start(p, config).unwrap();
         assert_ne!(restarted.id, started.id);
     }
@@ -3765,7 +3772,11 @@ mod tests {
                 vec!["--model".into(), "opus".into()],
             )
             .unwrap();
-        assert_eq!(started.display_name, "Mediator (run 1)");
+        // The per-launch override is the friendly base, suffixed with the id.
+        assert_eq!(
+            started.display_name,
+            format!("Mediator (run 1) #{}", started.id)
+        );
         assert_eq!(started.extra_args, vec!["--model", "opus"]);
 
         // The durable config is untouched: name and (absence of) args both stay.
@@ -3780,12 +3791,108 @@ mod tests {
             .process_start_with(p, config, None, vec!["--resume".into()])
             .unwrap();
         assert_ne!(second.id, started.id);
-        // No name override falls back to the config's display name.
-        assert_eq!(second.display_name, "Mediator");
+        // No name override falls back to the config's display name, suffixed.
+        assert_eq!(second.display_name, format!("Mediator #{}", second.id));
         assert_eq!(second.extra_args, vec!["--resume"]);
         // And the first instance still carries its own args, unchanged.
         let first = fx.store.process_get(p, started.id).unwrap();
         assert_eq!(first.extra_args, vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn process_start_is_a_factory_distinct_instances() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+
+        // Two starts without stopping yield two distinct live instances of the
+        // one config (the 1:N factory model, todo #190).
+        let first = fx.store.process_start(p, config).unwrap();
+        let second = fx.store.process_start(p, config).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(fx.store.process_list(p).unwrap().len(), 2);
+        assert_eq!(first.agent_tool_id, Some(config));
+        assert_eq!(second.agent_tool_id, Some(config));
+        assert_eq!(
+            first.status.as_deref(),
+            Some(process_status::STARTING),
+            "first stays live"
+        );
+        assert_eq!(second.status.as_deref(), Some(process_status::STARTING));
+        // Identity is per-instance so the two never collide in the registry/locks.
+        assert_ne!(first.name, second.name);
+        assert_ne!(first.display_name, second.display_name);
+        assert_eq!(first.name, format!("claude-a-{}", first.id));
+        assert_eq!(second.name, format!("claude-a-{}", second.id));
+    }
+
+    #[test]
+    fn process_start_empty_config_name_falls_back_to_agent_id() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        // A config with no name and no display name still yields a unique,
+        // non-empty instance identity (so the edge never collides in the registry).
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                String::new(),
+                String::new(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        let started = fx.store.process_start(p, config).unwrap();
+        assert_eq!(started.name, format!("agent-{}", started.id));
+        // A blank friendly base falls back to the internal name, never " #id".
+        assert_eq!(started.display_name, format!("agent-{}", started.id));
+    }
+
+    #[test]
+    fn process_start_with_name_override_is_suffixed() {
+        let mut fx = Fixture::new();
+        let (p, _root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        // Two spawns sharing one explicit override stay distinguishable: the id
+        // suffix disambiguates them in the cockpit.
+        let one = fx
+            .store
+            .process_start_with(p, config, Some("Reviewer".into()), Vec::new())
+            .unwrap();
+        let two = fx
+            .store
+            .process_start_with(p, config, Some("Reviewer".into()), Vec::new())
+            .unwrap();
+        assert_eq!(one.display_name, format!("Reviewer #{}", one.id));
+        assert_eq!(two.display_name, format!("Reviewer #{}", two.id));
+        assert_ne!(one.display_name, two.display_name);
     }
 
     #[test]

@@ -395,9 +395,10 @@ pub struct ProcessRow {
     pub agent_id: Option<String>,
     /// The backing agent config id, lifted from the ` (from #N)` suffix
     /// `render_processes_md` writes for instances spawned from a config. This is
-    /// the join key the Agents pane uses to bind a config to its single live
-    /// instance (the 1:1 policy). `None` for command/terminal rows and any
-    /// instance with no backing config.
+    /// the join key the Agents pane uses to bind a config to a live instance. The
+    /// daemon is a 1:N factory (a config can have several live instances, todo
+    /// #190); the config-centric pane binds to a representative one (the first).
+    /// `None` for command/terminal rows and any instance with no backing config.
     pub agent_tool_id: Option<u64>,
     /// The "sitting idle for N" age (`idle:<age>` segment, bug #163), present
     /// only while the agent is in the `idle` state - the daemon computes it as
@@ -410,8 +411,9 @@ pub struct ProcessRow {
 
 /// A parsed `.panopt/agent_tools.md` line: one durable agent config (the
 /// config layer of the two-layer model). The Agents pane is config-centric -
-/// each config *is* an agent, with at most one live instance - so this is the
-/// row it renders, joined to a live [`ProcessRow`] by `id == agent_tool_id`.
+/// each config *is* an agent - so this is the row it renders, joined to a
+/// representative live [`ProcessRow`] by `id == agent_tool_id` (the daemon is a
+/// 1:N factory, todo #190; surfacing every instance is a follow-up).
 /// Line format (see `render_agent_tools_md`): `- #<id> <label> [<flag>]<cmd>`.
 pub struct ConfigRow {
     pub id: u64,

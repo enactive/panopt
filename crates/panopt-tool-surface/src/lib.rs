@@ -356,11 +356,12 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         description: "Start an instance of an agent config (the instance lifecycle). \
                       Writes a desired-state process row in `starting` that the cockpit \
                       reconciles into a live pane; the daemon never spawns the pane \
-                      itself. One live instance per config: if one is already starting or \
-                      running, that row is returned instead of spawning a second. Optional \
-                      per-launch `name` and `extra_args` override the instance for this run \
-                      only without touching the config. Returns the process row as JSON, \
-                      including rendered `agent_instructions` to bootstrap the child.",
+                      itself. A pure factory: every call spawns a fresh instance, so one \
+                      config can back many concurrent instances (each addressable by its \
+                      own id). Optional per-launch `name` and `extra_args` override the \
+                      instance for this run only without touching the config. Returns the \
+                      process row as JSON, including rendered `agent_instructions` to \
+                      bootstrap the child.",
         schema_fn: schema_for::<ProcessStartArgs>,
     },
     ToolDef {
@@ -372,8 +373,12 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
                       that config; without, it spawns ad-hoc from `tool_type` (default agent \
                       type), creating a config named by `name`. `prompt` is the opening task, \
                       typed into the agent once it is live. Returns the process row plus \
-                      rendered `agent_instructions`. One live instance per config; then \
-                      `send_input` to task it further and `process_stop` to end it.",
+                      rendered `agent_instructions`. A pure factory - each call spawns a \
+                      fresh instance, so one config can back many concurrent agents; then \
+                      `send_input` to task it further. Spawned agents PERSIST until disposed \
+                      - nothing auto-kills an idle-but-live agent - so reap the ones you \
+                      spawn: when a sub-agent's task is done, `process_stop` (ends the run) \
+                      then `process_delete` (removes the instance).",
         schema_fn: schema_for::<SpawnAgentArgs>,
     },
     ToolDef {

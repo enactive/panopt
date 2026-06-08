@@ -254,12 +254,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let launch = build_launch(profile, &sample_facts(), dir.path()).expect("render");
 
-        // argv: claude --mcp-config <materialized path>
-        assert_eq!(launch.argv.len(), 3);
+        // argv: claude --mcp-config <materialized path> --disallowedTools Agent
+        //       --append-system-prompt <directive>. The Agent/Task guard steers
+        // spawns through panopt's spawn_agent (todo #190 follow-up).
+        assert_eq!(launch.argv.len(), 7);
         assert_eq!(launch.argv[0], "claude");
         assert_eq!(launch.argv[1], "--mcp-config");
         assert_eq!(launch.files.len(), 1);
         assert_eq!(launch.argv[2], launch.files[0].to_string_lossy());
+        assert_eq!(launch.argv[3], "--disallowedTools");
+        assert_eq!(launch.argv[4], "Agent");
+        assert_eq!(launch.argv[5], "--append-system-prompt");
+        assert!(launch.argv[6].contains("spawn_agent"));
         assert!(launch.env.is_empty());
 
         // The materialized mcp config has every fact substituted and boots the

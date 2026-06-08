@@ -2078,7 +2078,17 @@ impl ServerHandler for Handler {
                  starts a configured slot. It returns the new process_id plus rendered \
                  agent_instructions. After it is running, send_input(process_id, input) types \
                  a follow-up into the agent's pane, and process_stop(process_id) ends it (the \
-                 pane stands). One live instance per config.\n\
+                 pane stands). spawn_agent is a pure factory - each call spawns a fresh \
+                 instance, so one config can back many concurrent agents. Spawned agents \
+                 persist until disposed (nothing auto-kills an idle-but-live one), so reap \
+                 what you spawn: process_stop then process_delete when a sub-agent is done. \
+                 Getting a result back: spawn_agent returns a handle, not a value - agree a \
+                 channel up front. Create a note (or todo), tell the child in its prompt to \
+                 write its result there (note_append / todo_comment_add) before it stops, \
+                 then read it back. Know when it is done by watching the child's \
+                 agent_state via process_get (idle = finished its turn) or its idle_seconds \
+                 in agent_list; for a multi-turn child have it signal completion explicitly \
+                 (todo_complete, or a sentinel line in the note).\n\
                  - Utilities: id_kind resolves a numeric id to its resource kind \
                  (todo / note / agent-tool / process) plus a short label. \
                  Useful since ids are unified per project and a `#N` reference \
