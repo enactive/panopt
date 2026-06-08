@@ -369,6 +369,7 @@ impl TodoSort {
 /// the pre-V6 `roster.md` so the existing `[kind] #id label` parser still
 /// works; any trailing `(from #N)` is dropped from `label` and any trailing
 /// ` · <status>` (todo #141) is lifted into `status`.
+#[derive(Debug, Default, Clone)]
 pub struct ProcessRow {
     pub kind: String,
     pub id: u64,

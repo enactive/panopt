@@ -472,6 +472,11 @@ impl ZellijPlugin for PanoptPane {
                 }
                 self.reload_data();
                 self.rebuild_items();
+                // Hide the panes of instances disposed over MCP (#207) before the
+                // spawn reconciler prunes their pane mapping. Same poll and
+                // gatekeeper gating; suppress (never close) so the cockpit sheds
+                // dead agent husks without breaking the never-close invariant.
+                self.reconcile_disposed_processes();
                 // Turn any daemon-owned `starting` row into a live pane. Driven
                 // off the same 1s poll that refreshed `self.processes`, gated to
                 // the Todos gatekeeper inside the method.
@@ -2158,6 +2163,111 @@ impl PanoptPane {
         }
     }
 
+    /// The reconciled instances that have left the live set (todo #207): an
+    /// `(id, terminal_pane_id)` for each `reconciled_panes` entry whose row is
+    /// now gone (deleted) or terminal (`stopped`/`exited`). Pure — split out of
+    /// [`Self::reconcile_disposed_processes`] so the disposal predicate is unit
+    /// testable without the Zellij host. A still-`starting`/`running` row is
+    /// never disposed.
+    fn disposed_reconciled_panes(&self) -> Vec<(u64, u32)> {
+        self.reconciled_panes
+            .iter()
+            .filter(
+                |(id, _)| match self.processes.iter().find(|r| r.id == **id) {
+                    None => true,
+                    Some(r) => matches!(r.status.as_deref(), Some("stopped") | Some("exited")),
+                },
+            )
+            .map(|(id, tid)| (*id, *tid))
+            .collect()
+    }
+
+    /// Suppress the panes of instances that have left the live set (todo #207).
+    ///
+    /// `process_stop`/`process_delete` (e.g. an orchestrator disposing a
+    /// sub-agent over MCP) change only the daemon record; the agent's Zellij
+    /// pane is left standing - a dead husk cluttering the cockpit. This is the
+    /// effector that reconciles disposal into the UI, the mirror of
+    /// [`Self::reconcile_starting_processes`]: when a reconciled instance's row
+    /// is gone or terminal but its pane is still drawn and unsuppressed, hide it.
+    /// Suppress, never close (the never-close-panes invariant), so the user can
+    /// still resurface the pane.
+    ///
+    /// Runs before `reconcile_starting_processes` prunes `reconciled_panes`, so a
+    /// deleted row's pane mapping is still in hand. Idempotent: once a disposed
+    /// pane is handled its entry is dropped, so a still-present `stopped` row is
+    /// not re-hidden every tick (and the user re-surfacing it is not fought).
+    /// Gatekeeper-only, like the spawn reconciler, so the five plugin instances
+    /// don't all act on the same rows.
+    fn reconcile_disposed_processes(&mut self) {
+        if self.mode != Mode::Todos || !self.permitted {
+            return;
+        }
+        for (id, tid) in self.disposed_reconciled_panes() {
+            let pane = PaneId::Terminal(tid);
+            match self.panes.iter().find(|p| p.id == pane) {
+                // Drawn and on-screen: hide it, then forget the mapping.
+                Some(p) if !p.suppressed && !p.floating => {
+                    self.suppress_pane(pane);
+                    self.reconciled_panes.remove(&id);
+                }
+                // Already suppressed (or a floating overlay): nothing to do, but
+                // our work on this instance is done - stop tracking it.
+                Some(_) => {
+                    self.reconciled_panes.remove(&id);
+                }
+                // Not in this tick's manifest (gone, or its husk not surfaced
+                // yet): leave the entry for a retry or the deleted-row prune.
+                None => {}
+            }
+        }
+    }
+
+    /// Suppress (hide, never close) content pane `target`, honoring the
+    /// never-close-panes invariant: swap a viewer over it so it goes off-screen
+    /// but keeps running and the user can resurface it. Reuses an already-
+    /// suppressed viewer when one exists (no new process), else spawns a fresh
+    /// empty viewer in its place. Keeps focus on the sidebar so a background
+    /// disposal never yanks the user off whatever they are doing. If the
+    /// suppressed pane was the live slot, the viewer that displaced it becomes
+    /// the slot, so `slot_pane` keeps pointing at on-screen content.
+    fn suppress_pane(&mut self, target: PaneId) {
+        let replacement = if let Some(viewer) = self.first_suppressed_viewer() {
+            replace_pane_with_existing_pane(target, viewer, true);
+            Some(viewer)
+        } else if let Some(ws) = self.launch_cwd() {
+            let slot_name = self.allocate_viewer_slot();
+            write_routing("empty", None, &slot_name);
+            let args = vec![
+                "_viewer".to_string(),
+                "--slot".to_string(),
+                slot_name,
+                "--port".to_string(),
+                self.port.clone(),
+                "--kind".to_string(),
+                "empty".to_string(),
+            ];
+            open_command_pane_in_place_of_pane_id(
+                target,
+                CommandToRun {
+                    path: PathBuf::from(&self.panopt_bin),
+                    args,
+                    cwd: Some(ws),
+                },
+                false,
+                BTreeMap::new(),
+            )
+        } else {
+            None
+        };
+        if self.slot_pane == Some(target) {
+            self.slot_pane = replacement;
+        }
+        if let Some(plugin) = self.plugin_pane {
+            focus_pane_with_id(plugin, false, false);
+        }
+    }
+
     /// Rebuild the per-type status matchers from `.panopt/agent-types.md` when
     /// its text changes (todo #142). A cheap no-op when unchanged - the patterns
     /// are static for the daemon's lifetime and regex compilation is not free.
@@ -3125,6 +3235,27 @@ mod tests {
         assert!(matches!(pane.focused_target(), Some(ItemTarget::Todo(0))));
         pane.move_cursor(1);
         assert!(matches!(pane.focused_target(), Some(ItemTarget::Todo(1))));
+    }
+
+    #[test]
+    fn disposed_reconciled_panes_selects_only_gone_or_terminal_rows() {
+        let mut pane = pane_with(Mode::Todos);
+        let row = |id: u64, status: &str| ProcessRow {
+            id,
+            status: Some(status.to_string()),
+            ..Default::default()
+        };
+        // #1 running (live), #2 stopped, #3 exited; #4 has no row (deleted).
+        pane.processes = vec![row(1, "running"), row(2, "stopped"), row(3, "exited")];
+        pane.reconciled_panes = [(1u64, 11u32), (2, 12), (3, 13), (4, 14)]
+            .into_iter()
+            .collect();
+
+        let mut disposed = pane.disposed_reconciled_panes();
+        disposed.sort();
+        // Only the terminal (#2/#3) and deleted (#4) rows are disposed; the
+        // running instance keeps its pane.
+        assert_eq!(disposed, vec![(2, 12), (3, 13), (4, 14)]);
     }
 
     #[test]
