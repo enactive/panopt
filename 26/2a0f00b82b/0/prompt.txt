@@ -1,0 +1,7 @@
+<task-notification>
+<task-id>bs8wl41xf</task-id>
+<tool-use-id>toolu_01VztHNvjR2EL7CAuoEcVH5J</tool-use-id>
+<output-file>/tmp/claude-1000/-home-gregz-cp-panopt/441a2eb6-44ce-468f-976c-ddbe947aa315/tasks/bs8wl41xf.output</output-file>
+<status>killed</status>
+<summary>Background command "Wait for weather agent to go idle" was stopped</summary>
+</task-notification>
