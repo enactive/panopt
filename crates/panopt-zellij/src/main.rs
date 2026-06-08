@@ -2223,43 +2223,52 @@ impl PanoptPane {
         }
     }
 
-    /// Suppress (hide, never close) content pane `target`, honoring the
-    /// never-close-panes invariant: swap a viewer over it so it goes off-screen
-    /// but keeps running and the user can resurface it. Reuses an already-
-    /// suppressed viewer when one exists (no new process), else spawns a fresh
-    /// empty viewer in its place. Keeps focus on the sidebar so a background
-    /// disposal never yanks the user off whatever they are doing. If the
-    /// suppressed pane was the live slot, the viewer that displaced it becomes
-    /// the slot, so `slot_pane` keeps pointing at on-screen content.
+    /// Suppress (hide, never close) a disposed agent/command/terminal pane,
+    /// honoring the never-close-panes invariant: spawn a fresh empty viewer in
+    /// the pane's exact place. `open_command_pane_in_place_of_pane_id` keeps the
+    /// tile's geometry and drops `target` onto Zellij's suppressed stack -
+    /// off-screen, still running, resurfaceable - so the husk disappears
+    /// without reshaping the layout. Focus stays on the sidebar so a background
+    /// disposal never yanks the user off what they are doing.
+    ///
+    /// Crucially we do NOT reuse [`Self::first_suppressed_viewer`] here, unlike
+    /// the document slot (`show_in_slot`/`find_or_show`). That suppressed-viewer
+    /// pool belongs to the single content slot's swap-in-place rotation (one
+    /// pane visible in `slot_pane`, the rest parked off-screen). An agent pane
+    /// is its OWN independent tile, not the slot; surfacing a pool viewer into
+    /// it pulls that viewer out of the rotation, leaving `slot_pane` and the
+    /// pool desynced from Zellij's real layout - which scrambled the whole
+    /// cockpit when a sub-agent was disposed over MCP (#207 regression). A
+    /// dedicated empty viewer per disposal costs one process but keeps the slot
+    /// pool untouched.
     fn suppress_pane(&mut self, target: PaneId) {
-        let replacement = if let Some(viewer) = self.first_suppressed_viewer() {
-            replace_pane_with_existing_pane(target, viewer, true);
-            Some(viewer)
-        } else if let Some(ws) = self.launch_cwd() {
-            let slot_name = self.allocate_viewer_slot();
-            write_routing("empty", None, &slot_name);
-            let args = vec![
-                "_viewer".to_string(),
-                "--slot".to_string(),
-                slot_name,
-                "--port".to_string(),
-                self.port.clone(),
-                "--kind".to_string(),
-                "empty".to_string(),
-            ];
-            open_command_pane_in_place_of_pane_id(
-                target,
-                CommandToRun {
-                    path: PathBuf::from(&self.panopt_bin),
-                    args,
-                    cwd: Some(ws),
-                },
-                false,
-                BTreeMap::new(),
-            )
-        } else {
-            None
+        let Some(ws) = self.launch_cwd() else {
+            return;
         };
+        let slot_name = self.allocate_viewer_slot();
+        write_routing("empty", None, &slot_name);
+        let args = vec![
+            "_viewer".to_string(),
+            "--slot".to_string(),
+            slot_name,
+            "--port".to_string(),
+            self.port.clone(),
+            "--kind".to_string(),
+            "empty".to_string(),
+        ];
+        let replacement = open_command_pane_in_place_of_pane_id(
+            target,
+            CommandToRun {
+                path: PathBuf::from(&self.panopt_bin),
+                args,
+                cwd: Some(ws),
+            },
+            false,
+            BTreeMap::new(),
+        );
+        // An agent/command tile is never the document slot, but guard anyway:
+        // if `target` somehow was the slot, hand the slot to its replacement so
+        // `slot_pane` keeps pointing at on-screen content.
         if self.slot_pane == Some(target) {
             self.slot_pane = replacement;
         }
