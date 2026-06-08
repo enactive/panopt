@@ -1,0 +1,70 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "5f1b3b8036a2",
+  "session_id": "441a2eb6-44ce-468f-976c-ddbe947aa315",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-08T03:56:57.176673529Z",
+  "branch": "agent-model",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panopt-zellij/src/main.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "5f5d1c0c75f3",
+  "token_usage": {
+    "input_tokens": 3741,
+    "cache_creation_tokens": 21702,
+    "cache_read_tokens": 247560,
+    "output_tokens": 2184,
+    "api_call_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-08T03:56:57.15902253Z",
+    "agent_lines": 50,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 62,
+    "total_committed": 50,
+    "total_lines_changed": 112,
+    "agent_percentage": 44.642857142857146,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 307,
+      "user_lines_removed": 83,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "DESIGN.md": 22,
+        "README.md": 25,
+        "crates/panopt-core/src/agent_profiles/defaults.toml": 12,
+        "crates/panopt-core/src/agent_profiles/render.rs": 8,
+        "crates/panopt-core/src/state.rs": 153,
+        "crates/panopt-tool-surface/src/lib.rs": 12,
+        "crates/panopt-zellij-logic/src/lib.rs": 7,
+        "crates/panopt-zellij/src/main.rs": 41,
+        "crates/panopt/src/agent.rs": 23,
+        "crates/panoptd/src/handler.rs": 4
+      },
+      "user_removed_per_file": {
+        "DESIGN.md": 12,
+        "README.md": 1,
+        "crates/panopt-core/src/agent_profiles/defaults.toml": 1,
+        "crates/panopt-core/src/agent_profiles/render.rs": 2,
+        "crates/panopt-core/src/state.rs": 46,
+        "crates/panopt-tool-surface/src/lib.rs": 7,
+        "crates/panopt-zellij-logic/src/lib.rs": 5,
+        "crates/panopt-zellij/src/main.rs": 8,
+        "crates/panoptd/src/handler.rs": 1
+      }
+    }
+  ]
+}
