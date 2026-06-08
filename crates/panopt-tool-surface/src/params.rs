@@ -422,6 +422,41 @@ pub struct InputAckArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitForIdleArgs {
+    /// Numeric ids of the running instances (processes) to wait on - typically
+    /// the `process_id`s of agents you spawned.
+    pub process_ids: Vec<u64>,
+    /// How long to block before returning, in milliseconds. Capped server-side
+    /// (a few minutes); if the cap or this value elapses first the call returns
+    /// with `timed_out: true` and you can call again. Defaults to ~60s.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// "all" (default) returns once every listed process is idle or gone; "any"
+    /// returns as soon as one is.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProcessOutputArgs {
+    /// Numeric id of the instance (process) whose pane output to read.
+    pub process_id: u64,
+    /// How many of the most recent rendered terminal rows to return. Defaults to
+    /// a recent window; the capture is bounded, so older scrollback is not kept.
+    #[serde(default)]
+    pub lines: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchOutputArgs {
+    /// Numeric id of the instance (process) whose pane output to search.
+    pub process_id: u64,
+    /// Substring to look for in the captured pane output (e.g. a sentinel the
+    /// child was told to print). Returns the matching rows.
+    pub pattern: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProcessStopArgs {
     /// Numeric id of the process (instance) to stop.
     pub process_id: u64,

@@ -26,9 +26,10 @@ use panopt_tool_surface::params::{
     AgentToolCreateArgs, AgentToolDeleteArgs, AgentToolGetArgs, AgentToolUpdateArgs, IdKindArgs,
     IdentifyArgs, InputAckArgs, LockAcquireArgs, LockReleaseArgs, ProcessCreateArgs,
     ProcessDeleteArgs, ProcessGetArgs, ProcessReportArgs, ProcessStartArgs, ProcessStopArgs,
-    ProcessUpdateArgs, NoteAppendArgs, NoteCreateArgs,
+    ProcessOutputArgs, ProcessUpdateArgs, NoteAppendArgs, NoteCreateArgs,
     NoteDeleteArgs, NoteGetArgs, NoteReadArgs, NoteSearchArgs,
-    NoteUpdateArgs, SendInputArgs, SpawnAgentArgs, TodoBlockerArgs, TodoCommentAddArgs,
+    NoteUpdateArgs, SearchOutputArgs, SendInputArgs, SpawnAgentArgs, TodoBlockerArgs,
+    TodoCommentAddArgs, WaitForIdleArgs,
     TodoCommentDeleteArgs,
     TodoCommentUpdateArgs, TodoCompleteArgs, TodoCreateArgs, TodoDeleteArgs, TodoGetArgs,
     TodoLockArgs, TodoSearchArgs, TodoSetBlockersArgs, TodoStartArgs, TodoUnlockArgs,
@@ -1607,6 +1608,107 @@ impl Handler {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
+    /// `wait_for_idle`: block until the listed instances finish their turn (todo
+    /// #190 line). The orchestration sync primitive - polls the `agent_state`
+    /// the status observer already reports and returns when the all/any-idle
+    /// condition holds, or with `timed_out` on expiry. The state Mutex is taken
+    /// only for the per-tick snapshot and released before the sleep, so a long
+    /// wait never holds it across an await.
+    async fn wait_for_idle(
+        &self,
+        parts: Parts,
+        args: WaitForIdleArgs,
+    ) -> Result<CallToolResult, McpError> {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+        // Bounded so a single call never pins the proxy connection for long; the
+        // caller re-invokes on `timed_out`.
+        const MAX_WAIT_MS: u64 = 120_000;
+        const DEFAULT_WAIT_MS: u64 = 60_000;
+        let wait_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let want_all = !matches!(args.mode.as_deref(), Some("any"));
+        loop {
+            let (snapshot, settled) = {
+                let mut st = self.state.lock().expect("state mutex poisoned");
+                let (project, _) = enter(&mut st, &parts)?;
+                let mut rows = Vec::with_capacity(args.process_ids.len());
+                let mut settled = 0usize;
+                for &id in &args.process_ids {
+                    // A process is "settled" when it has gone idle (finished its
+                    // turn), reached a terminal status, or no longer exists.
+                    let (state, status, is_settled) = match st.process_get(project, id) {
+                        Ok(p) => {
+                            let terminal =
+                                matches!(p.status.as_deref(), Some("stopped") | Some("exited"));
+                            let idle = p.agent_state.as_deref() == Some("idle");
+                            (p.agent_state, p.status, terminal || idle)
+                        }
+                        Err(_) => (None, Some("gone".to_string()), true),
+                    };
+                    if is_settled {
+                        settled += 1;
+                    }
+                    rows.push(serde_json::json!({
+                        "process_id": id,
+                        "agent_state": state,
+                        "status": status,
+                        "settled": is_settled,
+                    }));
+                }
+                (rows, settled)
+            }; // state guard dropped here, before any await
+            let condition = if want_all {
+                settled == args.process_ids.len()
+            } else {
+                settled > 0
+            };
+            let timed_out = std::time::Instant::now() >= deadline;
+            if condition || timed_out || args.process_ids.is_empty() {
+                let result = serde_json::json!({
+                    "idle": condition,
+                    "timed_out": timed_out && !condition,
+                    "mode": if want_all { "all" } else { "any" },
+                    "processes": snapshot,
+                });
+                return json_result(&result);
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// `process_output`: return the recent captured pane rows for an instance
+    /// (the raw orchestration channel). Reads the bounded, ~1s-lagged capture
+    /// the cockpit plugin tees per running agent; empty when nothing is captured.
+    async fn process_output(
+        &self,
+        parts: Parts,
+        args: ProcessOutputArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let out = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.process_output(project, args.process_id, args.lines)
+                .map_err(map_core_err)?
+        };
+        Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
+    /// `search_output`: return the captured pane rows of an instance that contain
+    /// `pattern` (e.g. a sentinel the child was told to print).
+    async fn search_output(
+        &self,
+        parts: Parts,
+        args: SearchOutputArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let matches = {
+            let mut st = self.state.lock().expect("state mutex poisoned");
+            let (project, _) = enter(&mut st, &parts)?;
+            st.search_output(project, args.process_id, &args.pattern)
+                .map_err(map_core_err)?
+        };
+        Ok(CallToolResult::success(vec![Content::text(matches.join("\n"))]))
+    }
+
     async fn process_report(
         &self,
         parts: Parts,
@@ -1730,6 +1832,9 @@ enum Tool {
     SpawnAgent,
     SendInput,
     InputAck,
+    WaitForIdle,
+    ProcessOutput,
+    SearchOutput,
     ProcessStop,
     ProcessReport,
     IdKind,
@@ -1786,6 +1891,9 @@ impl Tool {
             "spawn_agent" => Tool::SpawnAgent,
             "send_input" => Tool::SendInput,
             "input_ack" => Tool::InputAck,
+            "wait_for_idle" => Tool::WaitForIdle,
+            "process_output" => Tool::ProcessOutput,
+            "search_output" => Tool::SearchOutput,
             "process_stop" => Tool::ProcessStop,
             "process_report" => Tool::ProcessReport,
             "id_kind" => Tool::IdKind,
@@ -2003,6 +2111,18 @@ async fn dispatch_local<'a>(
             let args: InputAckArgs = parse_json_object(raw_args)?;
             handler.input_ack(parts, args).await
         }
+        Tool::WaitForIdle => {
+            let args: WaitForIdleArgs = parse_json_object(raw_args)?;
+            handler.wait_for_idle(parts, args).await
+        }
+        Tool::ProcessOutput => {
+            let args: ProcessOutputArgs = parse_json_object(raw_args)?;
+            handler.process_output(parts, args).await
+        }
+        Tool::SearchOutput => {
+            let args: SearchOutputArgs = parse_json_object(raw_args)?;
+            handler.search_output(parts, args).await
+        }
         Tool::ProcessStop => {
             let args: ProcessStopArgs = parse_json_object(raw_args)?;
             handler.process_stop(parts, args).await
@@ -2085,10 +2205,11 @@ impl ServerHandler for Handler {
                  Getting a result back: spawn_agent returns a handle, not a value - agree a \
                  channel up front. Create a note (or todo), tell the child in its prompt to \
                  write its result there (note_append / todo_comment_add) before it stops, \
-                 then read it back. Know when it is done by watching the child's \
-                 agent_state via process_get (idle = finished its turn) or its idle_seconds \
-                 in agent_list; for a multi-turn child have it signal completion explicitly \
-                 (todo_complete, or a sentinel line in the note).\n\
+                 then read it back. To wait, call wait_for_idle(process_ids) - it blocks \
+                 until the child(ren) finish their turn (or time out) instead of you polling; \
+                 process_output / search_output scrape a child's pane for progress or a \
+                 sentinel (brittle - prefer the note). For a multi-turn child have it signal \
+                 completion explicitly (todo_complete, or a sentinel line in the note).\n\
                  - Utilities: id_kind resolves a numeric id to its resource kind \
                  (todo / note / agent-tool / process) plus a short label. \
                  Useful since ids are unified per project and a `#N` reference \

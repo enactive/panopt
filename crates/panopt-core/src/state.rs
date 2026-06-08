@@ -1156,6 +1156,61 @@ impl Store {
         self.fetch_process(project, id)
     }
 
+    /// The cockpit's per-instance pane-output capture file. The sidebar plugin
+    /// tees each running agent's viewport to `.panopt/.cockpit/output-<id>.txt`
+    /// on its poll; the orchestration `process_output`/`search_output` tools read
+    /// it. Cockpit-internal (under `.cockpit/`), bounded and ~1s-lagged - not a
+    /// durable record, just a recent window.
+    fn output_capture_path(&self, project: ProjectId, id: u64) -> Result<PathBuf, CoreError> {
+        Ok(self
+            .project_root(project)?
+            .join(".panopt")
+            .join(".cockpit")
+            .join(format!("output-{id}.txt")))
+    }
+
+    /// Recent captured pane rows for instance `id` (todo #190 line): the raw
+    /// orchestration channel a parent can scrape to confirm a child's progress.
+    /// Returns the last `lines` rows (all when `None`), or an empty string when
+    /// nothing has been captured yet. The instance must exist.
+    pub fn process_output(
+        &self,
+        project: ProjectId,
+        id: u64,
+        lines: Option<u64>,
+    ) -> Result<String, CoreError> {
+        self.fetch_process(project, id)?;
+        let body =
+            std::fs::read_to_string(self.output_capture_path(project, id)?).unwrap_or_default();
+        let out = match lines {
+            Some(n) => {
+                let rows: Vec<&str> = body.lines().collect();
+                let start = rows.len().saturating_sub(n as usize);
+                rows[start..].join("\n")
+            }
+            None => body,
+        };
+        Ok(out)
+    }
+
+    /// Captured pane rows of instance `id` that contain `pattern` (todo #190
+    /// line): grep the raw channel for a sentinel. The instance must exist.
+    pub fn search_output(
+        &self,
+        project: ProjectId,
+        id: u64,
+        pattern: &str,
+    ) -> Result<Vec<String>, CoreError> {
+        self.fetch_process(project, id)?;
+        let body =
+            std::fs::read_to_string(self.output_capture_path(project, id)?).unwrap_or_default();
+        Ok(body
+            .lines()
+            .filter(|l| l.contains(pattern))
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Apply a [`ProcessPatch`]: every outer `Some` field is written. Inner
     /// nullable fields (`agent_tool_id`, `pid`, `status`, `agent_state`,
     /// `last_seen`) use `Some(Option<T>)` so a caller can both set and clear
@@ -3893,6 +3948,61 @@ mod tests {
         assert_eq!(one.display_name, format!("Reviewer #{}", one.id));
         assert_eq!(two.display_name, format!("Reviewer #{}", two.id));
         assert_ne!(one.display_name, two.display_name);
+    }
+
+    #[test]
+    fn process_output_and_search_read_the_capture_file() {
+        let mut fx = Fixture::new();
+        let (p, root) = fx.project("proj");
+        let config = fx
+            .store
+            .agent_tool_create(
+                p,
+                "claude-a".into(),
+                "Mediator".into(),
+                "claude".into(),
+                "/work".into(),
+                "claude-code".into(),
+                String::new(),
+                true,
+            )
+            .unwrap();
+        let started = fx.store.process_start(p, config).unwrap();
+
+        // No capture written yet -> empty, not an error.
+        assert_eq!(fx.store.process_output(p, started.id, None).unwrap(), "");
+        assert!(fx
+            .store
+            .search_output(p, started.id, "anything")
+            .unwrap()
+            .is_empty());
+
+        // Simulate the cockpit teeing the pane viewport to the capture file.
+        let dir = root.join(".panopt").join(".cockpit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("output-{}.txt", started.id)),
+            "line one\nROUND 3 READY\nline three",
+        )
+        .unwrap();
+
+        // Full read, tail-by-lines, and substring search.
+        assert!(fx
+            .store
+            .process_output(p, started.id, None)
+            .unwrap()
+            .contains("ROUND 3 READY"));
+        assert_eq!(
+            fx.store.process_output(p, started.id, Some(1)).unwrap(),
+            "line three"
+        );
+        assert_eq!(
+            fx.store.search_output(p, started.id, "ROUND 3").unwrap(),
+            vec!["ROUND 3 READY".to_string()]
+        );
+
+        // An unknown instance is rejected (the row must exist).
+        assert!(fx.store.process_output(p, 9999, None).is_err());
     }
 
     #[test]

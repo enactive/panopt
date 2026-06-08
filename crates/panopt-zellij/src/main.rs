@@ -2199,13 +2199,18 @@ impl PanoptPane {
             return;
         };
         for (id, tool_type, agent_id) in observable {
-            let Some(matcher) = self.status_matchers.get(&tool_type) else {
-                continue;
-            };
             let Some(pane) = self.agent_pane(id, agent_id.as_deref()) else {
                 continue;
             };
             let Ok(contents) = get_pane_scrollback(pane, false) else {
+                continue;
+            };
+            // Tee the viewport to the capture file so the daemon's
+            // process_output / search_output tools can serve it (todo #190 line).
+            // Independent of status classification, so it runs even for types
+            // without status patterns.
+            self.write_output_capture(id, &contents.viewport);
+            let Some(matcher) = self.status_matchers.get(&tool_type) else {
                 continue;
             };
             // Classify only the live footer/prompt region, not the whole
@@ -2244,6 +2249,20 @@ impl PanoptPane {
     /// `running` instances - typing into a `starting` pane before the agent has
     /// booted would be lost. A `delivered_inputs` set guards the window between
     /// our write and the projection catching up, so an input is typed once.
+    /// Tee a running agent's recent viewport rows to the cockpit capture file
+    /// `.panopt/.cockpit/output-<id>.txt` - the bounded, ~1s-lagged raw channel
+    /// the daemon's `process_output`/`search_output` tools read (todo #190 line).
+    /// Best-effort: a failed write just means the orchestrator sees no/stale
+    /// output for that tick. The window is capped so the file stays small.
+    fn write_output_capture(&self, id: u64, viewport: &[String]) {
+        const MAX_ROWS: usize = 300;
+        let start = viewport.len().saturating_sub(MAX_ROWS);
+        let body = viewport[start..].join("\n");
+        let dir = "/host/.panopt/.cockpit";
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(format!("{dir}/output-{id}.txt"), body);
+    }
+
     fn deliver_pending_inputs(&mut self) {
         if self.mode != Mode::Todos || !self.permitted {
             return;

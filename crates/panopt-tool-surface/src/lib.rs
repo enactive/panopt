@@ -398,6 +398,34 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         schema_fn: schema_for::<InputAckArgs>,
     },
     ToolDef {
+        name: "wait_for_idle",
+        description: "Block until the listed instances finish their current turn, then \
+                      return. The synchronization half of orchestration: after spawn_agent \
+                      + send_input, call this to await a child instead of polling - it \
+                      returns when each process is idle (finished its turn) or gone \
+                      (stopped/exited). `mode` \"all\" (default) waits for every id, \"any\" \
+                      for the first. Bounded by `timeout_ms` and a server cap; on expiry it \
+                      returns `timed_out: true` (call again). Pair with an agreed note/todo: \
+                      wait here, then read the child's result from the note it wrote.",
+        schema_fn: schema_for::<WaitForIdleArgs>,
+    },
+    ToolDef {
+        name: "process_output",
+        description: "Read the recent rendered terminal rows of an instance's pane (the raw \
+                      progress channel). Brittle for structured data - prefer an agreed \
+                      note/todo for results - but useful to confirm progress or grep for a \
+                      sentinel. The capture is a bounded recent window refreshed by the \
+                      cockpit, so it lags ~1s and does not retain old scrollback.",
+        schema_fn: schema_for::<ProcessOutputArgs>,
+    },
+    ToolDef {
+        name: "search_output",
+        description: "Search an instance's captured pane output for `pattern` and return the \
+                      matching rows - e.g. find a sentinel the child was told to print. Same \
+                      bounded, ~1s-lagged capture as process_output.",
+        schema_fn: schema_for::<SearchOutputArgs>,
+    },
+    ToolDef {
         name: "process_stop",
         description: "Stop a running instance: signal its process and flip the row to \
                       `stopped`. The pane is left standing (panopt owns processes; Zellij \
