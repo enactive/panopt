@@ -188,8 +188,8 @@ pub const TOOL_SURFACE: &[ToolDef] = &[
         name: "todo_search",
         description: "Find todos. Optional `query` substring-matches title and body \
                       (case-insensitive). Optional status/priority/assignee narrow by \
-                      exact match (assignee is case-insensitive); pass an empty assignee \
-                      string to find unassigned todos. Optional `tags` requires every \
+                      exact match (assignee is case-insensitive); pass assignee: null \
+                      to find unassigned todos. Optional `tags` requires every \
                       listed tag (AND semantics). Returns the same shape as todo_list; \
                       an empty-arg call is equivalent to todo_list.",
         schema_fn: schema_for::<TodoSearchArgs>,

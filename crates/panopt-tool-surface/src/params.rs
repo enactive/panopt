@@ -193,10 +193,12 @@ pub struct TodoSearchArgs {
     /// priority.
     #[serde(default)]
     pub priority: Option<String>,
-    /// Case-insensitive exact match on assignee name. Pass an empty string
-    /// to match only unassigned todos; omit to ignore assignee.
-    #[serde(default)]
-    pub assignee: Option<String>,
+    /// Case-insensitive exact match on assignee name. Pass JSON `null` to
+    /// match only unassigned todos; omit to ignore assignee. (Use `null`, not
+    /// `""` — an empty-string argument is dropped in transit by the MCP
+    /// client, taking the whole call with it; see todo #239.)
+    #[serde(default, deserialize_with = "double_option")]
+    pub assignee: Option<Option<String>>,
     /// Require every listed tag to be present on the todo (AND semantics).
     /// Omit or pass an empty list to skip the tag filter.
     #[serde(default)]
@@ -562,13 +564,11 @@ mod tests {
         assert_eq!(omitted.assignee, None);
 
         // explicit null -> Some(None) -> clear
-        let cleared: TodoUpdateArgs =
-            from_value(json!({"todo_id": 1, "assignee": null})).unwrap();
+        let cleared: TodoUpdateArgs = from_value(json!({"todo_id": 1, "assignee": null})).unwrap();
         assert_eq!(cleared.assignee, Some(None));
 
         // a name -> Some(Some(name)) -> set
-        let set: TodoUpdateArgs =
-            from_value(json!({"todo_id": 1, "assignee": "greg"})).unwrap();
+        let set: TodoUpdateArgs = from_value(json!({"todo_id": 1, "assignee": "greg"})).unwrap();
         assert_eq!(set.assignee, Some(Some("greg".to_string())));
     }
 
@@ -582,5 +582,23 @@ mod tests {
             err.to_string().contains("todo_id"),
             "expected a missing-todo_id error, got: {err}"
         );
+    }
+
+    /// Search's `assignee` filter has the same three states as update's, for
+    /// the same reason: `""` ("match unassigned") can't survive the client, so
+    /// `null` carries that signal instead.
+    #[test]
+    fn todo_search_assignee_tristate() {
+        // absent -> None -> no assignee filter
+        let omitted: TodoSearchArgs = from_value(json!({})).unwrap();
+        assert_eq!(omitted.assignee, None);
+
+        // explicit null -> Some(None) -> match only unassigned
+        let unassigned: TodoSearchArgs = from_value(json!({"assignee": null})).unwrap();
+        assert_eq!(unassigned.assignee, Some(None));
+
+        // a name -> Some(Some(name)) -> match that assignee
+        let named: TodoSearchArgs = from_value(json!({"assignee": "greg"})).unwrap();
+        assert_eq!(named.assignee, Some(Some("greg".to_string())));
     }
 }

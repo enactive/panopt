@@ -1008,6 +1008,11 @@ impl Handler {
             None => None,
         };
         let tags = args.tags.unwrap_or_default();
+        // `assignee` is a double `Option`: absent -> no filter, `null` -> match
+        // only unassigned (the empty-string assignee), a name -> match it. The
+        // `null` route exists because agents can't send the empty string that
+        // would otherwise mean "unassigned" - the MCP client drops it (#239).
+        let assignee = args.assignee.as_ref().map(|a| a.as_deref().unwrap_or(""));
         let dtos: Vec<TodoSummaryDto> = {
             let mut st = self.state.lock().expect("state mutex poisoned");
             let (project, _) = enter(&mut st, &parts)?;
@@ -1016,7 +1021,7 @@ impl Handler {
                 args.query.as_deref(),
                 status,
                 priority,
-                args.assignee.as_deref(),
+                assignee,
                 &tags,
             )
             .map_err(map_core_err)?
