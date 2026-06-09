@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "adc6e4ab8d67",
+  "strategy": "manual-commit",
+  "branch": "todo-236-color-code-todos",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-zellij/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ad/c6e4ab8d67/0/metadata.json",
+      "transcript": "/ad/c6e4ab8d67/0/full.jsonl",
+      "content_hash": "/ad/c6e4ab8d67/0/content_hash.txt",
+      "prompt": "/ad/c6e4ab8d67/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 10403,
+    "cache_creation_tokens": 790247,
+    "cache_read_tokens": 37673359,
+    "output_tokens": 182477,
+    "api_call_count": 216
+  }
+}
