@@ -1,0 +1,1 @@
+update the README with all the latest features / details.  remember the focus is on the *user* and only lesser extent devs.
