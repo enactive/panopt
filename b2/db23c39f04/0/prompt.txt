@@ -1,0 +1,1 @@
+make in_progress be yellow instead of blue
