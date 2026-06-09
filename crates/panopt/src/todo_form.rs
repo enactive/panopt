@@ -20,6 +20,7 @@ use anyhow::{anyhow, Result};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use panopt_core::TodoStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -30,19 +31,17 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::mcpclient::Client;
 
-/// The cyclable status values, in cycle order. Mirrors the `TodoStatus` enum in
-/// panopt-core; keep the two in sync when statuses are added (todo #236 added
-/// `waiting` and `needs_review`).
-pub(crate) const STATUSES: [&str; 8] = [
-    "open",
-    "in_progress",
-    "waiting",
-    "needs_review",
-    "backlog",
-    "draft",
-    "completed",
-    "not_done",
-];
+/// The cyclable status values, in cycle order - derived from the canonical
+/// `TodoStatus::ALL` so the form's status set can never drift from the daemon's.
+pub(crate) const STATUSES: [&str; TodoStatus::ALL.len()] = {
+    let mut tokens = [""; TodoStatus::ALL.len()];
+    let mut i = 0;
+    while i < TodoStatus::ALL.len() {
+        tokens[i] = TodoStatus::ALL[i].as_str();
+        i += 1;
+    }
+    tokens
+};
 /// The cyclable priority values, in cycle order.
 pub(crate) const PRIORITIES: [&str; 3] = ["high", "medium", "low"];
 
@@ -2128,6 +2127,22 @@ mod tests {
         assert_eq!(index_of(&STATUSES, "needs_review"), 3);
         assert_eq!(index_of(&PRIORITIES, "medium"), 1);
         assert_eq!(index_of(&STATUSES, "bogus"), 0);
+    }
+
+    #[test]
+    fn status_tokens_match_core() {
+        // The canonical status set lives in panopt_core::TodoStatus::ALL. The
+        // form's STATUSES is derived from it; the wasm plugin's logic crate
+        // (panopt-zellij-logic) can't depend on core, so it keeps its own
+        // STATUS_TOKENS copy. `panopt` is the only crate that can see both, so
+        // this guard fails if the plugin's copy ever drifts from core.
+        let core: Vec<&str> = TodoStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(STATUSES.to_vec(), core, "form STATUSES drifted from core");
+        assert_eq!(
+            panopt_zellij_logic::STATUS_TOKENS.to_vec(),
+            core,
+            "panopt-zellij-logic STATUS_TOKENS drifted from panopt_core::TodoStatus::ALL"
+        );
     }
 
     #[test]

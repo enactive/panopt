@@ -235,6 +235,23 @@ pub fn suffix_start(label: &str) -> Option<usize> {
     }
 }
 
+/// The todo status tokens the sidebar recognizes, in `TodoStatus` order. This
+/// crate is the dependency-light wasm side and deliberately does NOT depend on
+/// `panopt-core`, so it carries its own copy of the status set rather than
+/// importing `TodoStatus`. The copy is kept honest by a cross-crate guard test
+/// in `panopt` (`status_tokens_match_core`) that fails if it drifts from
+/// `panopt_core::TodoStatus::ALL`.
+pub const STATUS_TOKENS: [&str; 8] = [
+    "open",
+    "in_progress",
+    "waiting",
+    "needs_review",
+    "backlog",
+    "draft",
+    "completed",
+    "not_done",
+];
+
 /// Extract the wire status token from a projection-index label suffix like
 /// `wire up auth - open, high`. Returns `None` for labels without a known
 /// suffix; callers treat that as "do not hide."
@@ -243,18 +260,7 @@ pub fn parse_status_suffix(label: &str) -> Option<&str> {
     let rest = &label[start..];
     let comma = rest.find(',').unwrap_or(rest.len());
     let token = rest[..comma].trim();
-    matches!(
-        token,
-        "open"
-            | "in_progress"
-            | "backlog"
-            | "draft"
-            | "completed"
-            | "not_done"
-            | "waiting"
-            | "needs_review"
-    )
-    .then_some(token)
+    STATUS_TOKENS.contains(&token).then_some(token)
 }
 
 /// Extract the wire priority token from a projection-index label suffix

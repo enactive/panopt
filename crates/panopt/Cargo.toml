@@ -23,3 +23,10 @@ tui-textarea = "0.7"
 # in our dependency graph via ratatui; declaring it here lets us use it
 # directly.
 unicode-width = "0.2"
+
+[dev-dependencies]
+# `panopt` already depends on panopt-core; the plugin's pure logic lives in the
+# wasm-only panopt-zellij-logic, which can't depend on core. This dev-only edge
+# lets a guard test assert the plugin's STATUS_TOKENS stay equal to core's
+# TodoStatus::ALL, since panopt is the one crate that can see both.
+panopt-zellij-logic = { path = "../panopt-zellij-logic" }

@@ -1086,6 +1086,7 @@ dependencies = [
  "libc",
  "panopt-core",
  "panopt-tool-surface",
+ "panopt-zellij-logic",
  "percent-encoding",
  "ratatui",
  "serde_json",

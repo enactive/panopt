@@ -24,6 +24,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
+use panopt_core::TodoStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
@@ -1468,18 +1469,9 @@ fn parse_status_suffix(label: &str) -> Option<String> {
     let rest = &label[dash + 3..];
     let comma = rest.find(',').unwrap_or(rest.len());
     let token = rest[..comma].trim();
-    matches!(
-        token,
-        "open"
-            | "in_progress"
-            | "waiting"
-            | "needs_review"
-            | "backlog"
-            | "draft"
-            | "completed"
-            | "not_done"
-    )
-    .then(|| token.to_string())
+    // Validated against the canonical TodoStatus set, so the viewer's notion of
+    // a status token can never drift from the daemon's.
+    TodoStatus::parse(token).map(|_| token.to_string())
 }
 
 /// One-shot `todo_list` against the daemon, returning enriched list entries

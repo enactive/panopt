@@ -616,12 +616,14 @@ fn require_lock_name(name: String) -> Result<String, McpError> {
 /// Parse a status token from a tool argument, with a caller-facing error.
 fn parse_status(s: &str) -> Result<TodoStatus, McpError> {
     TodoStatus::parse(s).ok_or_else(|| {
-        McpError::invalid_params(
-            format!(
-                "invalid status '{s}': expected open, in_progress, waiting, needs_review, backlog, draft, completed, or not_done"
-            ),
-            None,
-        )
+        // Built from the canonical TodoStatus::ALL so the caller-facing list can
+        // never drift from the statuses the daemon actually accepts.
+        let tokens: Vec<&str> = TodoStatus::ALL.iter().map(|t| t.as_str()).collect();
+        let expected = match tokens.split_last() {
+            Some((last, head)) if !head.is_empty() => format!("{}, or {last}", head.join(", ")),
+            _ => tokens.join(", "),
+        };
+        McpError::invalid_params(format!("invalid status '{s}': expected {expected}"), None)
     })
 }
 

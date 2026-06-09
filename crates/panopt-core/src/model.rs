@@ -99,8 +99,25 @@ pub enum TodoStatus {
 }
 
 impl TodoStatus {
+    /// Every status in canonical order - the single source of truth other code
+    /// derives its status lists from (the `panoptd` error message, the CLI
+    /// viewer's form + filters; `panopt-zellij-logic` can't depend on core, so
+    /// it carries its own copy guarded by a cross-crate test). Kept exhaustive
+    /// by `tests::all_lists_every_status`, which fails to compile if a variant
+    /// is added without being listed here.
+    pub const ALL: [TodoStatus; 8] = [
+        TodoStatus::Open,
+        TodoStatus::InProgress,
+        TodoStatus::Waiting,
+        TodoStatus::NeedsReview,
+        TodoStatus::Backlog,
+        TodoStatus::Draft,
+        TodoStatus::Completed,
+        TodoStatus::NotDone,
+    ];
+
     /// The token stored in SQLite and used on the wire and in the projection.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             TodoStatus::Open => "open",
             TodoStatus::InProgress => "in_progress",
@@ -555,6 +572,30 @@ mod tests {
 
     fn statuses(pairs: &[(u64, TodoStatus)]) -> HashMap<u64, TodoStatus> {
         pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn all_lists_every_status() {
+        // Round-trip every canonical token.
+        for s in TodoStatus::ALL {
+            assert_eq!(TodoStatus::parse(s.as_str()), Some(s));
+            assert!(TodoStatus::ALL.contains(&s));
+        }
+        // Exhaustiveness guard: this match must name every variant, so adding a
+        // new status fails to compile here - a reminder to also add it to
+        // `TodoStatus::ALL`, which every other crate's status list derives from.
+        fn _every_variant_is_in_all(s: TodoStatus) {
+            match s {
+                TodoStatus::Open
+                | TodoStatus::InProgress
+                | TodoStatus::Waiting
+                | TodoStatus::NeedsReview
+                | TodoStatus::Backlog
+                | TodoStatus::Draft
+                | TodoStatus::Completed
+                | TodoStatus::NotDone => assert!(TodoStatus::ALL.contains(&s)),
+            }
+        }
     }
 
     #[test]
