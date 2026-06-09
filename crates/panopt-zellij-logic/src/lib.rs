@@ -234,7 +234,14 @@ pub fn parse_status_suffix(label: &str) -> Option<&str> {
     let token = rest[..comma].trim();
     matches!(
         token,
-        "open" | "in_progress" | "backlog" | "draft" | "completed" | "not_done"
+        "open"
+            | "in_progress"
+            | "backlog"
+            | "draft"
+            | "completed"
+            | "not_done"
+            | "waiting"
+            | "needs_review"
     )
     .then_some(token)
 }
@@ -266,6 +273,87 @@ pub fn parse_updated_suffix(label: &str) -> Option<&str> {
         .map(str::trim)
         .find_map(|token| token.strip_prefix("updated "))
         .map(str::trim)
+}
+
+/// True when the projection-index label carries the `, blocked` marker the core
+/// stamps onto open todos with an unresolved dependency (todo #236). The marker
+/// is an append-only comma-token, so this scans the suffix for a bare `blocked`
+/// token, alongside `status`/`priority`/`updated`. A label with no suffix, or a
+/// stale pre-#236 projection that never wrote the marker, yields `false` - the
+/// row degrades to Ready, the same way the other suffix parsers degrade.
+pub fn parse_blocked_suffix(label: &str) -> bool {
+    suffix_start(label)
+        .map(|start| {
+            label[start..]
+                .split(',')
+                .map(str::trim)
+                .any(|t| t == "blocked")
+        })
+        .unwrap_or(false)
+}
+
+/// The visual state a Todos-pane row is painted in (todo #236), derived from the
+/// stored status plus the projection's per-row `blocked` marker - never stored.
+/// Each variant maps to one foreground colour via [`TodoRowState::fg_code`]; the
+/// derived `Ready`/`Blocked` split only applies to `open` todos.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TodoRowState {
+    /// `open` + every dependency done (or none) - actionable now.
+    Ready,
+    /// `open` + a dependency still open - cannot start yet.
+    Blocked,
+    InProgress,
+    /// Waiting on something external (not just dependency work).
+    Waiting,
+    /// Needs human judgement, approval, or clarification.
+    NeedsReview,
+    Completed,
+    /// `not_done` - cancelled / won't-do / obsolete.
+    Canceled,
+    /// `backlog`/`draft`/unrecognized - no colour, terminal default.
+    Other,
+}
+
+impl TodoRowState {
+    /// 256-colour SGR foreground code (`38;5;<n>`), or `None` to leave the
+    /// terminal default. Colours follow the #236 model: green ready, red
+    /// blocked, blue in-progress, amber waiting, purple needs-review, gray
+    /// completed, dark-gray cancelled.
+    pub fn fg_code(self) -> Option<u8> {
+        match self {
+            TodoRowState::Ready => Some(34),       // green
+            TodoRowState::Blocked => Some(160),    // red
+            TodoRowState::InProgress => Some(39),  // blue
+            TodoRowState::Waiting => Some(214),    // amber
+            TodoRowState::NeedsReview => Some(99), // purple
+            TodoRowState::Completed => Some(245),  // gray
+            TodoRowState::Canceled => Some(240),   // dark gray
+            TodoRowState::Other => None,
+        }
+    }
+}
+
+/// Classify a projection-index label into its paint state (todo #236). Each todo
+/// carries exactly one status, so this is a direct status -> state map, except
+/// `open` splits into `Blocked`/`Ready` on the `, blocked` marker. A label with
+/// no recognizable status (older projection, or a non-status suffix) falls to
+/// `Other`, which paints in the terminal default.
+pub fn row_state_for(label: &str) -> TodoRowState {
+    match parse_status_suffix(label) {
+        Some("open") => {
+            if parse_blocked_suffix(label) {
+                TodoRowState::Blocked
+            } else {
+                TodoRowState::Ready
+            }
+        }
+        Some("in_progress") => TodoRowState::InProgress,
+        Some("waiting") => TodoRowState::Waiting,
+        Some("needs_review") => TodoRowState::NeedsReview,
+        Some("completed") => TodoRowState::Completed,
+        Some("not_done") => TodoRowState::Canceled,
+        _ => TodoRowState::Other,
+    }
 }
 
 /// One axis of the two-level todo sort. The sidebar carries two of these
@@ -1112,6 +1200,56 @@ mod tests {
         // panicking.
         assert_eq!(parse_updated_suffix("wire the form - open, high"), None);
         assert_eq!(parse_updated_suffix("plain title"), None);
+    }
+
+    #[test]
+    fn parse_blocked_suffix_reads_the_trailing_marker() {
+        // #236 marker appended after `updated <ts>`.
+        let blocked = "build - open, medium, updated 2026-06-08 10:00:00, blocked";
+        let ready = "build - open, medium, updated 2026-06-08 10:00:00";
+        assert!(parse_blocked_suffix(blocked));
+        assert!(!parse_blocked_suffix(ready));
+        // Appending the marker must not disturb the other suffix parsers.
+        assert_eq!(parse_status_suffix(blocked), Some("open"));
+        assert_eq!(parse_priority_suffix(blocked), Some("medium"));
+        assert_eq!(parse_updated_suffix(blocked), Some("2026-06-08 10:00:00"));
+        // Empty-title and no-suffix shapes degrade to not-blocked.
+        assert!(parse_blocked_suffix("- open, high, updated x, blocked"));
+        assert!(!parse_blocked_suffix("plain title"));
+    }
+
+    #[test]
+    fn row_state_for_maps_each_state() {
+        use TodoRowState::*;
+        let row = |status: &str| format!("t - {status}, medium, updated 2026-06-08 10:00:00");
+        assert_eq!(row_state_for(&row("open")), Ready);
+        assert_eq!(
+            row_state_for("t - open, medium, updated 2026-06-08 10:00:00, blocked"),
+            Blocked
+        );
+        assert_eq!(row_state_for(&row("in_progress")), InProgress);
+        assert_eq!(row_state_for(&row("waiting")), Waiting);
+        assert_eq!(row_state_for(&row("needs_review")), NeedsReview);
+        assert_eq!(row_state_for(&row("completed")), Completed);
+        assert_eq!(row_state_for(&row("not_done")), Canceled);
+        assert_eq!(row_state_for(&row("backlog")), Other);
+        assert_eq!(row_state_for(&row("draft")), Other);
+        // No suffix -> Other (no colour), never panics.
+        assert_eq!(row_state_for("plain title"), Other);
+    }
+
+    #[test]
+    fn pre_236_open_row_classifies_as_ready() {
+        // A stale projection that predates the marker has no `blocked` token,
+        // so every open row reads as Ready (green) - safe degradation.
+        assert_eq!(row_state_for("build - open, high"), TodoRowState::Ready);
+    }
+
+    #[test]
+    fn fg_code_is_set_for_coloured_states_and_none_for_other() {
+        assert_eq!(TodoRowState::Ready.fg_code(), Some(34));
+        assert_eq!(TodoRowState::Blocked.fg_code(), Some(160));
+        assert_eq!(TodoRowState::Other.fg_code(), None);
     }
 
     #[test]
