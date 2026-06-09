@@ -102,8 +102,8 @@ pub struct TodoCreateArgs {
     /// Free-form description body. Omit for an empty body.
     #[serde(default)]
     pub body: Option<String>,
-    /// Initial status: one of open, in_progress, backlog, draft, completed,
-    /// not_done. Omit to default to open.
+    /// Initial status: one of open, in_progress, waiting, needs_review,
+    /// backlog, draft, completed, not_done. Omit to default to open.
     #[serde(default)]
     pub status: Option<String>,
     /// Priority: one of high, medium, low. Omit to default to medium.
@@ -161,8 +161,8 @@ pub struct TodoUpdateArgs {
     /// New free-form description body. Omit to leave unchanged.
     #[serde(default)]
     pub body: Option<String>,
-    /// New status: one of open, in_progress, backlog, draft, completed,
-    /// not_done. Omit to leave unchanged.
+    /// New status: one of open, in_progress, waiting, needs_review, backlog,
+    /// draft, completed, not_done. Omit to leave unchanged.
     #[serde(default)]
     pub status: Option<String>,
     /// New priority: one of high, medium, low. Omit to leave unchanged.
@@ -185,8 +185,8 @@ pub struct TodoSearchArgs {
     /// match every todo (subject to other filters).
     #[serde(default)]
     pub query: Option<String>,
-    /// Restrict to this status. One of open, in_progress, backlog, draft,
-    /// completed, not_done. Omit to ignore status.
+    /// Restrict to this status. One of open, in_progress, waiting,
+    /// needs_review, backlog, draft, completed, not_done. Omit to ignore status.
     #[serde(default)]
     pub status: Option<String>,
     /// Restrict to this priority. One of high, medium, low. Omit to ignore

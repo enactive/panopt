@@ -618,7 +618,7 @@ fn parse_status(s: &str) -> Result<TodoStatus, McpError> {
     TodoStatus::parse(s).ok_or_else(|| {
         McpError::invalid_params(
             format!(
-                "invalid status '{s}': expected open, in_progress, backlog, draft, completed, or not_done"
+                "invalid status '{s}': expected open, in_progress, waiting, needs_review, backlog, draft, completed, or not_done"
             ),
             None,
         )

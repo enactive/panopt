@@ -1965,7 +1965,11 @@ impl Store {
                     todo.status.as_str()
                 )));
             }
-            TodoStatus::Open | TodoStatus::Backlog | TodoStatus::Draft => {}
+            TodoStatus::Open
+            | TodoStatus::Waiting
+            | TodoStatus::NeedsReview
+            | TodoStatus::Backlog
+            | TodoStatus::Draft => {}
         }
         self.conn.execute(
             "UPDATE todos SET status = 'in_progress', updated_at = datetime('now')

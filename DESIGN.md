@@ -402,13 +402,17 @@ rather than a GPU-rendered surface - immaterial for a coordination sidebar.
 
 ### 6.1 Todos
 
-Fields: id, title, body, status (open / in_progress / backlog / draft /
-completed / not_done), priority (high / medium / low), assignee, tags,
-blockers, comments, and created / updated / completed timestamps. `draft`
-is panopt's own addition for an early note the author has not yet committed
-to doing, and `not_done` is panopt's own addition for todos that were
-closed without being completed (cancelled, won't-fix); only `completed`
-populates the `completed` timestamp. This
+Fields: id, title, body, status (open / in_progress / waiting / needs_review /
+backlog / draft / completed / not_done), priority (high / medium / low),
+assignee, tags, blockers, comments, and created / updated / completed
+timestamps. `draft` is panopt's own addition for an early note the author has
+not yet committed to doing, and `not_done` is panopt's own addition for todos
+that were closed without being completed (cancelled, won't-fix); only
+`completed` populates the `completed` timestamp. `waiting` (parked on something
+external) and `needs_review` (needs human judgement) were added for the
+cockpit's colour model (todo #236), which also derives a Ready/Blocked split
+for `open` todos from the blocker graph — `open` with every blocker done shows
+green, `open` with a blocker still open shows red. This
 mirrors a trimmed subset of
 Solo's `todos` table plus its `todo_comments` and `todo_blockers` side tables.
 The one deliberate divergence is `assignee`: Solo uses a foreign key to an

@@ -85,6 +85,13 @@ pub enum TodoStatus {
     #[default]
     Open,
     InProgress,
+    /// Parked on something external (a review, a dependency outside the todo
+    /// graph, a person) - distinct from `Open`-but-blocked, which is derived
+    /// from the blocker graph. Surfaced amber in the cockpit (todo #236).
+    Waiting,
+    /// Needs human judgement, approval, or clarification before it can proceed.
+    /// Surfaced purple in the cockpit (todo #236).
+    NeedsReview,
     Backlog,
     Draft,
     Completed,
@@ -97,6 +104,8 @@ impl TodoStatus {
         match self {
             TodoStatus::Open => "open",
             TodoStatus::InProgress => "in_progress",
+            TodoStatus::Waiting => "waiting",
+            TodoStatus::NeedsReview => "needs_review",
             TodoStatus::Backlog => "backlog",
             TodoStatus::Draft => "draft",
             TodoStatus::Completed => "completed",
@@ -109,6 +118,8 @@ impl TodoStatus {
         match s {
             "open" => Some(TodoStatus::Open),
             "in_progress" => Some(TodoStatus::InProgress),
+            "waiting" => Some(TodoStatus::Waiting),
+            "needs_review" => Some(TodoStatus::NeedsReview),
             "backlog" => Some(TodoStatus::Backlog),
             "draft" => Some(TodoStatus::Draft),
             "completed" => Some(TodoStatus::Completed),
@@ -544,6 +555,30 @@ mod tests {
 
     fn statuses(pairs: &[(u64, TodoStatus)]) -> HashMap<u64, TodoStatus> {
         pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn status_tokens_round_trip_including_new_states() {
+        for s in [
+            TodoStatus::Open,
+            TodoStatus::InProgress,
+            TodoStatus::Waiting,
+            TodoStatus::NeedsReview,
+            TodoStatus::Backlog,
+            TodoStatus::Draft,
+            TodoStatus::Completed,
+            TodoStatus::NotDone,
+        ] {
+            assert_eq!(TodoStatus::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(TodoStatus::parse("waiting"), Some(TodoStatus::Waiting));
+        assert_eq!(
+            TodoStatus::parse("needs_review"),
+            Some(TodoStatus::NeedsReview)
+        );
+        // The two new states are active, not terminal.
+        assert!(!TodoStatus::Waiting.is_done());
+        assert!(!TodoStatus::NeedsReview.is_done());
     }
 
     #[test]
