@@ -317,13 +317,13 @@ pub enum TodoRowState {
 impl TodoRowState {
     /// 256-colour SGR foreground code (`38;5;<n>`), or `None` to leave the
     /// terminal default. Colours follow the #236 model: green ready, red
-    /// blocked, blue in-progress, amber waiting, purple needs-review, gray
+    /// blocked, yellow in-progress, amber waiting, purple needs-review, gray
     /// completed, dark-gray cancelled.
     pub fn fg_code(self) -> Option<u8> {
         match self {
             TodoRowState::Ready => Some(34),       // green
             TodoRowState::Blocked => Some(160),    // red
-            TodoRowState::InProgress => Some(39),  // blue
+            TodoRowState::InProgress => Some(226), // yellow
             TodoRowState::Waiting => Some(214),    // amber
             TodoRowState::NeedsReview => Some(99), // purple
             TodoRowState::Completed => Some(245),  // gray
