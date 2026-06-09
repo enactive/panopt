@@ -1,0 +1,23 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "e59aceb36df6",
+  "strategy": "manual-commit",
+  "branch": "todo-236-color-code-todos",
+  "checkpoints_count": 0,
+  "files_touched": null,
+  "sessions": [
+    {
+      "metadata": "/e5/9aceb36df6/0/metadata.json",
+      "transcript": "/e5/9aceb36df6/0/full.jsonl",
+      "content_hash": "/e5/9aceb36df6/0/content_hash.txt",
+      "prompt": "/e5/9aceb36df6/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 2378,
+    "cache_creation_tokens": 328929,
+    "cache_read_tokens": 8565149,
+    "output_tokens": 30015,
+    "api_call_count": 32
+  }
+}
