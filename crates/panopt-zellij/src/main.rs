@@ -334,6 +334,9 @@ struct Item {
     target: ItemTarget,
     /// A live marker: a running process, or the Zellij-focused pane.
     live: bool,
+    /// The colour state for a Todos-pane row (todo #236); `None` in every other
+    /// mode, where rows paint in the terminal default.
+    state: Option<TodoRowState>,
 }
 
 /// What selecting an item does.
@@ -661,13 +664,16 @@ impl ZellijPlugin for PanoptPane {
                 print!(
                     "\u{1b}[{};1H{}",
                     i + 1,
-                    paint(line, cols, Style::Dim, false)
+                    paint(line, cols, Style::Dim, None, false)
                 );
             }
             return;
         }
         if total == 0 {
-            print!("\u{1b}[1;1H{}", paint("  (none)", cols, Style::Dim, false));
+            print!(
+                "\u{1b}[1;1H{}",
+                paint("  (none)", cols, Style::Dim, None, false)
+            );
         } else {
             let end = (self.scroll + visible).min(total);
             for (slot, idx) in (self.scroll..end).enumerate() {
@@ -675,10 +681,11 @@ impl ZellijPlugin for PanoptPane {
                 let marker = if item.live { '*' } else { ' ' };
                 let line = format!(" {marker}{}", item.label);
                 let focused = idx == self.cursor;
+                let fg = item.state.and_then(TodoRowState::fg_code);
                 print!(
                     "\u{1b}[{};1H{}",
                     slot + 1,
-                    paint(&line, cols, Style::Normal, focused)
+                    paint(&line, cols, Style::Normal, fg, focused)
                 );
             }
         }
@@ -689,7 +696,7 @@ impl ZellijPlugin for PanoptPane {
             print!(
                 "\u{1b}[{};1H{}",
                 body_rows,
-                paint(&status, cols, Style::Dim, false)
+                paint(&status, cols, Style::Dim, None, false)
             );
         }
     }
@@ -1360,6 +1367,9 @@ impl PanoptPane {
                         label: format!("#{id} {label}"),
                         target: ItemTarget::Todo(*id),
                         live: false,
+                        // Classify from the raw projection label (it carries the
+                        // `- status, …` suffix) before the `#id ` prefix is added.
+                        state: Some(row_state_for(label)),
                     })
                     .collect()
             }
@@ -1370,6 +1380,7 @@ impl PanoptPane {
                     label: format!("#{id} {label}"),
                     target: ItemTarget::Note(*id),
                     live: false,
+                    state: None,
                 })
                 .collect(),
             Mode::Agents => {
@@ -1390,6 +1401,7 @@ impl PanoptPane {
                             label: agent_config_label(c, inst),
                             target: ItemTarget::Config(c.id),
                             live,
+                            state: None,
                         }
                     })
                     .collect()
@@ -1402,6 +1414,7 @@ impl PanoptPane {
                     label: r.label.clone(),
                     target: ItemTarget::Process(r.id),
                     live: self.process_pane(r.id).is_some(),
+                    state: None,
                 })
                 .collect(),
             Mode::Terminals => self
@@ -1412,6 +1425,7 @@ impl PanoptPane {
                     label: pane_label(p),
                     target: ItemTarget::Pane(p.id),
                     live: p.focused,
+                    state: None,
                 })
                 .collect(),
         };
@@ -3139,17 +3153,23 @@ enum Style {
 }
 
 /// Truncate `content` to `cols` and wrap it in the SGR codes for `style`,
-/// with the focused row reversed. The codes are added after truncation so
-/// they never count toward the width.
-fn paint(content: &str, cols: usize, style: Style, focused: bool) -> String {
+/// with the focused row reversed and an optional 256-colour foreground `fg`
+/// (todo #236). The codes are added after truncation so they never count toward
+/// the width. `fg` rides alongside the reverse/dim codes; on the focused row the
+/// reverse (`7`) swaps fg/bg, so the colour shows as the row background - still
+/// a distinct per-state cue.
+fn paint(content: &str, cols: usize, style: Style, fg: Option<u8>, focused: bool) -> String {
     let truncated: String = content.chars().take(cols).collect();
-    let mut codes: Vec<&str> = Vec::new();
+    let mut codes: Vec<String> = Vec::new();
     if focused {
-        codes.push("7");
+        codes.push("7".to_string());
     }
     match style {
-        Style::Dim => codes.push("2"),
+        Style::Dim => codes.push("2".to_string()),
         Style::Normal => {}
+    }
+    if let Some(c) = fg {
+        codes.push(format!("38;5;{c}"));
     }
     if codes.is_empty() {
         truncated
