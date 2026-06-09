@@ -1,0 +1,9 @@
+should we be able to set *all* of the status' (including the new ones?)
+
+---
+
+what are all the status values? the new ones?
+
+---
+
+those are not all settable in the todo form field

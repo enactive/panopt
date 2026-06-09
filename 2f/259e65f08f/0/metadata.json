@@ -1,0 +1,83 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "2f259e65f08f",
+  "session_id": "232e58b4-02e5-4d51-aeea-190b7d9380ef",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-09T06:26:12.942244369Z",
+  "branch": "todo-236-color-code-todos",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt/src/todo_form.rs",
+    "crates/panopt/src/viewer.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "f32a47c09967",
+  "checkpoint_transcript_start": 1188,
+  "transcript_lines_at_start": 1188,
+  "token_usage": {
+    "input_tokens": 288,
+    "cache_creation_tokens": 12552,
+    "cache_read_tokens": 5282992,
+    "output_tokens": 11392,
+    "api_call_count": 15
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_01WqHdJa6vrDoq7wTX2C9Xg3",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "f32a47c09967",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 516,
+        "end": 517,
+        "entry_ids": [
+          "9a4f507a-c960-4d14-a472-478d0e0f375d"
+        ],
+        "tool_use_id": "toolu_01WqHdJa6vrDoq7wTX2C9Xg3"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01WqHdJa6vrDoq7wTX2C9Xg3"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 11
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-09T06:26:12.864290472Z",
+    "agent_lines": 23,
+    "agent_removed": 25,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 23,
+    "total_lines_changed": 48,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
