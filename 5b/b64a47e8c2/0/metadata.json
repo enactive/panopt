@@ -1,0 +1,78 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "5bb64a47e8c2",
+  "session_id": "232e58b4-02e5-4d51-aeea-190b7d9380ef",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-09T05:29:14.546320864Z",
+  "branch": "todo-236-color-code-todos",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt-core/src/model.rs",
+    "crates/panoptd/src/handler.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "DESIGN.md",
+    "crates/panopt-core/src/state.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "0f9542f33428",
+  "checkpoint_transcript_start": 1044,
+  "transcript_lines_at_start": 1044,
+  "token_usage": {
+    "input_tokens": 572,
+    "cache_creation_tokens": 14041,
+    "cache_read_tokens": 9232923,
+    "output_tokens": 9044,
+    "api_call_count": 28
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_01WqHdJa6vrDoq7wTX2C9Xg3",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "verify-all"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "0f9542f33428",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 516,
+        "end": 517,
+        "entry_ids": [
+          "9a4f507a-c960-4d14-a472-478d0e0f375d"
+        ],
+        "tool_use_id": "toolu_01WqHdJa6vrDoq7wTX2C9Xg3"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01WqHdJa6vrDoq7wTX2C9Xg3"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: verify-all",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 7
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-09T05:29:14.479277854Z",
+    "agent_lines": 60,
+    "agent_removed": 17,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 60,
+    "total_lines_changed": 77,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}

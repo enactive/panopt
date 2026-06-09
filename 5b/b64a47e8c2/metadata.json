@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "5bb64a47e8c2",
+  "strategy": "manual-commit",
+  "branch": "todo-236-color-code-todos",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "DESIGN.md",
+    "crates/panopt-core/src/model.rs",
+    "crates/panopt-core/src/state.rs",
+    "crates/panopt-tool-surface/src/lib.rs",
+    "crates/panopt-tool-surface/src/params.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/5b/b64a47e8c2/0/metadata.json",
+      "transcript": "/5b/b64a47e8c2/0/full.jsonl",
+      "content_hash": "/5b/b64a47e8c2/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 572,
+    "cache_creation_tokens": 14041,
+    "cache_read_tokens": 9232923,
+    "output_tokens": 9044,
+    "api_call_count": 28
+  }
+}
