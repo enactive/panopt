@@ -118,13 +118,18 @@ pub enum TodoFilter {
     #[default]
     Active,
     InProgress,
+    Waiting,
+    NeedsReview,
     Backlog,
     Draft,
     Completed,
     NotDone,
 }
 
-pub const ALL_TODO_FILTERS: [TodoFilter; 8] = [
+// Cycle / wire order is APPEND-ONLY: `to_wire` stores a filter as its index
+// here, so new variants (waiting, needs_review for #236) go at the end to keep
+// existing view-state files (#116) decoding to the same filter.
+pub const ALL_TODO_FILTERS: [TodoFilter; 10] = [
     TodoFilter::All,
     TodoFilter::Open,
     TodoFilter::Active,
@@ -133,6 +138,8 @@ pub const ALL_TODO_FILTERS: [TodoFilter; 8] = [
     TodoFilter::Draft,
     TodoFilter::Completed,
     TodoFilter::NotDone,
+    TodoFilter::Waiting,
+    TodoFilter::NeedsReview,
 ];
 
 impl TodoFilter {
@@ -142,6 +149,8 @@ impl TodoFilter {
             TodoFilter::Open => "open",
             TodoFilter::Active => "active",
             TodoFilter::InProgress => "in_progress",
+            TodoFilter::Waiting => "waiting",
+            TodoFilter::NeedsReview => "needs_review",
             TodoFilter::Backlog => "backlog",
             TodoFilter::Draft => "draft",
             TodoFilter::Completed => "completed",
@@ -183,6 +192,8 @@ impl TodoFilter {
             TodoFilter::Open => status == "open",
             TodoFilter::Active => status == "open" || status == "in_progress",
             TodoFilter::InProgress => status == "in_progress",
+            TodoFilter::Waiting => status == "waiting",
+            TodoFilter::NeedsReview => status == "needs_review",
             TodoFilter::Backlog => status == "backlog",
             TodoFilter::Draft => status == "draft",
             TodoFilter::Completed => status == "completed",

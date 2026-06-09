@@ -216,6 +216,8 @@ enum TodoFilter {
     #[default]
     Active,
     InProgress,
+    Waiting,
+    NeedsReview,
     Backlog,
     Draft,
     Completed,
@@ -230,6 +232,8 @@ impl TodoFilter {
             TodoFilter::Open => "open",
             TodoFilter::Active => "active",
             TodoFilter::InProgress => "in_progress",
+            TodoFilter::Waiting => "waiting",
+            TodoFilter::NeedsReview => "needs_review",
             TodoFilter::Backlog => "backlog",
             TodoFilter::Draft => "draft",
             TodoFilter::Completed => "completed",
@@ -279,6 +283,8 @@ impl TodoFilter {
                 (status == "open" && !entry.is_blocked) || status == "in_progress"
             }
             TodoFilter::InProgress => status == "in_progress",
+            TodoFilter::Waiting => status == "waiting",
+            TodoFilter::NeedsReview => status == "needs_review",
             TodoFilter::Backlog => status == "backlog",
             TodoFilter::Draft => status == "draft",
             TodoFilter::Completed => status == "completed",
@@ -289,7 +295,7 @@ impl TodoFilter {
 
 /// Every [`TodoFilter`] variant in cycle order, used by the `f` / `F` keys
 /// and by [`TodoFilter::parse`].
-const ALL_FILTERS: [TodoFilter; 8] = [
+const ALL_FILTERS: [TodoFilter; 10] = [
     TodoFilter::All,
     TodoFilter::Open,
     TodoFilter::Active,
@@ -298,6 +304,8 @@ const ALL_FILTERS: [TodoFilter; 8] = [
     TodoFilter::Draft,
     TodoFilter::Completed,
     TodoFilter::NotDone,
+    TodoFilter::Waiting,
+    TodoFilter::NeedsReview,
 ];
 
 /// One axis of the two-level todo sort. The list view carries two of these
