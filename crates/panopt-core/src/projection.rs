@@ -8,7 +8,7 @@
 //! self-contained record with a `---` frontmatter block of structured fields
 //! and a markdown body, plus a `.panopt/todos.md` index linking them all.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::agent_profiles::ProfileSet;
 use crate::model::{
-    process_status, Agent, AgentTool, Lock, Note, PendingInput, Process, ProcessKind, Todo,
-    TodoStatus,
+    is_blocked, process_status, Agent, AgentTool, Lock, Note, PendingInput, Process, ProcessKind,
+    Todo, TodoStatus,
 };
 
 /// Per-process counter giving each temp file a unique name, so two concurrent
@@ -143,6 +143,12 @@ pub(crate) fn render_todos_index_md(todos: &[Todo]) -> String {
         out.push_str("_(no todos)_\n");
         return out;
     }
+    // Resolve each row's blockers to their statuses so the index can stamp a
+    // derived `, blocked` marker (todo #236). The whole project list is in hand
+    // on every reproject, so this needs no extra query, and because any status
+    // change reprojects the whole list, a blocker flipping to done automatically
+    // re-renders its dependents without the marker.
+    let statuses: HashMap<u64, TodoStatus> = todos.iter().map(|t| (t.id, t.status)).collect();
     for todo in todos {
         let mark = match todo.status {
             TodoStatus::Completed => 'x',
@@ -152,8 +158,17 @@ pub(crate) fn render_todos_index_md(todos: &[Todo]) -> String {
             TodoStatus::NotDone => '-',
             _ => ' ',
         };
+        // Append-only token after `updated <ts>`: the sidebar's suffix parsers
+        // slice the 1st/2nd comma-token and the `updated `-prefixed token, all
+        // inert to a trailing `, blocked`. Only blocked rows carry it, so an
+        // older reader simply sees a plain `open` row (degrades to Ready).
+        let blocked = if is_blocked(todo, &statuses) {
+            ", blocked"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "- [{mark}] [#{id}](todos/{id}.md) {title} - {status}, {priority}, updated {updated}\n",
+            "- [{mark}] [#{id}](todos/{id}.md) {title} - {status}, {priority}, updated {updated}{blocked}\n",
             id = todo.id,
             title = todo.title,
             status = todo.status.as_str(),
@@ -655,6 +670,35 @@ mod tests {
              - [ ] [#1](todos/1.md) wire up auth - open, medium, updated 2026-05-23 18:05:21\n\
              - [x] [#2](todos/2.md) write readme - completed, medium, updated 2026-05-21 10:00:00\n"
         );
+    }
+
+    #[test]
+    fn todo_index_marks_blocked_rows_only(/* #236 */) {
+        // #2 depends on the still-open #1 -> blocked; #3 depends on the
+        // completed #1b -> ready (no marker). The blocker (#1) itself is open
+        // with no deps, so it is ready and carries no marker either.
+        let mut one = todo(1, "design", TodoStatus::Open);
+        one.updated_at = "2026-06-08 10:00:00".into();
+        let mut two = todo(2, "build", TodoStatus::Open);
+        two.blockers = vec![1];
+        two.updated_at = "2026-06-08 10:00:00".into();
+        let mut done = todo(4, "spec", TodoStatus::Completed);
+        done.updated_at = "2026-06-08 10:00:00".into();
+        let mut three = todo(3, "ship", TodoStatus::Open);
+        three.blockers = vec![4]; // blocker is done -> not blocked
+        three.updated_at = "2026-06-08 10:00:00".into();
+        let out = render_todos_index_md(&[one, two, three, done]);
+        assert!(out.contains(
+            "- [ ] [#2](todos/2.md) build - open, medium, updated 2026-06-08 10:00:00, blocked\n"
+        ));
+        // Ready rows (open, deps done / none) get no marker.
+        assert!(out.contains(
+            "- [ ] [#1](todos/1.md) design - open, medium, updated 2026-06-08 10:00:00\n"
+        ));
+        assert!(out
+            .contains("- [ ] [#3](todos/3.md) ship - open, medium, updated 2026-06-08 10:00:00\n"));
+        // Exactly one blocked marker in the whole index.
+        assert_eq!(out.matches(", blocked").count(), 1);
     }
 
     #[test]

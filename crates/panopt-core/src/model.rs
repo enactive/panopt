@@ -116,6 +116,15 @@ impl TodoStatus {
             _ => None,
         }
     }
+
+    /// Whether this status is *terminal* - the todo is closed and no longer
+    /// actionable. Both `Completed` and `NotDone` (cancelled / won't-do) count:
+    /// the distinction is used by [`is_blocked`], where a blocker in either
+    /// terminal state no longer blocks its dependents (a cancelled dependency
+    /// is as resolved, for scheduling purposes, as a finished one).
+    pub fn is_done(self) -> bool {
+        matches!(self, TodoStatus::Completed | TodoStatus::NotDone)
+    }
 }
 
 /// Importance of a [`Todo`], mirroring Solo's `todos.priority` column.
@@ -185,6 +194,28 @@ pub struct Todo {
     pub updated_at: String,
     /// Set while `status` is `Completed`, `None` otherwise.
     pub completed_at: Option<String>,
+}
+
+/// Whether `todo` is *blocked*: actionable (`Open`) yet held up by at least one
+/// dependency that has not reached a terminal state (todo #236). `statuses_by_id`
+/// maps every live todo id in the project to its status; a blocker id absent from
+/// the map (soft-deleted or dangling) is treated as resolved, matching
+/// [`crate::Store::todo_blockers`], which only returns live blockers.
+///
+/// This is the single source of truth for the Ready/Blocked split that the
+/// cockpit colours (green = open + every blocker done; red = open + a blocker
+/// still open). It is *derived*, never stored: only `Open` todos can be blocked,
+/// so any non-`Open` status returns `false`.
+pub fn is_blocked(
+    todo: &Todo,
+    statuses_by_id: &std::collections::HashMap<u64, TodoStatus>,
+) -> bool {
+    if todo.status != TodoStatus::Open {
+        return false;
+    }
+    todo.blockers
+        .iter()
+        .any(|b| matches!(statuses_by_id.get(b), Some(s) if !s.is_done()))
 }
 
 /// A set of optional edits to a [`Todo`], applied by [`crate::Store::todo_update`].
@@ -495,4 +526,78 @@ pub struct Lock {
     /// Optional free-form reason the holder gave when acquiring.
     pub note: String,
     pub acquired_at: SystemTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn todo_with(status: TodoStatus, blockers: Vec<u64>) -> Todo {
+        Todo {
+            id: 100,
+            status,
+            blockers,
+            ..Default::default()
+        }
+    }
+
+    fn statuses(pairs: &[(u64, TodoStatus)]) -> HashMap<u64, TodoStatus> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn is_done_covers_both_terminal_states() {
+        assert!(TodoStatus::Completed.is_done());
+        assert!(TodoStatus::NotDone.is_done());
+        for s in [
+            TodoStatus::Open,
+            TodoStatus::InProgress,
+            TodoStatus::Backlog,
+            TodoStatus::Draft,
+        ] {
+            assert!(!s.is_done(), "{s:?} should not be terminal");
+        }
+    }
+
+    #[test]
+    fn blocked_only_when_open_with_an_unresolved_blocker() {
+        let map = statuses(&[(1, TodoStatus::Open), (2, TodoStatus::Completed)]);
+        // Open + a still-open blocker -> blocked.
+        assert!(is_blocked(&todo_with(TodoStatus::Open, vec![1]), &map));
+        // Open + a completed blocker -> ready.
+        assert!(!is_blocked(&todo_with(TodoStatus::Open, vec![2]), &map));
+        // Open + no blockers -> ready.
+        assert!(!is_blocked(&todo_with(TodoStatus::Open, vec![]), &map));
+        // Open + one open + one done -> still blocked (any unresolved blocks).
+        assert!(is_blocked(&todo_with(TodoStatus::Open, vec![1, 2]), &map));
+    }
+
+    #[test]
+    fn non_open_statuses_are_never_blocked() {
+        let map = statuses(&[(1, TodoStatus::Open)]);
+        for s in [
+            TodoStatus::InProgress,
+            TodoStatus::Completed,
+            TodoStatus::NotDone,
+            TodoStatus::Backlog,
+            TodoStatus::Draft,
+        ] {
+            assert!(!is_blocked(&todo_with(s, vec![1]), &map));
+        }
+    }
+
+    #[test]
+    fn a_not_done_blocker_does_not_block() {
+        // A cancelled / won't-do dependency is resolved for scheduling.
+        let map = statuses(&[(1, TodoStatus::NotDone)]);
+        assert!(!is_blocked(&todo_with(TodoStatus::Open, vec![1]), &map));
+    }
+
+    #[test]
+    fn a_missing_blocker_id_is_treated_resolved() {
+        // Soft-deleted/dangling blocker id absent from the map -> not blocking.
+        let map = statuses(&[]);
+        assert!(!is_blocked(&todo_with(TodoStatus::Open, vec![999]), &map));
+    }
 }
