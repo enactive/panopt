@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "1ccfc838cbbf",
+  "strategy": "manual-commit",
+  "branch": "todo-236-color-code-todos",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/panopt-core/src/model.rs",
+    "crates/panopt-zellij-logic/src/lib.rs",
+    "crates/panopt/Cargo.toml",
+    "crates/panopt/src/todo_form.rs",
+    "crates/panopt/src/viewer.rs",
+    "crates/panoptd/src/handler.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/1c/cfc838cbbf/0/metadata.json",
+      "transcript": "/1c/cfc838cbbf/0/full.jsonl",
+      "content_hash": "/1c/cfc838cbbf/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 564,
+    "cache_creation_tokens": 25488,
+    "cache_read_tokens": 9453156,
+    "output_tokens": 18685,
+    "api_call_count": 24
+  }
+}
