@@ -1,0 +1,7 @@
+<task-notification>
+<task-id>bvo3sj4bv</task-id>
+<tool-use-id>toolu_01BXtVVAkaTft1UBjme1tyWG</tool-use-id>
+<output-file>/tmp/claude-1000/-home-gregz-cp-panopt/2f67e8c4-b7bb-49a7-9d42-423ec74ed396/tasks/bvo3sj4bv.output</output-file>
+<status>killed</status>
+<summary>Background command "Run panoptd in background" was stopped</summary>
+</task-notification>
