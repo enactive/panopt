@@ -14,9 +14,12 @@ in flight, and what's coming next - all from one terminal window.
 ## What you get
 
 **A shared todo list.** Every agent sees the same todos. Assign them, set
-priorities, add tags, leave comments, mark them blocked by other todos. You
-edit them from the sidebar with a quick form; your agents create and update
-them through MCP tools.
+priorities, add tags, leave comments, mark them blocked by other todos. Each
+todo carries a status - open, in progress, waiting, needs review, backlog,
+draft, done, or won't-do - and the sidebar color-codes the board so you can
+see at a glance what's in flight, what's parked waiting on something, and
+what's blocked. You edit them from the sidebar with a quick form; your agents
+create and update them through MCP tools.
 
 **Shared notes.** Free-form notes that agents and humans both read and
 write. Useful for "here's what I tried", "open questions", or a running log
@@ -26,11 +29,24 @@ of what an agent is doing - read live as the agent writes.
 a todo or any other resource by name. The sidebar shows what's currently held
 and by whom, so two agents won't quietly clobber each other.
 
+**Find anything fast.** A cockpit-wide search popup (one keybind) searches
+across every todo and note in the project at once - type a few characters,
+arrow to the hit, and it opens in the content pane. Reference anything by its
+`#N` id and PANopt resolves it to the right resource, whether it's a todo,
+note, command, or agent.
+
 **One terminal cockpit.** The cockpit is a [Zellij](https://zellij.dev)
-session with five sidebar panes - todos, agents, terminals, commands,
-notes - and one big content pane on the right. Arrow through any
-list to preview an item; activate it to swap it into the content pane.
-Todos, notes, and new agents are all created from the sidebar.
+session with five sidebar panes and a number of content panes on the right:
+
+- **Todos** and **Notes** - the shared lists above, browsed and edited inline.
+- **Agents** - every agent connected to the project; spawn a new one here.
+- **Commands** - your project's saved commands (build, test, run a server).
+  Launch one and it runs in the content pane where you can watch its output.
+- **Terminals** - plain shell panes you open inside the cockpit, alongside
+  the agents instead of in a separate window.
+
+Arrow through any list to preview an item; activate it to swap it into the
+content pane. Todos, notes, and new agents are all created from the sidebar.
 
 **Multiple agents, one project.** Spawn another agent from the agents
 pane and it joins the cockpit with its own pane. Every agent shares the
@@ -43,21 +59,36 @@ Code agents with the built-in sub-agent (Agent/Task) tool disabled
 (`--disallowedTools Agent`) plus a system-prompt pointer at `spawn_agent`;
 the panopt MCP tools themselves are unaffected.
 
+**Agents that orchestrate agents.** A spawned agent isn't fire-and-forget:
+the agent that launched it can hand it a task, wait for it to finish, and read
+back its result, so you can build a lead agent that farms work out to helpers
+and collects what they return. Helpers you spawn just for one job can be marked
+disposable - they're cleaned up automatically once they go idle, so the cockpit
+doesn't fill up with stragglers - while the agents you mean to keep stay put
+until you dismiss them yourself.
+
 **Remote agents.** Run the daemon on your workstation and connect an agent
 from another machine on the LAN - a laptop, a Mac running Solo, a host with
 USB-attached debug hardware. The remote agent joins the same coordination
 plane as the local ones and can work on resources only it has access to.
 
 **Your stuff stays yours.** Todos and notes mirror to plain markdown
-files under `.panopt/` in your project and is gitignored by default; check 
-it in if you want the project's todos to travel with the repo.
+files under `.panopt/` in your project, gitignored by default; check them
+in if you want the project's todos to travel with the repo.
 
 ## Features
 
-- Multi-platform
-- Remote friendly
-- Multi-pane
-- so! much! more!
+- One cockpit for many agents - Claude Code, Codex, anything that speaks MCP
+- Shared todos with statuses, priorities, tags, comments, and blockers
+- Shared free-form notes, readable live as an agent writes
+- Advisory locks so agents coordinate instead of colliding
+- Cockpit-wide search across todos and notes; reference anything by `#N`
+- Agents that spawn, drive, and collect results from other agents
+- Saved commands and ad-hoc terminals alongside your agents
+- Remote agents over the LAN, joined to the same coordination plane
+- State mirrored to plain markdown under `.panopt/` - yours to keep or commit
+- A `panopt` CLI that does everything the cockpit does, for scripting
+- Runs on Linux, macOS, and Windows
 
 ## Prerequisites
 
