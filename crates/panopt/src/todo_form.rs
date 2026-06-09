@@ -30,10 +30,14 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::mcpclient::Client;
 
-/// The cyclable status values, in cycle order.
-pub(crate) const STATUSES: [&str; 6] = [
+/// The cyclable status values, in cycle order. Mirrors the `TodoStatus` enum in
+/// panopt-core; keep the two in sync when statuses are added (todo #236 added
+/// `waiting` and `needs_review`).
+pub(crate) const STATUSES: [&str; 8] = [
     "open",
     "in_progress",
+    "waiting",
+    "needs_review",
     "backlog",
     "draft",
     "completed",
@@ -2119,7 +2123,9 @@ mod tests {
 
     #[test]
     fn index_of_finds_values_and_defaults_to_zero() {
-        assert_eq!(index_of(&STATUSES, "completed"), 4);
+        assert_eq!(index_of(&STATUSES, "completed"), 6);
+        assert_eq!(index_of(&STATUSES, "waiting"), 2);
+        assert_eq!(index_of(&STATUSES, "needs_review"), 3);
         assert_eq!(index_of(&PRIORITIES, "medium"), 1);
         assert_eq!(index_of(&STATUSES, "bogus"), 0);
     }

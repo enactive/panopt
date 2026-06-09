@@ -1462,7 +1462,14 @@ fn parse_status_suffix(label: &str) -> Option<String> {
     let token = rest[..comma].trim();
     matches!(
         token,
-        "open" | "in_progress" | "backlog" | "draft" | "completed" | "not_done"
+        "open"
+            | "in_progress"
+            | "waiting"
+            | "needs_review"
+            | "backlog"
+            | "draft"
+            | "completed"
+            | "not_done"
     )
     .then(|| token.to_string())
 }
