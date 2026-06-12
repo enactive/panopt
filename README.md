@@ -21,6 +21,12 @@ see at a glance what's in flight, what's parked waiting on something, and
 what's blocked. You edit them from the sidebar with a quick form; your agents
 create and update them through MCP tools.
 
+![A color-coded graph of todos across all projects, dynamically updated as their status and dependencies change](docs/todo-graph.png)
+
+A color-coded, dynamically updated graph representation of the todos across all
+your projects - nodes recolor as status changes and edges track the blocked-by
+dependencies between them.
+
 **Shared notes.** Free-form notes that agents and humans both read and
 write. Useful for "here's what I tried", "open questions", or a running log
 of what an agent is doing - read live as the agent writes.
