@@ -1,0 +1,1 @@
+update README to include @docs/todo-graph.png  and mention that it's a color-coded, dynamically updated graph representation of todos for all projects.

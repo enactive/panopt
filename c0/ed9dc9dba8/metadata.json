@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "c0ed9dc9dba8",
+  "strategy": "manual-commit",
+  "branch": "idle-bell-175",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/c0/ed9dc9dba8/0/metadata.json",
+      "transcript": "/c0/ed9dc9dba8/0/full.jsonl",
+      "content_hash": "/c0/ed9dc9dba8/0/content_hash.txt",
+      "prompt": "/c0/ed9dc9dba8/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 3803,
+    "cache_creation_tokens": 26772,
+    "cache_read_tokens": 124173,
+    "output_tokens": 1339,
+    "api_call_count": 6
+  }
+}
