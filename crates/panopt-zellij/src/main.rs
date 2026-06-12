@@ -29,7 +29,7 @@
 //! refuses by showing a floating dialog with a `close anyway` override; any
 //! of the five plugin panes themselves cannot be closed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -67,6 +67,14 @@ const CONTENT_COUNT_PATH: &str = "/host/.panopt/.cockpit/content-count";
 /// each `content` into the addressed agent's pane, and acks the `seq` so the
 /// daemon drops it. See `panopt_core::projection::project_inputs`.
 const INPUTS_PATH: &str = "/host/.panopt/.cockpit/inputs.jsonl";
+
+/// Foreground 256-colour SGR code for an agent row that needs attention (todo
+/// #175): the agent finished a work cycle (busy -> idle) and the operator has
+/// not yet looked at its pane. Amber, to read as "(may) need attention, work is
+/// done". This is a latch, not a state mirror - it clears the moment the agent's
+/// pane is focused (see [`PanoptPane::update_attention`]), so a long-idle agent
+/// the user has already seen carries no colour.
+const AGENT_ATTENTION_FG: u8 = 214;
 
 #[derive(Default)]
 struct PanoptPane {
@@ -294,6 +302,32 @@ struct PanoptPane {
     /// [`PanoptPane::adopt_view_state`] only adopts strictly-newer seqs, so this
     /// both skips our own writes and prevents regressing to a stale view.
     last_applied_seq: u64,
+
+    /// Whether the idle bell is armed (todo #175). On by default; set in
+    /// [`PanoptPane::load`] (the derived `Default` is `false`) and toggled with
+    /// `b` on the Todos pane. Only gates the audible bell - the agent-row
+    /// attention colour is always shown. Operationally only the Todos gatekeeper
+    /// rings, so this is only consulted there.
+    idle_bell: bool,
+    /// One-shot: an agent settled to idle since the last render, so the next
+    /// [`PanoptPane::render`] should emit a single BEL (todo #175). Armed in
+    /// [`PanoptPane::observe_agent_states`], cleared when flushed.
+    pending_bell: bool,
+
+    /// Process ids of agents that finished a work cycle (busy -> idle) and whose
+    /// pane the operator has not yet focused (todo #175). Their Agents-pane row
+    /// paints [`AGENT_ATTENTION_FG`] until attention is paid. A latch, not a
+    /// state mirror: set on the busy -> idle transition, cleared when the agent's
+    /// pane is focused or it resumes work. Maintained by
+    /// [`PanoptPane::update_attention`]; only the Agents instance renders agent
+    /// rows, so only it keeps this.
+    attention: BTreeSet<u64>,
+    /// Last projected `agent_state` per agent process id, used by
+    /// [`PanoptPane::update_attention`] to detect the busy -> idle transition
+    /// from the `.panopt/processes.md` projection (the shared truth every
+    /// instance reads). Distinct from `reported_states`, which is the
+    /// gatekeeper's pane-scrape channel for the bell. Pruned to the live set.
+    agent_state_seen: BTreeMap<u64, String>,
 }
 
 /// A content pane flattened from Zellij's manifest.
@@ -334,9 +368,12 @@ struct Item {
     target: ItemTarget,
     /// A live marker: a running process, or the Zellij-focused pane.
     live: bool,
-    /// The colour state for a Todos-pane row (todo #236); `None` in every other
-    /// mode, where rows paint in the terminal default.
-    state: Option<TodoRowState>,
+    /// Precomputed foreground 256-colour SGR code for this row, or `None` to
+    /// paint in the terminal default. Todos derive it from their status (todo
+    /// #236, [`row_state_for`]); an agent row is [`AGENT_ATTENTION_FG`] while it
+    /// needs attention (todo #175, [`PanoptPane::attention`]); other modes leave
+    /// it `None`. Resolved at build time so [`PanoptPane::render`] just paints it.
+    fg: Option<u8>,
 }
 
 /// What selecting an item does.
@@ -381,6 +418,14 @@ impl ZellijPlugin for PanoptPane {
             .get("port")
             .cloned()
             .unwrap_or_else(|| "7600".to_string());
+        // The idle bell (todo #175) is on by default - the derived `Default`
+        // gives `false`, so set it here. A layout can opt out with
+        // `idle_bell = "false"` (or `0`/`off`/`no`) in the plugin config; any
+        // other value, or none, leaves it on.
+        self.idle_bell = !matches!(
+            configuration.get("idle_bell").map(String::as_str),
+            Some("false") | Some("0") | Some("off") | Some("no")
+        );
         // Override the per-field Default for level 2: `TodoSort::default()`
         // is `PriorityDesc`, but we want a distinct level-2 default so the
         // initial sort is "priority desc, then oldest first" rather than
@@ -681,7 +726,7 @@ impl ZellijPlugin for PanoptPane {
                 let marker = if item.live { '*' } else { ' ' };
                 let line = format!(" {marker}{}", item.label);
                 let focused = idx == self.cursor;
-                let fg = item.state.and_then(TodoRowState::fg_code);
+                let fg = item.fg;
                 print!(
                     "\u{1b}[{};1H{}",
                     slot + 1,
@@ -698,6 +743,17 @@ impl ZellijPlugin for PanoptPane {
                 body_rows,
                 paint(&status, cols, Style::Dim, None, false)
             );
+        }
+        // Ring the terminal bell once when an agent has just settled to idle
+        // (todo #175). Armed in `observe_agent_states` on a busy -> idle
+        // transition and flushed here, after the cursor-positioned row writes
+        // and the `\x1b[3J` clear, so the bare BEL can't disturb the layout
+        // (it moves no cursor and prints no glyph). Only the Todos gatekeeper
+        // observes agent state, so only it ever arms this - the bell rings
+        // once, not once per sidebar instance.
+        if self.pending_bell {
+            print!("\u{07}");
+            self.pending_bell = false;
         }
     }
 }
@@ -803,6 +859,10 @@ impl PanoptPane {
                 lines.push(format!(
                     "  2 / @         sort 2 forward / back  [{}]",
                     self.todo_sort_2.label()
+                ));
+                lines.push(format!(
+                    "  b             idle bell on / off     [{}]",
+                    if self.idle_bell { "on" } else { "off" }
                 ));
             }
             Mode::Notes => {
@@ -1239,6 +1299,64 @@ impl PanoptPane {
         self.process_pane(id)
     }
 
+    /// Maintain the "needs attention" latch behind the agent-row colour (todo
+    /// #175). The colour is not a passive idle indicator: it must mean "work is
+    /// done, (may) need attention" and clear once attention has been paid. So a
+    /// row latches on the busy -> idle transition and clears the moment its pane
+    /// is focused (the operator looked) or the agent resumes work.
+    ///
+    /// Driven off the projected `agent_state` (the truth every instance shares
+    /// via `.panopt/processes.md`) rather than the gatekeeper's pane scrape, so
+    /// the Agents instance maintains it locally without any cross-instance
+    /// plumbing. The transition is detected by diffing each agent's current
+    /// state against `agent_state_seen`; a first observation (`None` previous) is
+    /// the boot case and never latches - matching the bell's boot-settle
+    /// suppression (#237).
+    fn update_attention(&mut self) {
+        // Snapshot the live agents and whether each one's pane is currently
+        // focused, so the borrow of `self.panes`/`self.processes` is released
+        // before mutating `self.attention` / `self.agent_state_seen`.
+        let agents: Vec<(u64, String, bool)> = self
+            .processes
+            .iter()
+            .filter(|r| r.kind == "agent" && r.status.as_deref() == Some("running"))
+            .map(|r| {
+                let state = r.agent_state.clone().unwrap_or_default();
+                let focused = self
+                    .agent_pane(r.id, r.agent_id.as_deref())
+                    .and_then(|pane| self.panes.iter().find(|p| p.id == pane))
+                    .map(|p| p.focused)
+                    .unwrap_or(false);
+                (r.id, state, focused)
+            })
+            .collect();
+        let live: BTreeSet<u64> = agents.iter().map(|(id, _, _)| *id).collect();
+        self.attention.retain(|id| live.contains(id));
+        self.agent_state_seen.retain(|id, _| live.contains(id));
+
+        for (id, state, focused) in agents {
+            let prev = self.agent_state_seen.get(&id).map(String::as_str);
+            // Latch on a genuine busy -> idle transition: the agent finished a
+            // work cycle. `prev == None` (boot) and prev already idle do not
+            // latch.
+            if state == "idle" && matches!(prev, Some(p) if p != "idle") {
+                self.attention.insert(id);
+            }
+            // Resumed work -> the "done" premise no longer holds, drop the latch.
+            if state != "idle" {
+                self.attention.remove(&id);
+            }
+            // Attention paid: the operator focused the agent's pane. Clears the
+            // latch even while still idle (the whole point - it is not a passive
+            // idle light). Also covers the "already watching when it finished"
+            // case: the same pass latches then immediately clears, so no colour.
+            if focused {
+                self.attention.remove(&id);
+            }
+            self.agent_state_seen.insert(id, state);
+        }
+    }
+
     /// Keep `agent_labels` in step with the live agent panes: forget closed
     /// ones, give any agent still unlabelled a stable "Agent N" fallback.
     /// The Todos pane (the gatekeeper) projects the resulting map to the
@@ -1351,6 +1469,13 @@ impl PanoptPane {
     /// Rebuild this pane's item list from parsed data + live panes. The list
     /// is always a single flat sequence for the pane's mode.
     fn rebuild_items(&mut self) {
+        // Refresh the attention latch before building agent rows (todo #175):
+        // only the Agents instance renders them and needs the colour, so other
+        // modes skip the scan. Runs here because both the 1s poll (fresh agent
+        // state) and PaneUpdate (fresh focus) route through `rebuild_items`.
+        if self.mode == Mode::Agents {
+            self.update_attention();
+        }
         let items: Vec<Item> = match self.mode {
             Mode::Todos => {
                 let mut rows: Vec<&(u64, String)> = self
@@ -1369,7 +1494,7 @@ impl PanoptPane {
                         live: false,
                         // Classify from the raw projection label (it carries the
                         // `- status, …` suffix) before the `#id ` prefix is added.
-                        state: Some(row_state_for(label)),
+                        fg: row_state_for(label).fg_code(),
                     })
                     .collect()
             }
@@ -1380,7 +1505,7 @@ impl PanoptPane {
                     label: format!("#{id} {label}"),
                     target: ItemTarget::Note(*id),
                     live: false,
-                    state: None,
+                    fg: None,
                 })
                 .collect(),
             Mode::Agents => {
@@ -1397,11 +1522,18 @@ impl PanoptPane {
                         let live = inst
                             .map(|r| self.process_pane(r.id).is_some())
                             .unwrap_or(false);
+                        // Amber while this agent needs attention (todo #175):
+                        // it finished a work cycle and its pane has not been
+                        // focused yet. The latch is maintained in
+                        // `update_attention`, keyed by the instance's process id.
+                        let fg = inst
+                            .filter(|r| self.attention.contains(&r.id))
+                            .map(|_| AGENT_ATTENTION_FG);
                         Item {
                             label: agent_config_label(c, inst),
                             target: ItemTarget::Config(c.id),
                             live,
-                            state: None,
+                            fg,
                         }
                     })
                     .collect()
@@ -1414,7 +1546,7 @@ impl PanoptPane {
                     label: r.label.clone(),
                     target: ItemTarget::Process(r.id),
                     live: self.process_pane(r.id).is_some(),
-                    state: None,
+                    fg: None,
                 })
                 .collect(),
             Mode::Terminals => self
@@ -1425,7 +1557,7 @@ impl PanoptPane {
                     label: pane_label(p),
                     target: ItemTarget::Pane(p.id),
                     live: p.focused,
-                    state: None,
+                    fg: None,
                 })
                 .collect(),
         };
@@ -1584,6 +1716,10 @@ impl PanoptPane {
             BareKey::Char('!') if self.mode == Mode::Todos => self.cycle_todo_sort(1, false),
             BareKey::Char('2') if self.mode == Mode::Todos => self.cycle_todo_sort(2, true),
             BareKey::Char('@') if self.mode == Mode::Todos => self.cycle_todo_sort(2, false),
+            // Toggle the idle bell (todo #175). Gated to the Todos pane because
+            // it is the gatekeeper that observes agent state and rings; the flag
+            // on any other instance would never fire.
+            BareKey::Char('b') if self.mode == Mode::Todos => self.idle_bell = !self.idle_bell,
             // Delete the focused item. Dispatches by mode; see [`delete_focused`].
             BareKey::Char('x') => self.delete_focused(),
             // Start / focus the focused runnable. Identical to Enter for
@@ -2353,8 +2489,17 @@ impl PanoptPane {
             let state = matcher
                 .classify(&viewport_live_region(&contents.viewport))
                 .as_str();
-            if self.reported_states.get(&id).map(String::as_str) == Some(state) {
+            let prev = self.reported_states.get(&id).map(String::as_str);
+            if prev == Some(state) {
                 continue;
+            }
+            // Ring on a genuine busy -> idle transition (todo #175): the agent
+            // finished a work cycle and wants attention. `prev == None` is the
+            // boot case - a freshly spawned agent's first observed state is idle
+            // (sitting at its prompt), which must NOT ring (the #237 boot-settle
+            // caveat). An agent that was thinking/working and settles does.
+            if self.idle_bell && state == "idle" && matches!(prev, Some(p) if p != "idle") {
+                self.pending_bell = true;
             }
             let id_str = id.to_string();
             self.run_panopt(
