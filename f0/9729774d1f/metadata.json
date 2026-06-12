@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.7.3",
+  "checkpoint_id": "f09729774d1f",
+  "strategy": "manual-commit",
+  "branch": "idle-bell-175",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/panopt-zellij/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/f0/9729774d1f/0/metadata.json",
+      "transcript": "/f0/9729774d1f/0/full.jsonl",
+      "content_hash": "/f0/9729774d1f/0/content_hash.txt",
+      "prompt": "/f0/9729774d1f/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 6338,
+    "cache_creation_tokens": 233301,
+    "cache_read_tokens": 12898873,
+    "output_tokens": 112042,
+    "api_call_count": 106
+  }
+}

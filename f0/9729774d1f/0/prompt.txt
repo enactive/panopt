@@ -1,0 +1,9 @@
+something is wonky with the agents pane.  all kinds of entries when there should only be two
+
+---
+
+what are you on about?  this didn't happen until after this last change to centralize the todo status values.  this is some kind of regression
+
+---
+
+yes
